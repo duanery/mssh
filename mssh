@@ -551,7 +551,7 @@ def read_pubkey(path):
     return key
 
 
-def install_pubkey(client, endpoint, pubkey, opts, label):
+def install_pubkey(client, endpoint, pubkey, opts, label, path=""):
     """Append pubkey to the remote authorized_keys, idempotently.
 
     Runs a small shell snippet remotely: it creates ~/.ssh with the right
@@ -605,14 +605,16 @@ def install_pubkey(client, endpoint, pubkey, opts, label):
     text = out.decode("utf-8", "replace")
     if status != 0 or "MSSH_" not in text:
         detail = err.decode("utf-8", "replace").strip() or "exit %d" % status
-        sys.stderr.write("mssh: %s: could not install key on %s: %s\n"
-                         % (label, endpoint, detail))
+        sys.stderr.write("mssh: %s: could not install key (%s) on %s: %s\n"
+                         % (label, path, endpoint, detail))
         return False
 
     if "MSSH_ALREADY_PRESENT" in text:
-        sys.stderr.write("mssh: %s: key already present on %s\n" % (label, endpoint))
+        sys.stderr.write("mssh: %s: key (%s) already present on %s\n"
+                         % (label, path, endpoint))
     else:
-        sys.stderr.write("mssh: %s: key installed on %s\n" % (label, endpoint))
+        sys.stderr.write("mssh: %s: key (%s) installed on %s\n"
+                         % (label, path, endpoint))
     return True
 
 
@@ -651,6 +653,7 @@ def build_chain(jumps, target, opts):
     factory = None
     hops = jumps + [target]
     pubkey = read_pubkey(opts.copy_id) if opts.copy_id else None
+    pubkey_path = os.path.expanduser(opts.copy_id) if opts.copy_id else None
 
     try:
         for i, hop in enumerate(hops):
@@ -660,7 +663,8 @@ def build_chain(jumps, target, opts):
 
             if pubkey is not None:
                 install_pubkey(client, hop, pubkey, opts,
-                               "hop %d/%d" % (i + 1, len(hops)))
+                               "hop %d/%d" % (i + 1, len(hops)),
+                               path=pubkey_path)
 
             if i + 1 < len(hops):
                 factory = _tunnel_factory(client, hop, hops[i + 1], opts,
