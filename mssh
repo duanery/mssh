@@ -21,6 +21,11 @@ Endpoint format:
                                                  user:p:a@ss@host:22
   * omit the password to use key auth / ssh-agent, or to be prompted.
   * IPv6 must be bracketed:                      user:pw@[::1]:22
+
+File copy (instead of logging in), cp-style, ':' marking the remote side:
+    mssh -j jump@ip target@ip ./app.tar :/tmp/         # upload
+    mssh -j jump@ip target@ip :/var/log/syslog ./      # download
+    mssh -rp -j jump@ip target@ip ./dist :/srv/www/    # tree, keep attrs
 """
 
 from __future__ import print_function
@@ -33,6 +38,7 @@ import re
 import select
 import signal
 import socket
+import stat as statmod
 import sys
 import threading
 import time
@@ -61,6 +67,12 @@ DEFAULT_TIMEOUT = 20
 # against old servers that only accept SHA-1 ssh-rsa signatures (paramiko
 # 5 dropped SHA-1 signing, so an RSA key silently fails against those).
 DEFAULT_KEY_NAMES = ("id_ed25519", "id_ecdsa", "id_rsa")
+
+# Cap on outstanding SFTP read requests during a download.  Paramiko's
+# default is unlimited, which for a 500 MiB file queues ~15000 32 KiB reads
+# up front; an interrupt then has to drain all of them before the channel
+# can close, so Ctrl-C appears to hang.  OpenSSH's own sftp uses 64.
+MAX_PREFETCH = 64
 
 
 # --------------------------------------------------------------------------
@@ -934,6 +946,417 @@ def pump_command(chan):
 
 
 # --------------------------------------------------------------------------
+# file copy
+# --------------------------------------------------------------------------
+
+def split_copy_path(arg):
+    """Split a copy argument into (is_remote, path).
+
+    A leading ':' marks the remote side, so the target endpoint stays its own
+    argument and there is no ambiguity with user:password@host:port.  A bare
+    ':' means the remote home directory.  A local file whose name really does
+    start with ':' is reachable as './:name'.
+    """
+    if arg.startswith(":"):
+        path = arg[1:]
+        return True, path if path else "."
+    return False, arg
+
+
+def plan_copy(paths):
+    """Turn 'SOURCE... DEST' into (direction, sources, dest).
+
+    ``direction`` is "up" or "down"; ``sources`` and ``dest`` are bare paths
+    with the ':' marker removed.  Raises ValueError on any combination we
+    cannot serve, so main() can reject it before opening a connection.
+    """
+    if len(paths) < 2:
+        raise ValueError(
+            "file copy needs SOURCE and DEST, e.g. ./app.tar :/tmp/ "
+            "(a leading ':' marks the remote side)"
+        )
+
+    split = [split_copy_path(p) for p in paths]
+    src_marks, dest_mark = split[:-1], split[-1]
+    dest_remote, dest = dest_mark
+
+    for _, path in src_marks:
+        if not path:
+            raise ValueError("empty source path")
+    if not dest:
+        raise ValueError("empty destination path")
+
+    remote_sources = [remote for remote, _ in src_marks]
+
+    if dest_remote:
+        if any(remote_sources):
+            bad = [p for remote, p in src_marks if remote]
+            raise ValueError(
+                "cannot copy remote to remote: %s and the destination are "
+                "both on the target"
+                % ", ".join(":" + b for b in bad)
+            )
+        direction = "up"
+    else:
+        if not all(remote_sources):
+            bad = [p for remote, p in src_marks if not remote]
+            raise ValueError(
+                "both sides are local (%s -> %s); mark the remote side with "
+                "a leading ':'" % (", ".join(bad), dest)
+            )
+        direction = "down"
+
+    return direction, [p for _, p in src_marks], dest
+
+
+def open_target_sftp(client):
+    """An SFTP session on the target, or a clear exit if there is none."""
+    try:
+        return client.open_sftp()
+    except paramiko.SSHException as exc:
+        raise SystemExit(
+            "mssh: target has no sftp subsystem (%s); sshd needs a\n"
+            "      'Subsystem sftp' line. For a single file you can use:\n"
+            "  mssh TARGET -c 'cat > /remote/path' < ./local/path" % exc
+        )
+    except (socket.error, OSError) as exc:
+        raise SystemExit("mssh: cannot start sftp on the target: %s" % exc)
+
+
+def _human(size):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            if unit == "B":
+                return "%d B" % size
+            return "%.1f %s" % (size, unit)
+        size /= 1024.0
+
+
+class _Interrupted(Exception):
+    """Ctrl-C during a transfer, raised at a safe chunk boundary."""
+
+    def __init__(self, path=None, done=0):
+        Exception.__init__(self, "interrupted")
+        self.path = path
+        self.done = done
+
+
+# Ctrl-C cannot simply raise during an SFTP transfer.  The default handler
+# fires at an arbitrary bytecode boundary, which in practice is halfway
+# through reading a packet; paramiko then closes the remote file politely on
+# the way out, reads the rest of that packet as a header, and dies with
+# "Garbage packet received" -- an exception that *replaces* the
+# KeyboardInterrupt, so main() never sees it.  Even when the stream survives,
+# that close is synchronous and waits for every outstanding prefetch reply,
+# which for a large file over a slow chain means downloading the remainder
+# before exiting.  So the handler only records the request, and the transfer
+# callback acts on it between chunks.
+_ABORT = {"requested": False}
+
+
+def _install_abort_handler():
+    """Make SIGINT set a flag instead of raising.
+
+    Returns a callable that restores the previous handlers.
+    """
+    previous = None
+
+    def on_sigint(signum, frame):
+        if _ABORT["requested"]:
+            # Asked twice: the transfer is not responding, so stop being
+            # polite and let the interrupt through even if the unwind is
+            # untidy.  run_copy turns the fallout back into a clean exit.
+            try:
+                signal.signal(signal.SIGINT, signal.default_int_handler)
+            except Exception:
+                pass
+            raise KeyboardInterrupt
+        _ABORT["requested"] = True
+        sys.stderr.write("\nmssh: interrupting transfer...\n")
+        sys.stderr.flush()
+
+    _ABORT["requested"] = False
+
+    # Closing the channel strands paramiko's prefetch thread on a dead
+    # socket, and threading prints its traceback by default.  That death is
+    # the intended consequence of the teardown, not news, so drop it -- but
+    # only while an abort is in flight, and only for background threads.
+    old_hook = getattr(threading, "excepthook", None)
+
+    def thread_hook(args):
+        if _ABORT["requested"]:
+            return
+        if old_hook is not None:
+            old_hook(args)
+
+    if old_hook is not None:
+        threading.excepthook = thread_hook
+
+    try:
+        previous = signal.signal(signal.SIGINT, on_sigint)
+    except (ValueError, OSError, AttributeError):
+        return lambda: None
+
+    def restore():
+        try:
+            signal.signal(signal.SIGINT, previous)
+        except Exception:
+            pass
+        if old_hook is not None:
+            threading.excepthook = old_hook
+
+    return restore
+
+
+def _transfer_callback(sftp, label):
+    """Paramiko transfer callback: checks for Ctrl-C, then draws progress.
+
+    Paramiko calls this every 32 KiB, which makes it the natural place to
+    notice an abort request -- it is a chunk boundary, so the packet stream
+    is intact and we can tear the channel down deliberately.
+    """
+    try:
+        show = sys.stderr.isatty()
+    except Exception:
+        show = False
+
+    state = {"start": time.time(), "last": 0.0}
+    name = os.path.basename(label) or label
+
+    def callback(done, total):
+        if _ABORT["requested"]:
+            if show:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+            # Kill the channel before unwinding.  Paramiko's file close is
+            # synchronous and would otherwise wait for every outstanding
+            # prefetch reply; on a dead channel it raises EOFError instead,
+            # which paramiko swallows itself.
+            try:
+                sftp.sock.close()
+            except Exception:
+                pass
+            raise _Interrupted(label, done)
+
+        if not show:
+            return
+        now = time.time()
+        # Redraw at most ~8x/s, but never skip the final frame.
+        if now - state["last"] < 0.125 and 0 < done < total:
+            return
+        state["last"] = now
+        elapsed = now - state["start"]
+        pct = (100.0 * done / total) if total else 100.0
+        # Below half a second the rate is dominated by timer noise -- a
+        # 2 TiB/s first frame is worse than no number at all.
+        rate = "%s/s" % _human(done / elapsed) if elapsed >= 0.5 else ""
+        sys.stderr.write("\r\033[K%s  %s / %s  %3.0f%%  %s"
+                         % (name, _human(done), _human(total), pct, rate))
+        if total and done >= total:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+
+    return callback
+
+
+def _remote_isdir(sftp, path):
+    try:
+        return statmod.S_ISDIR(sftp.stat(path).st_mode)
+    except IOError:
+        return False
+
+
+def _apply_local_attrs(path, attrs):
+    """Copy mode and mtime from a remote stat onto a local path (-p)."""
+    try:
+        if attrs.st_mode is not None:
+            os.chmod(path, statmod.S_IMODE(attrs.st_mode))
+        if attrs.st_mtime is not None:
+            atime = attrs.st_atime if attrs.st_atime is not None \
+                else attrs.st_mtime
+            os.utime(path, (atime, attrs.st_mtime))
+    except OSError as exc:
+        sys.stderr.write("mssh: cannot preserve attributes on %s: %s\n"
+                         % (path, exc))
+
+
+def _apply_remote_attrs(sftp, path, st):
+    """Copy mode and mtime from a local stat onto a remote path (-p)."""
+    try:
+        sftp.chmod(path, statmod.S_IMODE(st.st_mode))
+        sftp.utime(path, (st.st_atime, st.st_mtime))
+    except IOError as exc:
+        sys.stderr.write("mssh: cannot preserve attributes on :%s: %s\n"
+                         % (path, exc))
+
+
+def _remote_mkdir(sftp, path):
+    if _remote_isdir(sftp, path):
+        return
+    try:
+        sftp.mkdir(path)
+    except IOError as exc:
+        # A parallel creation or an existing dir is fine; anything else is not.
+        if not _remote_isdir(sftp, path):
+            raise SystemExit("mssh: cannot create remote directory :%s: %s"
+                             % (path, exc))
+
+
+def _check_abort():
+    """Raise if Ctrl-C arrived.
+
+    Called where no transfer callback would fire: paramiko skips the callback
+    for a zero-byte file, so a tree of tiny files needs its own check.
+    """
+    if _ABORT["requested"]:
+        raise _Interrupted()
+
+
+def upload_path(sftp, local, remote, opts):
+    """Copy a local file or tree to ``remote`` (which is the final name)."""
+    _check_abort()
+    st = os.stat(local)                      # follows symlinks, like scp
+
+    if statmod.S_ISDIR(st.st_mode):
+        if not opts.recursive:
+            raise SystemExit("mssh: omitting directory %s (use -r)" % local)
+        _remote_mkdir(sftp, remote)
+        for name in sorted(os.listdir(local)):
+            upload_path(sftp, os.path.join(local, name),
+                        remote.rstrip("/") + "/" + name, opts)
+        # Attributes last: writing the contents bumps the directory mtime.
+        if opts.preserve:
+            _apply_remote_attrs(sftp, remote, st)
+        return
+
+    try:
+        sftp.put(local, remote, callback=_transfer_callback(sftp, local))
+    except _Interrupted:
+        raise
+    except IOError as exc:
+        raise SystemExit("mssh: cannot write :%s: %s" % (remote, exc))
+    if opts.preserve:
+        _apply_remote_attrs(sftp, remote, st)
+
+
+def download_path(sftp, remote, local, opts):
+    """Copy a remote file or tree to ``local`` (which is the final name)."""
+    _check_abort()
+    try:
+        attrs = sftp.stat(remote)            # follows symlinks, like scp
+    except IOError as exc:
+        raise SystemExit("mssh: cannot read :%s: %s" % (remote, exc))
+
+    if attrs.st_mode is not None and statmod.S_ISDIR(attrs.st_mode):
+        if not opts.recursive:
+            raise SystemExit("mssh: omitting remote directory :%s (use -r)"
+                             % remote)
+        if not os.path.isdir(local):
+            try:
+                os.makedirs(local)
+            except OSError as exc:
+                raise SystemExit("mssh: cannot create %s: %s" % (local, exc))
+        for entry in sorted(sftp.listdir_attr(remote),
+                            key=lambda a: a.filename):
+            download_path(sftp, remote.rstrip("/") + "/" + entry.filename,
+                          os.path.join(local, entry.filename), opts)
+        if opts.preserve:
+            _apply_local_attrs(local, attrs)
+        return
+
+    try:
+        sftp.get(remote, local,
+                 callback=_transfer_callback(sftp, remote),
+                 max_concurrent_prefetch_requests=MAX_PREFETCH)
+    except _Interrupted:
+        # A half-written file is worse than none: it looks complete to every
+        # tool that follows.  Drop it and name it, so nothing silently uses it.
+        try:
+            os.unlink(local)
+            sys.stderr.write("mssh: removed partial %s\n" % local)
+        except OSError:
+            pass
+        raise
+    except IOError as exc:
+        raise SystemExit("mssh: cannot write %s: %s" % (local, exc))
+    if opts.preserve:
+        _apply_local_attrs(local, attrs)
+
+
+def run_copy(client, opts):
+    """Serve the SOURCE... DEST form over one SFTP session on the target."""
+    try:
+        direction, sources, dest = plan_copy(opts.paths)
+    except ValueError as exc:
+        raise SystemExit("mssh: %s" % exc)
+
+    sftp = open_target_sftp(client)
+    restore_sigint = _install_abort_handler()
+    try:
+        if direction == "up":
+            for src in sources:
+                if not os.path.exists(src):
+                    raise SystemExit(
+                        "mssh: %s: no such file or directory" % src)
+            dest_is_dir = _remote_isdir(sftp, dest)
+            if len(sources) > 1 and not dest_is_dir:
+                raise SystemExit(
+                    "mssh: :%s is not a directory, but %d sources were given"
+                    % (dest, len(sources))
+                )
+            for src in sources:
+                target = dest
+                if dest_is_dir:
+                    base = os.path.basename(src.rstrip("/")) or src
+                    target = dest.rstrip("/") + "/" + base
+                verbose(opts, "upload %s -> :%s" % (src, target))
+                upload_path(sftp, src, target, opts)
+        else:
+            dest_is_dir = os.path.isdir(dest)
+            if len(sources) > 1 and not dest_is_dir:
+                raise SystemExit(
+                    "mssh: %s is not a directory, but %d sources were given"
+                    % (dest, len(sources))
+                )
+            for src in sources:
+                target = dest
+                if dest_is_dir:
+                    base = os.path.basename(src.rstrip("/")) or src
+                    target = os.path.join(dest, base)
+                verbose(opts, "download :%s -> %s" % (src, target))
+                download_path(sftp, src, target, opts)
+    except _Interrupted as exc:
+        # The channel may still be live (an abort noticed between files rather
+        # than mid-chunk); close it before the polite sftp.close() in the
+        # finally block can block waiting on a reply.
+        try:
+            sftp.sock.close()
+        except Exception:
+            pass
+        if exc.path is not None:
+            sys.stderr.write("mssh: interrupted %s at %s\n"
+                             % (os.path.basename(exc.path) or exc.path,
+                                _human(exc.done)))
+        else:
+            sys.stderr.write("mssh: interrupted\n")
+        return 130
+    except (paramiko.SSHException, EOFError) as exc:
+        # The channel we tore down on abort can surface as a protocol error
+        # while unwinding; report the interrupt, not the debris.
+        if _ABORT["requested"]:
+            sys.stderr.write("mssh: interrupted\n")
+            return 130
+        raise SystemExit("mssh: sftp error: %s" % exc)
+    finally:
+        restore_sigint()
+        try:
+            sftp.close()
+        except Exception:
+            pass
+    return 0
+
+
+# --------------------------------------------------------------------------
 # cli
 # --------------------------------------------------------------------------
 
@@ -958,6 +1381,16 @@ examples:
   mssh -j ops@10.0.0.1 root@192.168.1.10 -i ~/.ssh/id_ed25519
   mssh -j ops:pw@10.0.0.1 root@192.168.1.10 -i ~/.ssh/id_rsa
   mssh -j ops:pw@10.0.0.1 root:pw@192.168.1.10 -c 'uptime; df -h'
+
+file copy (SOURCE... DEST, a leading ':' marks the remote side):
+  mssh -j ops@10.0.0.1 root@10.0.0.9 ./app.tar :/tmp/      # upload
+  mssh -j ops@10.0.0.1 root@10.0.0.9 :/var/log/syslog ./   # download
+  mssh root@10.0.0.9 ./a ./b :/opt/pkg/   # several, DEST must be a dir
+  mssh -r root@10.0.0.9 ./dist :/srv/www/ # -r recurses into directories
+  mssh -rp root@10.0.0.9 :/etc/nginx ./   # -p keeps mode and mtime
+  mssh root@10.0.0.9 ./x :                # ':' alone is the remote $HOME
+  A local file whose own name starts with ':' is reachable as './:name'.
+  Runs over sftp on the target; add -C to compress large transfers.
 
 first-time key setup (then no more passwords):
   ssh-keygen -t ed25519                       # if you have no key yet
@@ -999,6 +1432,20 @@ def build_parser():
     parser.add_argument(
         "target", metavar="TARGET",
         help="final host as user[:password]@host[:port]",
+    )
+    parser.add_argument(
+        "paths", metavar="PATH", nargs="*",
+        help="SOURCE... DEST to copy files instead of logging in; a leading "
+             "':' marks the remote side, e.g. './app.tar :/tmp/' to upload "
+             "or ':/var/log/messages ./' to download",
+    )
+    parser.add_argument(
+        "-r", "--recursive", action="store_true",
+        help="copy directories recursively",
+    )
+    parser.add_argument(
+        "-p", "--preserve", action="store_true",
+        help="preserve mode and modification time on copied files",
     )
     parser.add_argument(
         "-c", "--command", metavar="CMD",
@@ -1082,6 +1529,24 @@ def main(argv=None):
             return 2
         opts.copy_id = found
 
+    # Reject the impossible combinations before opening any connection.
+    if opts.paths:
+        if opts.command:
+            parser.error("-c and a file copy are mutually exclusive")
+            return 2
+        if opts.copy_id:
+            parser.error("--copy-id installs a key and exits; it cannot also "
+                         "copy files")
+            return 2
+        try:
+            plan_copy(opts.paths)
+        except ValueError as exc:
+            parser.error(str(exc))
+            return 2
+    elif opts.recursive or opts.preserve:
+        parser.error("-r/-p only apply to a file copy; pass SOURCE and DEST")
+        return 2
+
     import logging
     if opts.verbose:
         # Match paramiko's own output to the mssh timestamp format so the
@@ -1105,6 +1570,8 @@ def main(argv=None):
         # every hop is the whole job, so stop before any shell or command.
         if opts.copy_id:
             return 0
+        if opts.paths:
+            return run_copy(tgt, opts)
         if opts.command:
             return run_command(tgt, opts.command, opts)
         return run_interactive(tgt, opts)
