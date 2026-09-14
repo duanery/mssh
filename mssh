@@ -1,0 +1,913 @@
+#!/usr/bin/env python3.12
+# -*- coding: utf-8 -*-
+"""
+mssh - Multi-hop SSH login tool.
+
+Usage:
+    mssh -j jump1_user:password@ip:port -j jump2_user:password@ip:port target_user:password@ip:port
+
+Each -j/--jump adds one jump host, applied in the order given.  The final
+positional argument is the target host.  mssh chains direct-tcpip channels
+through every jump host, so no credentials or traffic are exposed to the
+intermediate boxes beyond the TCP forwarding itself.
+
+Endpoint format:
+    user[:password]@host[:port]
+
+  * port defaults to 22 and may be omitted:      user@host
+  * the password goes before the '@':            user:secret@host
+  * the credential part splits on the LAST '@', and the password is the
+    rest after the first ':', so ':' and '@' inside it are fine:
+                                                 user:p:a@ss@host:22
+  * omit the password to use key auth / ssh-agent, or to be prompted.
+  * IPv6 must be bracketed:                      user:pw@[::1]:22
+"""
+
+from __future__ import print_function
+
+import argparse
+import datetime
+import getpass
+import os
+import re
+import select
+import signal
+import socket
+import sys
+import threading
+import time
+
+__version__ = "1.0.0"
+
+try:
+    import paramiko
+except ImportError:  # pragma: no cover
+    sys.stderr.write(
+        "mssh: paramiko is required.\n"
+        "      install it with:  pip3 install paramiko\n"
+    )
+    sys.exit(3)
+
+
+# Process start, used for the +elapsed column in verbose output.
+_START_TIME = time.time()
+
+DEFAULT_PORT = 22
+DEFAULT_TIMEOUT = 20
+
+# Standard key names, best algorithm first. Single source of truth for
+# both "which key would we use" and "do we have any key at all".
+# ed25519 leads: it is the modern default and, unlike RSA, still works
+# against old servers that only accept SHA-1 ssh-rsa signatures (paramiko
+# 5 dropped SHA-1 signing, so an RSA key silently fails against those).
+DEFAULT_KEY_NAMES = ("id_ed25519", "id_ecdsa", "id_rsa")
+
+
+# --------------------------------------------------------------------------
+# endpoint parsing
+# --------------------------------------------------------------------------
+
+class Endpoint(object):
+    """One SSH endpoint: user, host, port and optional password."""
+
+    __slots__ = ("user", "host", "port", "password", "raw")
+
+    def __init__(self, user, host, port, password, raw):
+        self.user = user
+        self.host = host
+        self.port = port
+        self.password = password
+        self.raw = raw
+
+    def __str__(self):
+        return "%s@%s:%d" % (self.user, self.host, self.port)
+
+    def masked(self):
+        return "%s@%s:%d%s" % (
+            self.user, self.host, self.port,
+            ":***" if self.password is not None else "",
+        )
+
+
+def parse_endpoint(spec):
+    """Parse 'user[:password]@host[:port]' into an Endpoint.
+
+    The credential part is split from the host part on the LAST '@', so a
+    password may itself contain '@' and ':'.  The port, when given, must be
+    numeric -- unlike the old trailing-password format there is no ambiguity
+    between a port and a password.
+    """
+    if not spec:
+        raise ValueError("empty endpoint")
+
+    if "@" not in spec:
+        raise ValueError(
+            "missing '@' in %r, expected user[:password]@host[:port]" % spec
+        )
+
+    # Split on the LAST '@': the host part never contains '@', but a
+    # password may.
+    cred, _, hostpart = spec.rpartition("@")
+
+    # Credentials: user[:password]; the password is the remainder, so ':'
+    # inside it is fine.
+    user, sep, password = cred.partition(":")
+    if not user:
+        raise ValueError("missing user in %r" % spec)
+    if not sep:
+        password = None
+    elif password == "":
+        # 'user:@host' -- an explicit but empty password means "ask me".
+        password = None
+
+    if not hostpart:
+        raise ValueError("missing host in %r" % spec)
+
+    # Host: bare, or a bracketed IPv6 literal, each with an optional :port.
+    if hostpart.startswith("["):
+        end = hostpart.find("]")
+        if end < 0:
+            raise ValueError("unterminated '[' in %r" % spec)
+        host = hostpart[1:end]
+        tail = hostpart[end + 1:]
+        if not tail:
+            portstr = None
+        elif tail.startswith(":"):
+            portstr = tail[1:]
+        else:
+            raise ValueError("junk after ']' in %r" % spec)
+    else:
+        if hostpart.count(":") > 1:
+            # Most likely the old user@host:port:password layout.
+            raise ValueError(
+                "too many ':' in host part of %r; the format is now "
+                "user[:password]@host[:port] -- move the password before "
+                "the '@' (bracket IPv6 as user@[::1]:port)" % spec
+            )
+        host, sep, rest = hostpart.partition(":")
+        portstr = rest if sep else None
+
+    if not host:
+        raise ValueError("missing host in %r" % spec)
+
+    port = DEFAULT_PORT
+    if portstr is not None:
+        if not portstr.isdigit():
+            raise ValueError(
+                "port must be numeric in %r, got %r; the format is now "
+                "user[:password]@host[:port] -- if that was a password, "
+                "move it before the '@'" % (spec, portstr)
+            )
+        port = int(portstr)
+        if not 0 < port < 65536:
+            raise ValueError("port out of range in %r" % spec)
+
+    return Endpoint(user, host, port, password, spec)
+
+
+# --------------------------------------------------------------------------
+# connection chain
+# --------------------------------------------------------------------------
+
+def connect_hop(endpoint, sock=None, opts=None, index=0, total=1):
+    """Open one SSH connection, optionally over an existing socket/channel."""
+    client = paramiko.SSHClient()
+
+    if opts.known_hosts:
+        try:
+            client.load_host_keys(os.path.expanduser(opts.known_hosts))
+        except IOError:
+            pass
+    else:
+        client.load_system_host_keys()
+
+    if opts.strict:
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    else:
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    password = endpoint.password
+    if password is None and not opts.no_prompt and not opts.identity:
+        # Only prompt if we have no other plausible credential source.
+        if not _has_usable_key(opts):
+            try:
+                password = getpass.getpass(
+                    "password for %s: " % endpoint
+                )
+            except (EOFError, KeyboardInterrupt):
+                raise SystemExit("\nmssh: aborted")
+            if password == "":
+                password = None
+
+    kwargs = dict(
+        hostname=endpoint.host,
+        port=endpoint.port,
+        username=endpoint.user,
+        password=password,
+        sock=sock,
+        timeout=opts.timeout,
+        banner_timeout=opts.timeout,
+        auth_timeout=opts.timeout,
+        allow_agent=not opts.no_agent,
+        look_for_keys=not opts.no_keys,
+        compress=opts.compress,
+    )
+    if opts.identity:
+        paths = [os.path.expanduser(p) for p in opts.identity]
+        for path in paths:
+            if not os.path.exists(path):
+                raise SystemExit("mssh: identity file not found: %s" % path)
+        kwargs["key_filename"] = paths
+        # If any key is encrypted, get the passphrase up front. Otherwise
+        # paramiko silently skips the key and the hop just looks like a
+        # plain auth failure, which sends you debugging the wrong thing.
+        phrase = _identity_passphrase(paths, opts)
+        if phrase is not None:
+            kwargs["passphrase"] = phrase
+
+    label = "hop %d/%d" % (index + 1, total)
+    verbose(opts, "%s: connecting to %s" % (label, endpoint.masked()))
+
+    started = time.time()
+    try:
+        client.connect(**kwargs)
+    except paramiko.AuthenticationException:
+        raise SystemExit("mssh: %s: authentication failed for %s%s"
+                         % (label, endpoint, _auth_hint(client, opts)))
+    except paramiko.BadHostKeyException as exc:
+        raise SystemExit("mssh: %s: host key mismatch for %s: %s" % (label, endpoint, exc))
+    except paramiko.SSHException as exc:
+        # "Invalid key" here is usually the legacy-RSA problem, not a
+        # corrupt key file, so attach the same hint.
+        extra = _auth_hint(client, opts) if "key" in str(exc).lower() else ""
+        raise SystemExit("mssh: %s: ssh error to %s: %s%s"
+                         % (label, endpoint, exc, extra))
+    except socket.timeout:
+        raise SystemExit("mssh: %s: timed out connecting to %s" % (label, endpoint))
+    except (socket.error, OSError) as exc:
+        raise SystemExit("mssh: %s: cannot reach %s: %s" % (label, endpoint, exc))
+
+    transport = client.get_transport()
+    if transport is not None and opts.keepalive > 0:
+        transport.set_keepalive(opts.keepalive)
+
+    verbose(opts, "%s: connected to %s in %.3fs" % (label, endpoint, time.time() - started))
+    return client
+
+
+def _key_loaders():
+    """Available paramiko key classes (DSSKey was removed in paramiko 5)."""
+    names = ("Ed25519Key", "RSAKey", "ECDSAKey", "DSSKey")
+    return [getattr(paramiko, n) for n in names if hasattr(paramiko, n)]
+
+
+def _is_encrypted_key(path):
+    """True if the private key file needs a passphrase to load."""
+    for loader in _key_loaders():
+        try:
+            loader.from_private_key_file(path)
+            return False            # loaded fine, not encrypted
+        except paramiko.PasswordRequiredException:
+            return True             # definitely encrypted
+        except Exception:
+            continue                # wrong key type, try the next loader
+    return False
+
+
+_PASSPHRASE_CACHE = {}
+
+
+def _identity_passphrase(paths, opts):
+    """Passphrase for the first encrypted -i key, prompting once per file."""
+    for path in paths:
+        if path in _PASSPHRASE_CACHE:
+            return _PASSPHRASE_CACHE[path]
+        if not _is_encrypted_key(path):
+            continue
+        if opts.no_prompt:
+            raise SystemExit(
+                "mssh: identity %s is passphrase-protected and --no-prompt "
+                "is set; use ssh-agent or an unencrypted key" % path
+            )
+        try:
+            phrase = getpass.getpass("passphrase for %s: " % path)
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit("\nmssh: aborted")
+        _PASSPHRASE_CACHE[path] = phrase
+        return phrase
+    return None
+
+
+def _rsa_only_identities(opts):
+    """RSA key files among the identities we would actually offer."""
+    if opts.identity:
+        paths = [os.path.expanduser(p) for p in opts.identity]
+    else:
+        ssh_dir = os.path.expanduser("~/.ssh")
+        paths = [os.path.join(ssh_dir, n) for n in DEFAULT_KEY_NAMES]
+        paths = [p for p in paths if os.path.exists(p)]
+    if not paths:
+        return []
+    rsa = []
+    for path in paths:
+        try:
+            with open(path, "rb") as handle:
+                head = handle.read(120)
+        except IOError:
+            continue
+        # Any non-RSA key in play means SHA-1 is not the bottleneck.
+        if b"OPENSSH PRIVATE KEY" in head:
+            # Modern container: inspect the actual type.
+            try:
+                paramiko.Ed25519Key.from_private_key_file(path)
+                return []          # ed25519 available, no RSA problem
+            except paramiko.PasswordRequiredException:
+                return []
+            except Exception:
+                pass
+        if b"RSA PRIVATE KEY" in head or b"OPENSSH PRIVATE KEY" in head:
+            rsa.append(path)
+    return rsa
+
+
+def _auth_hint(client, opts):
+    """Explain the paramiko-5 + legacy-server RSA trap when it applies.
+
+    Servers older than OpenSSH 7.8 accept only SHA-1 "ssh-rsa" signatures
+    and do not advertise server-sig-algs. Paramiko 5 removed SHA-1 signing
+    entirely, so an RSA key that works fine with the ssh(1) client fails
+    here with a bare "authentication failed". Point at ed25519, which both
+    sides do support.
+    """
+    try:
+        transport = client.get_transport()
+        banner = (transport.remote_version or "") if transport else ""
+    except Exception:
+        banner = ""
+
+    if not _server_lacks_sha2(banner):
+        return ""
+    if not _rsa_only_identities(opts):
+        return ""
+
+    return (
+        "\n  the server is %s, which only accepts legacy SHA-1 'ssh-rsa'\n"
+        "  signatures; paramiko %s cannot produce those, so your RSA key\n"
+        "  cannot be used here even though ssh(1) accepts it.\n"
+        "  Use an ed25519 key instead:\n"
+        "      ssh-keygen -t ed25519\n"
+        "  then install it on every hop with --copy-id and the same -j\n"
+        "  chain (ssh-copy-id cannot reach a host behind jumps),\n"
+        "  and re-run mssh (add -i ~/.ssh/id_ed25519 if needed)."
+        % (banner or "an old OpenSSH", paramiko.__version__)
+    )
+
+
+def _server_lacks_sha2(banner):
+    """True for OpenSSH older than 7.8, which predates rsa-sha2-*."""
+    match = re.search(r"OpenSSH[_-](\d+)\.(\d+)", banner or "")
+    if not match:
+        return False
+    major, minor = int(match.group(1)), int(match.group(2))
+    return (major, minor) < (7, 8)
+
+
+def _has_usable_key(opts):
+    """Rough guess at whether key/agent auth could work without a password."""
+    if opts.identity:
+        return True
+    if not opts.no_agent and os.environ.get("SSH_AUTH_SOCK"):
+        return True
+    if not opts.no_keys:
+        ssh_dir = os.path.expanduser("~/.ssh")
+        for name in DEFAULT_KEY_NAMES:
+            if os.path.exists(os.path.join(ssh_dir, name)):
+                return True
+    return False
+
+
+def _default_pubkey():
+    """First plausible public key in ~/.ssh, for a bare --copy-id."""
+    ssh_dir = os.path.expanduser("~/.ssh")
+    for name in DEFAULT_KEY_NAMES:
+        path = os.path.join(ssh_dir, name + ".pub")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def read_pubkey(path):
+    """Read and sanity-check a public key file, returning one line."""
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        raise SystemExit("mssh: public key not found: %s" % path)
+    try:
+        with open(path, "r") as handle:
+            content = handle.read()
+    except IOError as exc:
+        raise SystemExit("mssh: cannot read %s: %s" % (path, exc))
+
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    if not lines:
+        raise SystemExit("mssh: %s is empty" % path)
+
+    # Check for a private key first: it is the dangerous mistake, and it is
+    # also multi-line, so this must precede the "several keys" check.
+    if "PRIVATE KEY" in content or lines[0].startswith("-----"):
+        raise SystemExit(
+            "mssh: %s looks like a PRIVATE key -- pass the .pub file instead "
+            "(e.g. %s.pub). Never copy a private key to a remote host." % (path, path)
+        )
+    if len(lines) > 1:
+        raise SystemExit("mssh: %s holds several keys; point --copy-id at one"
+                         % path)
+
+    key = lines[0]
+    if not key.split()[0].startswith(("ssh-", "ecdsa-", "sk-")):
+        raise SystemExit("mssh: %s is not a valid public key line" % path)
+    return key
+
+
+def install_pubkey(client, endpoint, pubkey, opts, label):
+    """Append pubkey to the remote authorized_keys, idempotently.
+
+    Runs a small shell snippet remotely: it creates ~/.ssh with the right
+    modes, skips the write if the key is already present, and keeps a
+    timestamped backup the first time it touches the file.
+    """
+    # Single-quote the key for the remote shell; keys have no quotes, but
+    # be strict anyway rather than trusting the input.
+    quoted = "'" + pubkey.replace("'", "'\\''") + "'"
+    script = (
+        'set -e; '
+        'KEY=%s; '
+        'DIR="$HOME/.ssh"; FILE="$DIR/authorized_keys"; '
+        'mkdir -p "$DIR"; chmod 700 "$DIR"; '
+        'touch "$FILE"; chmod 600 "$FILE"; '
+        'if grep -qxF "$KEY" "$FILE" 2>/dev/null; then '
+        '  echo MSSH_ALREADY_PRESENT; '
+        'else '
+        '  cp -p "$FILE" "$FILE.mssh-bak.$(date +%%Y%%m%%d%%H%%M%%S)" '
+        '    2>/dev/null || true; '
+        '  printf "%%s\\n" "$KEY" >> "$FILE"; '
+        '  echo MSSH_KEY_ADDED; '
+        'fi'
+    ) % quoted
+
+    transport = client.get_transport()
+    chan = transport.open_session(timeout=opts.timeout)
+    try:
+        chan.exec_command(script)
+        out = b""
+        err = b""
+        while True:
+            if chan.recv_ready():
+                out += chan.recv(65536)
+                continue
+            if chan.recv_stderr_ready():
+                err += chan.recv_stderr(65536)
+                continue
+            if chan.exit_status_ready():
+                break
+            select.select([chan], [], [], 0.1)
+        # Drain anything buffered after exit.
+        while chan.recv_ready():
+            out += chan.recv(65536)
+        while chan.recv_stderr_ready():
+            err += chan.recv_stderr(65536)
+        status = chan.recv_exit_status()
+    finally:
+        chan.close()
+
+    text = out.decode("utf-8", "replace")
+    if status != 0 or "MSSH_" not in text:
+        detail = err.decode("utf-8", "replace").strip() or "exit %d" % status
+        sys.stderr.write("mssh: %s: could not install key on %s: %s\n"
+                         % (label, endpoint, detail))
+        return False
+
+    if "MSSH_ALREADY_PRESENT" in text:
+        sys.stderr.write("mssh: %s: key already present on %s\n" % (label, endpoint))
+    else:
+        sys.stderr.write("mssh: %s: key installed on %s\n" % (label, endpoint))
+    return True
+
+
+def build_chain(jumps, target, opts):
+    """Connect through every jump host, return (clients, target_client)."""
+    clients = []
+    sock = None
+    hops = jumps + [target]
+    pubkey = read_pubkey(opts.copy_id) if opts.copy_id else None
+
+    try:
+        for i, hop in enumerate(hops):
+            client = connect_hop(hop, sock=sock, opts=opts, index=i, total=len(hops))
+            clients.append(client)
+
+            if pubkey is not None:
+                install_pubkey(client, hop, pubkey, opts,
+                               "hop %d/%d" % (i + 1, len(hops)))
+
+            if i + 1 < len(hops):
+                nxt = hops[i + 1]
+                transport = client.get_transport()
+                opened = time.time()
+                try:
+                    sock = transport.open_channel(
+                        "direct-tcpip",
+                        dest_addr=(nxt.host, nxt.port),
+                        src_addr=("127.0.0.1", 0),
+                        timeout=opts.timeout,
+                    )
+                except paramiko.SSHException as exc:
+                    raise SystemExit(
+                        "mssh: hop %d: %s refused to forward to %s:%d: %s"
+                        % (i + 1, hop, nxt.host, nxt.port, exc)
+                    )
+                verbose(opts, "hop %d/%d: tunnel %s -> %s:%d open in %.3fs"
+                        % (i + 1, len(hops), hop, nxt.host, nxt.port,
+                           time.time() - opened))
+    except BaseException:
+        close_all(clients)
+        raise
+
+    verbose(opts, "chain established: %d hop(s) in %.3fs total"
+            % (len(hops), time.time() - _START_TIME))
+    return clients, clients[-1]
+
+
+def close_all(clients):
+    for client in reversed(clients):
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# interactive shell
+# --------------------------------------------------------------------------
+
+def term_size():
+    try:
+        import fcntl
+        import struct
+        import termios
+        packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ,
+                             struct.pack("HHHH", 0, 0, 0, 0))
+        rows, cols = struct.unpack("HHHH", packed)[:2]
+        if rows and cols:
+            return cols, rows
+    except Exception:
+        pass
+    try:
+        import shutil
+        size = shutil.get_terminal_size((80, 24))
+        return size.columns, size.lines
+    except Exception:
+        return 80, 24
+
+
+def posix_shell(chan):
+    """Bridge the local tty and the remote channel until either closes."""
+    import termios
+    import tty
+
+    stdin_fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(stdin_fd)
+
+    resized = [False]
+
+    def on_winch(signum, frame):
+        resized[0] = True
+
+    old_winch = None
+    try:
+        old_winch = signal.signal(signal.SIGWINCH, on_winch)
+    except (ValueError, AttributeError, OSError):
+        pass
+
+    try:
+        tty.setraw(stdin_fd)
+        tty.setcbreak(stdin_fd)
+        chan.settimeout(0.0)
+
+        while True:
+            if resized[0]:
+                resized[0] = False
+                cols, rows = term_size()
+                try:
+                    chan.resize_pty(width=cols, height=rows)
+                except Exception:
+                    pass
+
+            try:
+                ready, _, _ = select.select([chan, stdin_fd], [], [], 0.2)
+            except select.error:
+                continue
+            except InterruptedError:
+                continue
+
+            if chan in ready:
+                try:
+                    data = chan.recv(65536)
+                except socket.timeout:
+                    data = b""
+                except Exception:
+                    break
+                if len(data) == 0:
+                    break
+                os.write(sys.stdout.fileno(), data)
+
+            if stdin_fd in ready:
+                try:
+                    data = os.read(stdin_fd, 4096)
+                except OSError:
+                    break
+                if len(data) == 0:
+                    try:
+                        chan.shutdown_write()
+                    except Exception:
+                        pass
+                    break
+                try:
+                    chan.sendall(data)
+                except Exception:
+                    break
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
+        if old_winch is not None:
+            try:
+                signal.signal(signal.SIGWINCH, old_winch)
+            except Exception:
+                pass
+
+
+def pipe_shell(chan):
+    """Non-tty fallback: pump stdin/stdout without raw mode."""
+    def reader():
+        while True:
+            try:
+                data = chan.recv(65536)
+            except Exception:
+                break
+            if not data:
+                break
+            sys.stdout.buffer.write(data)
+            sys.stdout.flush()
+
+    thread = threading.Thread(target=reader)
+    thread.daemon = True
+    thread.start()
+
+    try:
+        while True:
+            data = sys.stdin.buffer.read(4096)
+            if not data:
+                break
+            chan.sendall(data)
+        chan.shutdown_write()
+    except Exception:
+        pass
+    thread.join(timeout=2)
+
+
+def run_interactive(client, opts):
+    transport = client.get_transport()
+    chan = transport.open_session(timeout=opts.timeout)
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if interactive:
+        cols, rows = term_size()
+        chan.get_pty(term=os.environ.get("TERM", "xterm-256color"),
+                     width=cols, height=rows)
+    chan.invoke_shell()
+
+    if interactive:
+        posix_shell(chan)
+    else:
+        pipe_shell(chan)
+
+    status = 0
+    try:
+        if chan.exit_status_ready():
+            status = chan.recv_exit_status()
+    except Exception:
+        pass
+    chan.close()
+    return status
+
+
+def run_command(client, command, opts):
+    transport = client.get_transport()
+    chan = transport.open_session(timeout=opts.timeout)
+    if opts.force_tty:
+        cols, rows = term_size()
+        chan.get_pty(term=os.environ.get("TERM", "xterm-256color"),
+                     width=cols, height=rows)
+    chan.exec_command(command)
+
+    chan.settimeout(0.0)
+    stdout_fd = sys.stdout.buffer
+    stderr_fd = sys.stderr.buffer
+
+    while True:
+        got = False
+        if chan.recv_ready():
+            data = chan.recv(65536)
+            if data:
+                stdout_fd.write(data)
+                stdout_fd.flush()
+                got = True
+        if chan.recv_stderr_ready():
+            data = chan.recv_stderr(65536)
+            if data:
+                stderr_fd.write(data)
+                stderr_fd.flush()
+                got = True
+        if not got:
+            if chan.exit_status_ready() and not chan.recv_ready() \
+                    and not chan.recv_stderr_ready():
+                break
+            select.select([chan], [], [], 0.1)
+
+    status = chan.recv_exit_status()
+    chan.close()
+    return status
+
+
+# --------------------------------------------------------------------------
+# cli
+# --------------------------------------------------------------------------
+
+def verbose(opts, message):
+    if opts.verbose:
+        now = datetime.datetime.now()
+        stamp = now.strftime("%H:%M:%S.") + "%03d" % (now.microsecond // 1000)
+        elapsed = time.time() - _START_TIME
+        sys.stderr.write("[%s +%7.3fs] mssh: %s\n" % (stamp, elapsed, message))
+        sys.stderr.flush()
+
+
+EPILOG = """\
+endpoint format:
+  user[:password]@host[:port]
+  port defaults to 22 and must be numeric; the password goes before the '@'
+  and may contain ':' and '@'.  Bracket IPv6 hosts: user:pw@[::1]:22
+
+examples:
+  mssh -j ops:jumppw@10.0.0.1:22 root:rootpw@192.168.1.10:22
+  mssh -j a:pw1@1.1.1.1:2222 -j b:pw2@10.0.0.5 app:pw3@172.16.0.9:22
+  mssh -j ops@10.0.0.1 root@192.168.1.10 -i ~/.ssh/id_ed25519
+  mssh -j ops:pw@10.0.0.1 root@192.168.1.10 -i ~/.ssh/id_rsa
+  mssh -j ops:pw@10.0.0.1 root:pw@192.168.1.10 -c 'uptime; df -h'
+
+first-time key setup (then no more passwords):
+  ssh-keygen -t ed25519                       # if you have no key yet
+  mssh --copy-id -j ops:pw1@10.0.0.1 root:pw2@10.0.0.9
+  mssh -j ops@10.0.0.1 root@10.0.0.9          # subsequent logins, key auth
+
+security note:
+  passwords on the command line are visible in `ps` and shell history.
+  Prefer keys, or omit the password and let mssh prompt for it.
+
+legacy servers:
+  against OpenSSH older than 7.8, RSA keys cannot be used: those servers
+  accept only SHA-1 'ssh-rsa' signatures, which paramiko 5 no longer
+  produces. Use an ed25519 key (ssh-keygen -t ed25519) instead.
+"""
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="mssh",
+        description="Multi-hop SSH login through one or more jump hosts.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-j", "--jump", action="append", default=[], metavar="SPEC",
+        help="jump host as user[:password]@host[:port]; repeat for each hop, in order",
+    )
+    parser.add_argument(
+        "target", metavar="TARGET",
+        help="final host as user[:password]@host[:port]",
+    )
+    parser.add_argument(
+        "-c", "--command", metavar="CMD",
+        help="run CMD on the target and exit instead of opening a shell",
+    )
+    parser.add_argument(
+        "-i", "--identity", action="append", metavar="KEYFILE",
+        help="private key file to authenticate with, e.g. ~/.ssh/id_rsa; "
+             "repeat to offer several. Applies to every hop. Prompts once "
+             "for the passphrase if the key is encrypted",
+    )
+    parser.add_argument(
+        "--copy-id", nargs="?", const="", metavar="PUBKEY",
+        help="install a public key into ~/.ssh/authorized_keys on every hop, "
+             "then exit without opening a shell or running -c, so later "
+             "connections need no password. "
+             "Defaults to ~/.ssh/id_ed25519.pub or id_rsa.pub",
+    )
+    parser.add_argument(
+        "-t", "--force-tty", action="store_true",
+        help="allocate a pty even with -c",
+    )
+    parser.add_argument(
+        "-o", "--timeout", type=float, default=DEFAULT_TIMEOUT, metavar="SEC",
+        help="per-hop connect timeout in seconds (default: %d)" % DEFAULT_TIMEOUT,
+    )
+    parser.add_argument(
+        "-k", "--keepalive", type=int, default=30, metavar="SEC",
+        help="keepalive interval, 0 to disable (default: 30)",
+    )
+    parser.add_argument(
+        "-C", "--compress", action="store_true", help="enable compression",
+    )
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="reject unknown host keys instead of auto-adding them",
+    )
+    parser.add_argument(
+        "--known-hosts", metavar="FILE", help="known_hosts file to load",
+    )
+    parser.add_argument(
+        "--no-agent", action="store_true", help="do not use ssh-agent",
+    )
+    parser.add_argument(
+        "--no-keys", action="store_true", help="do not look for keys in ~/.ssh",
+    )
+    parser.add_argument(
+        "--no-prompt", action="store_true",
+        help="never prompt for a missing password (fail instead)",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="log each hop to stderr",
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version="mssh " + __version__,
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    opts = parser.parse_args(argv)
+
+    try:
+        jumps = [parse_endpoint(spec) for spec in opts.jump]
+        target = parse_endpoint(opts.target)
+    except ValueError as exc:
+        parser.error(str(exc))
+        return 2
+
+    # --copy-id with no argument: fall back to a standard public key.
+    if opts.copy_id == "":
+        found = _default_pubkey()
+        if found is None:
+            parser.error(
+                "no public key found in ~/.ssh. Generate one with:\n"
+                "    ssh-keygen -t ed25519\n"
+                "  (press Enter at each prompt for a passwordless key), "
+                "or pass --copy-id <file>"
+            )
+            return 2
+        opts.copy_id = found
+
+    import logging
+    if opts.verbose:
+        # Match paramiko's own output to the mssh timestamp format so the
+        # two interleave readably on stderr.
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter(
+            fmt="[%(asctime)s.%(msecs)03d] paramiko: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        plog = logging.getLogger("paramiko")
+        plog.handlers = [handler]
+        plog.setLevel(logging.WARNING)
+        plog.propagate = False
+    else:
+        logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+
+    clients = []
+    try:
+        clients, tgt = build_chain(jumps, target, opts)
+        # --copy-id is a setup action, not a login: installing the key on
+        # every hop is the whole job, so stop before any shell or command.
+        if opts.copy_id:
+            return 0
+        if opts.command:
+            return run_command(tgt, opts.command, opts)
+        return run_interactive(tgt, opts)
+    except KeyboardInterrupt:
+        sys.stderr.write("\nmssh: interrupted\n")
+        return 130
+    finally:
+        close_all(clients)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
