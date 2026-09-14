@@ -849,33 +849,88 @@ def run_command(client, command, opts):
                      width=cols, height=rows)
     chan.exec_command(command)
 
+    if opts.force_tty and sys.stdin.isatty() and sys.stdout.isatty():
+        # The remote pty echoes and handles line editing, so the local tty has
+        # to stay out of the way -- the same bridge an interactive login uses.
+        posix_shell(chan)
+    else:
+        pump_command(chan)
+
+    status = chan.recv_exit_status()
+    chan.close()
+    return status
+
+
+def stdin_fd():
+    """The fd to forward to the remote, or None if there is nothing to read."""
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, ValueError, IOError):
+        return None
+    try:
+        os.fstat(fd)
+    except OSError:
+        return None
+    return fd
+
+
+def pump_command(chan):
+    """Forward stdin to the remote command and its output back, until it exits.
+
+    stdin matters more than it looks: anything that reads input -- `-c cat`, a
+    prompt, a pipeline fed from a local file -- hangs forever if we only drain
+    the channel, which is what ssh(1) would never do.
+    """
     chan.settimeout(0.0)
-    stdout_fd = sys.stdout.buffer
-    stderr_fd = sys.stderr.buffer
+    out = sys.stdout.buffer
+    err = sys.stderr.buffer
+    infd = stdin_fd()
 
     while True:
         got = False
         if chan.recv_ready():
             data = chan.recv(65536)
             if data:
-                stdout_fd.write(data)
-                stdout_fd.flush()
+                out.write(data)
+                out.flush()
                 got = True
         if chan.recv_stderr_ready():
             data = chan.recv_stderr(65536)
             if data:
-                stderr_fd.write(data)
-                stderr_fd.flush()
+                err.write(data)
+                err.flush()
                 got = True
-        if not got:
-            if chan.exit_status_ready() and not chan.recv_ready() \
-                    and not chan.recv_stderr_ready():
-                break
-            select.select([chan], [], [], 0.1)
+        if got:
+            continue
 
-    status = chan.recv_exit_status()
-    chan.close()
-    return status
+        if chan.exit_status_ready() and not chan.recv_ready() \
+                and not chan.recv_stderr_ready():
+            break
+
+        watch = [chan] if infd is None else [chan, infd]
+        try:
+            ready, _, _ = select.select(watch, [], [], 0.1)
+        except (select.error, InterruptedError):
+            continue
+
+        if infd is not None and infd in ready:
+            try:
+                data = os.read(infd, 65536)
+            except OSError:
+                data = b""
+            if data:
+                try:
+                    chan.sendall(data)
+                except Exception:
+                    break
+            else:
+                # Local EOF: close the remote's stdin so it can finish, then
+                # stay in the loop to collect whatever it still prints.
+                infd = None
+                try:
+                    chan.shutdown_write()
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------
