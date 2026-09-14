@@ -22,10 +22,12 @@ Endpoint format:
   * omit the password to use key auth / ssh-agent, or to be prompted.
   * IPv6 must be bracketed:                      user:pw@[::1]:22
 
-File copy (instead of logging in), cp-style, ':' marking the remote side:
-    mssh -j jump@ip target@ip ./app.tar :/tmp/         # upload
-    mssh -j jump@ip target@ip :/var/log/syslog ./      # download
-    mssh -rp -j jump@ip target@ip ./dist :/srv/www/    # tree, keep attrs
+File copy (instead of logging in), scp-style: the remote side of the copy
+carries the endpoint, with ':' and the path appended.  The path may be
+absolute or relative to the remote home directory.
+    mssh -j jump@ip ./app.tar target@ip:/tmp/          # upload
+    mssh -j jump@ip target@ip:/var/log/syslog ./       # download
+    mssh -rp -j jump@ip ./dist target@ip:/srv/www/     # tree, keep attrs
 """
 
 from __future__ import print_function
@@ -949,36 +951,80 @@ def pump_command(chan):
 # file copy
 # --------------------------------------------------------------------------
 
-def split_copy_path(arg):
-    """Split a copy argument into (is_remote, path).
+def split_copy_arg(arg):
+    """Split a copy argument into (endpoint_or_None, path).
 
-    A leading ':' marks the remote side, so the target endpoint stays its own
-    argument and there is no ambiguity with user:password@host:port.  A bare
-    ':' means the remote home directory.  A local file whose name really does
-    start with ':' is reachable as './:name'.
+    A remote file is written the way a login target is, with ':' and the
+    path appended:  user[:password]@host[:port]:path.  The path may be
+    absolute or relative to the remote home directory, and a trailing ':'
+    with nothing after it means that home directory, as in scp.
+
+        root@10.0.0.9:/var/log/syslog      absolute
+        root@10.0.0.9:logs/today.log       relative to ~
+        root@10.0.0.9:36001:/var/log/x     with a port
+        root@10.0.0.9:                     the home directory itself
+
+    A local path is told apart by its lack of a credential part: everything
+    before the last '@' must be non-empty and hold no '/', so
+    './mail@archive/x' stays local.  Two things cannot be written here: a
+    password containing '/', and a relative remote path that is all digits
+    (it would read as a port -- write './2222' instead).
     """
-    if arg.startswith(":"):
-        path = arg[1:]
-        return True, path if path else "."
-    return False, arg
+    if "@" not in arg:
+        return None, arg
+
+    cred, _, hostpart = arg.rpartition("@")
+    if not cred or "/" in cred:
+        # No user name, or a '/' before the '@': a local path that happens
+        # to contain '@', like ./mail@archive/x.
+        return None, arg
+
+    # Skip a bracketed IPv6 literal, whose own ':'s are not separators.
+    start = 0
+    if hostpart.startswith("["):
+        end = hostpart.find("]")
+        if end < 0:
+            raise ValueError("unterminated '[' in %r" % arg)
+        start = end + 1
+
+    colon = hostpart.find(":", start)
+    if colon < 0:
+        return None, arg              # no path at all: a plain login target
+
+    host, rest = hostpart[:colon], hostpart[colon + 1:]
+    head, sep, tail = rest.partition(":")
+
+    if head.isdigit():
+        # A numeric field is the port.  What follows it, if anything, is the
+        # path; on its own it is just a login target with no path.
+        if not sep:
+            return None, arg
+        host = "%s:%s" % (host, head)
+        path = tail or "."
+    else:
+        # Everything after the first ':' is the path, colons included, so a
+        # name like /tmp/a:b survives.
+        path = rest or "."
+
+    return parse_endpoint(cred + "@" + host), path
 
 
-def plan_copy(paths):
-    """Turn 'SOURCE... DEST' into (direction, sources, dest).
+def plan_copy(args):
+    """Turn 'SOURCE... DEST' into (direction, sources, dest, endpoint).
 
     ``direction`` is "up" or "down"; ``sources`` and ``dest`` are bare paths
-    with the ':' marker removed.  Raises ValueError on any combination we
-    cannot serve, so main() can reject it before opening a connection.
+    with the endpoint stripped off, and ``endpoint`` is the remote host they
+    all refer to.  Raises ValueError on any combination we cannot serve, so
+    main() can reject it before opening a connection.
     """
-    if len(paths) < 2:
+    if len(args) < 2:
         raise ValueError(
-            "file copy needs SOURCE and DEST, e.g. ./app.tar :/tmp/ "
-            "(a leading ':' marks the remote side)"
+            "file copy needs SOURCE and DEST, e.g. "
+            "./app.tar root@10.0.0.9:/tmp/"
         )
 
-    split = [split_copy_path(p) for p in paths]
-    src_marks, dest_mark = split[:-1], split[-1]
-    dest_remote, dest = dest_mark
+    split = [split_copy_arg(a) for a in args]
+    src_marks, (dest_ep, dest) = split[:-1], split[-1]
 
     for _, path in src_marks:
         if not path:
@@ -986,27 +1032,42 @@ def plan_copy(paths):
     if not dest:
         raise ValueError("empty destination path")
 
-    remote_sources = [remote for remote, _ in src_marks]
+    remote = [ep for ep, _ in split if ep is not None]
+    if not remote:
+        raise ValueError(
+            "no remote path among %s; write the remote side as "
+            "user@host:/path" % ", ".join(args)
+        )
 
-    if dest_remote:
-        if any(remote_sources):
-            bad = [p for remote, p in src_marks if remote]
+    # One target per copy: every remote argument has to name the same host,
+    # and a password given on either side counts for the whole connection.
+    target = remote[0]
+    for ep in remote[1:]:
+        if (ep.user, ep.host, ep.port) != (target.user, target.host,
+                                           target.port):
             raise ValueError(
-                "cannot copy remote to remote: %s and the destination are "
-                "both on the target"
-                % ", ".join(":" + b for b in bad)
+                "all remote paths must be on the same host, got %s and %s"
+                % (target, ep)
             )
+        if target.password is None and ep.password is not None:
+            target.password = ep.password
+
+    remote_srcs = sum(1 for ep, _ in src_marks if ep is not None)
+    if dest_ep is not None:
+        if remote_srcs == len(src_marks):
+            raise ValueError(
+                "cannot copy remote to remote: every path is on %s"
+                % target.host
+            )
+        if remote_srcs:
+            raise ValueError("cannot mix local and remote sources")
         direction = "up"
     else:
-        if not all(remote_sources):
-            bad = [p for remote, p in src_marks if not remote]
-            raise ValueError(
-                "both sides are local (%s -> %s); mark the remote side with "
-                "a leading ':'" % (", ".join(bad), dest)
-            )
+        if remote_srcs != len(src_marks):
+            raise ValueError("cannot mix local and remote sources")
         direction = "down"
 
-    return direction, [p for _, p in src_marks], dest
+    return direction, [p for _, p in src_marks], dest, target
 
 
 def open_target_sftp(client):
@@ -1283,12 +1344,13 @@ def download_path(sftp, remote, local, opts):
         _apply_local_attrs(local, attrs)
 
 
-def run_copy(client, opts):
-    """Serve the SOURCE... DEST form over one SFTP session on the target."""
-    try:
-        direction, sources, dest = plan_copy(opts.paths)
-    except ValueError as exc:
-        raise SystemExit("mssh: %s" % exc)
+def run_copy(client, plan, opts):
+    """Serve the SOURCE... DEST form over one SFTP session on the target.
+
+    ``plan`` is the tuple main() already got from plan_copy, so the
+    arguments are parsed and validated before any connection is opened.
+    """
+    direction, sources, dest, _ = plan
 
     sftp = open_target_sftp(client)
     restore_sigint = _install_abort_handler()
@@ -1382,14 +1444,15 @@ examples:
   mssh -j ops:pw@10.0.0.1 root@192.168.1.10 -i ~/.ssh/id_rsa
   mssh -j ops:pw@10.0.0.1 root:pw@192.168.1.10 -c 'uptime; df -h'
 
-file copy (SOURCE... DEST, a leading ':' marks the remote side):
-  mssh -j ops@10.0.0.1 root@10.0.0.9 ./app.tar :/tmp/      # upload
-  mssh -j ops@10.0.0.1 root@10.0.0.9 :/var/log/syslog ./   # download
-  mssh root@10.0.0.9 ./a ./b :/opt/pkg/   # several, DEST must be a dir
-  mssh -r root@10.0.0.9 ./dist :/srv/www/ # -r recurses into directories
-  mssh -rp root@10.0.0.9 :/etc/nginx ./   # -p keeps mode and mtime
-  mssh root@10.0.0.9 ./x :                # ':' alone is the remote $HOME
-  A local file whose own name starts with ':' is reachable as './:name'.
+file copy (SOURCE... DEST; the remote side carries the endpoint):
+  mssh -j ops@10.0.0.1 ./app.tar root@10.0.0.9:/tmp/       # upload
+  mssh -j ops@10.0.0.1 root@10.0.0.9:/var/log/syslog ./    # download
+  mssh ./a ./b root@10.0.0.9:/opt/pkg/    # several, DEST must be a dir
+  mssh -r ./dist root@10.0.0.9:/srv/www/  # -r recurses into directories
+  mssh -rp root@10.0.0.9:/etc/nginx ./    # -p keeps mode and mtime
+  mssh ./x root@10.0.0.9:                 # bare ':' is the remote $HOME
+  mssh ./x root@10.0.0.9:36001:/tmp/      # with a port
+  The path after ':' may be absolute or relative to the remote home.
   Runs over sftp on the target; add -C to compress large transfers.
 
 first-time key setup (then no more passwords):
@@ -1430,14 +1493,12 @@ def build_parser():
         help="jump host as user[:password]@host[:port]; repeat for each hop, in order",
     )
     parser.add_argument(
-        "target", metavar="TARGET",
-        help="final host as user[:password]@host[:port]",
-    )
-    parser.add_argument(
-        "paths", metavar="PATH", nargs="*",
-        help="SOURCE... DEST to copy files instead of logging in; a leading "
-             "':' marks the remote side, e.g. './app.tar :/tmp/' to upload "
-             "or ':/var/log/messages ./' to download",
+        "args", metavar="TARGET|PATH", nargs="+",
+        help="either one login target, user[:password]@host[:port], or copy "
+             "arguments SOURCE... DEST in which the remote side carries that "
+             "same endpoint with ':' and a path appended: "
+             "'./app.tar root@10.0.0.9:/tmp/' uploads, "
+             "'root@10.0.0.9:/var/log/syslog ./' downloads",
     )
     parser.add_argument(
         "-r", "--recursive", action="store_true",
@@ -1509,9 +1570,38 @@ def main(argv=None):
     parser = build_parser()
     opts = parser.parse_args(argv)
 
+    # One positional is a login target; several mean a copy, and then the
+    # target is whichever host the remote paths name.
+    opts.paths = opts.args if len(opts.args) > 1 else []
+    plan = None
+
+    if not opts.paths:
+        # A lone argument that carries a path is a half-written copy.  Say so,
+        # rather than letting parse_endpoint complain about the path looking
+        # like a port.  --copy-id is the usual culprit: its optional argument
+        # silently eats the source.
+        try:
+            lone_ep, _ = split_copy_arg(opts.args[0])
+        except ValueError:
+            lone_ep = None
+        if lone_ep is not None:
+            extra = ""
+            if opts.copy_id:
+                extra = (" (--copy-id took %r as its public key; put it "
+                         "after the paths, or use --copy-id=FILE)"
+                         % opts.copy_id)
+            parser.error("%s names a remote file, so this is a copy, but "
+                         "only one path was given -- a copy needs SOURCE "
+                         "and DEST%s" % (opts.args[0], extra))
+            return 2
+
     try:
         jumps = [parse_endpoint(spec) for spec in opts.jump]
-        target = parse_endpoint(opts.target)
+        if opts.paths:
+            plan = plan_copy(opts.paths)
+            target = plan[3]
+        else:
+            target = parse_endpoint(opts.args[0])
     except ValueError as exc:
         parser.error(str(exc))
         return 2
@@ -1537,11 +1627,6 @@ def main(argv=None):
         if opts.copy_id:
             parser.error("--copy-id installs a key and exits; it cannot also "
                          "copy files")
-            return 2
-        try:
-            plan_copy(opts.paths)
-        except ValueError as exc:
-            parser.error(str(exc))
             return 2
     elif opts.recursive or opts.preserve:
         parser.error("-r/-p only apply to a file copy; pass SOURCE and DEST")
@@ -1571,7 +1656,7 @@ def main(argv=None):
         if opts.copy_id:
             return 0
         if opts.paths:
-            return run_copy(tgt, opts)
+            return run_copy(tgt, plan, opts)
         if opts.command:
             return run_command(tgt, opts.command, opts)
         return run_interactive(tgt, opts)
