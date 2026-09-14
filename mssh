@@ -169,8 +169,72 @@ def parse_endpoint(spec):
 # connection chain
 # --------------------------------------------------------------------------
 
-def connect_hop(endpoint, sock=None, opts=None, index=0, total=1):
-    """Open one SSH connection, optionally over an existing socket/channel."""
+def _identities_tried(opts):
+    """The credentials paramiko just offered, in the order it offered them.
+
+    Paramiko reports a bare "authentication failed" no matter how many keys
+    it walked through, which makes a wrong-key mistake hard to see. We feed
+    it the same inputs, so we can name them.
+    """
+    tried = []
+    if opts.identity:
+        for path in opts.identity:
+            tried.append(os.path.expanduser(path))
+    if not opts.no_agent:
+        sock = os.environ.get("SSH_AUTH_SOCK")
+        if sock:
+            n = _agent_key_count()
+            if n:
+                tried.append("ssh-agent (%d key%s via %s)"
+                             % (n, "" if n == 1 else "s", sock))
+    if not opts.no_keys:
+        # Paramiko's own discovery order, which is not DEFAULT_KEY_NAMES'.
+        ssh_dir = os.path.expanduser("~/.ssh")
+        for name in ("id_rsa", "id_ecdsa", "id_ed25519"):
+            path = os.path.join(ssh_dir, name)
+            if os.path.isfile(path):
+                tried.append(path)
+    return tried
+
+
+def _agent_key_count():
+    try:
+        agent = paramiko.Agent()
+        try:
+            return len(agent.get_keys())
+        finally:
+            agent.close()
+    except Exception:
+        return 0
+
+
+def _identity_summary(opts):
+    """Compact 'which key failed' text for a single-line message."""
+    tried = _identities_tried(opts)
+    if not tried:
+        return ""
+    if len(tried) <= 3:
+        return ", ".join(tried)
+    return "%s and %d more" % (", ".join(tried[:3]), len(tried) - 3)
+
+
+def _log_identities(opts, label):
+    """Verbose-only: the full offer order, and how to pin one key down."""
+    tried = _identities_tried(opts)
+    if not tried:
+        verbose(opts, "%s: no key material offered (password auth only)" % label)
+        return
+    verbose(opts, "%s: offered %d credential(s), in paramiko's order:"
+            % (label, len(tried)))
+    for i, item in enumerate(tried, 1):
+        verbose(opts, "%s:   %d. %s" % (label, i, item))
+    if not opts.identity:
+        verbose(opts, "%s: these were auto-discovered; use -i KEYFILE to "
+                      "offer just one" % label)
+
+
+def _new_client(opts):
+    """An SSHClient with this run's host-key policy applied."""
     client = paramiko.SSHClient()
 
     if opts.known_hosts:
@@ -185,79 +249,138 @@ def connect_hop(endpoint, sock=None, opts=None, index=0, total=1):
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
     else:
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    password = endpoint.password
-    if password is None and not opts.no_prompt and not opts.identity:
-        # Only prompt if we have no other plausible credential source.
-        if not _has_usable_key(opts):
-            try:
-                password = getpass.getpass(
-                    "password for %s: " % endpoint
-                )
-            except (EOFError, KeyboardInterrupt):
-                raise SystemExit("\nmssh: aborted")
-            if password == "":
-                password = None
-
-    kwargs = dict(
-        hostname=endpoint.host,
-        port=endpoint.port,
-        username=endpoint.user,
-        password=password,
-        sock=sock,
-        timeout=opts.timeout,
-        banner_timeout=opts.timeout,
-        auth_timeout=opts.timeout,
-        allow_agent=not opts.no_agent,
-        look_for_keys=not opts.no_keys,
-        compress=opts.compress,
-    )
-    if opts.identity:
-        paths = [os.path.expanduser(p) for p in opts.identity]
-        for path in paths:
-            if not os.path.exists(path):
-                raise SystemExit("mssh: identity file not found: %s" % path)
-        kwargs["key_filename"] = paths
-        # If any key is encrypted, get the passphrase up front. Otherwise
-        # paramiko silently skips the key and the hop just looks like a
-        # plain auth failure, which sends you debugging the wrong thing.
-        phrase = _identity_passphrase(paths, opts)
-        if phrase is not None:
-            kwargs["passphrase"] = phrase
-
-    label = "hop %d/%d" % (index + 1, total)
-    verbose(opts, "%s: connecting to %s" % (label, endpoint.masked()))
-
-    started = time.time()
-    try:
-        client.connect(**kwargs)
-    except paramiko.AuthenticationException:
-        raise SystemExit("mssh: %s: authentication failed for %s%s"
-                         % (label, endpoint, _auth_hint(client, opts)))
-    except paramiko.BadHostKeyException as exc:
-        raise SystemExit("mssh: %s: host key mismatch for %s: %s" % (label, endpoint, exc))
-    except paramiko.SSHException as exc:
-        # "Invalid key" here is usually the legacy-RSA problem, not a
-        # corrupt key file, so attach the same hint.
-        extra = _auth_hint(client, opts) if "key" in str(exc).lower() else ""
-        raise SystemExit("mssh: %s: ssh error to %s: %s%s"
-                         % (label, endpoint, exc, extra))
-    except socket.timeout:
-        raise SystemExit("mssh: %s: timed out connecting to %s" % (label, endpoint))
-    except (socket.error, OSError) as exc:
-        raise SystemExit("mssh: %s: cannot reach %s: %s" % (label, endpoint, exc))
-
-    transport = client.get_transport()
-    if transport is not None and opts.keepalive > 0:
-        transport.set_keepalive(opts.keepalive)
-
-    verbose(opts, "%s: connected to %s in %.3fs" % (label, endpoint, time.time() - started))
     return client
 
 
+def _can_prompt(opts):
+    """True if we may still ask the user for a password interactively."""
+    if opts.no_prompt:
+        return False
+    if sys.stdin.isatty():
+        return True
+    # getpass reads /dev/tty, which still works with stdin redirected.
+    try:
+        with open("/dev/tty"):
+            return True
+    except (IOError, OSError):
+        return False
+
+
+def _prompt_password(endpoint, opts, label):
+    if not _can_prompt(opts):
+        raise SystemExit(
+            "mssh: %s: no usable key and no password for %s, and there is no "
+            "terminal to ask on (drop --no-prompt, or put the password in the "
+            "endpoint as user:password@host)" % (label, endpoint)
+        )
+    try:
+        password = getpass.getpass("password for %s: " % endpoint)
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("\nmssh: aborted")
+    return password or None
+
+
+def connect_hop(endpoint, sock_factory=None, opts=None, index=0, total=1):
+    """Open one SSH connection, optionally tunnelled through the previous hop.
+
+    ``sock_factory`` is a callable returning a fresh channel to this hop, or
+    None for the first hop.  It is a factory rather than a plain socket
+    because a failed authentication burns the channel, and we may need a
+    second attempt to ask for a password.
+    """
+    label = "hop %d/%d" % (index + 1, total)
+    password = endpoint.password
+
+    if password is None and not opts.identity and not _has_usable_key(opts):
+        # No key material at all, so a key attempt would only waste a round
+        # trip. Ask up front instead.
+        password = _prompt_password(endpoint, opts, label)
+
+    asked = False
+    while True:
+        sock = sock_factory() if sock_factory is not None else None
+        client = _new_client(opts)
+
+        kwargs = dict(
+            hostname=endpoint.host,
+            port=endpoint.port,
+            username=endpoint.user,
+            password=password,
+            sock=sock,
+            timeout=opts.timeout,
+            banner_timeout=opts.timeout,
+            auth_timeout=opts.timeout,
+            allow_agent=not opts.no_agent,
+            look_for_keys=not opts.no_keys,
+            compress=opts.compress,
+        )
+        if opts.identity:
+            paths = [os.path.expanduser(p) for p in opts.identity]
+            for path in paths:
+                if not os.path.exists(path):
+                    raise SystemExit("mssh: identity file not found: %s" % path)
+            kwargs["key_filename"] = paths
+            # If any key is encrypted, get the passphrase up front. Otherwise
+            # paramiko silently skips the key and the hop just looks like a
+            # plain auth failure, which sends you debugging the wrong thing.
+            phrase = _identity_passphrase(paths, opts)
+            if phrase is not None:
+                kwargs["passphrase"] = phrase
+
+        verbose(opts, "%s: connecting to %s" % (label, endpoint.masked()))
+        started = time.time()
+        try:
+            client.connect(**kwargs)
+        except paramiko.AuthenticationException:
+            # Compute the hint while the transport is still around.
+            hint = _auth_hint(client, opts)
+            client.close()
+            # Key or agent auth failed and we never had a password: fall back
+            # to asking, the way ssh(1) does. This is also what lets
+            # --copy-id bootstrap a hop whose authorized_keys is still empty.
+            if password is None and not asked and _can_prompt(opts):
+                asked = True
+                which = _identity_summary(opts)
+                sys.stderr.write(
+                    "mssh: %s: key auth failed%s, trying password\n"
+                    % (label, " (%s)" % which if which else "")
+                )
+                _log_identities(opts, label)
+                password = _prompt_password(endpoint, opts, label)
+                if password is not None:
+                    continue
+            if not asked:
+                _log_identities(opts, label)
+            raise SystemExit("mssh: %s: authentication failed for %s%s"
+                             % (label, endpoint, hint))
+        except paramiko.BadHostKeyException as exc:
+            raise SystemExit("mssh: %s: host key mismatch for %s: %s" % (label, endpoint, exc))
+        except paramiko.SSHException as exc:
+            # "Invalid key" here is usually the legacy-RSA problem, not a
+            # corrupt key file, so attach the same hint.
+            extra = _auth_hint(client, opts) if "key" in str(exc).lower() else ""
+            raise SystemExit("mssh: %s: ssh error to %s: %s%s"
+                             % (label, endpoint, exc, extra))
+        except socket.timeout:
+            raise SystemExit("mssh: %s: timed out connecting to %s" % (label, endpoint))
+        except (socket.error, OSError) as exc:
+            raise SystemExit("mssh: %s: cannot reach %s: %s" % (label, endpoint, exc))
+
+        transport = client.get_transport()
+        if transport is not None and opts.keepalive > 0:
+            transport.set_keepalive(opts.keepalive)
+
+        verbose(opts, "%s: connected to %s in %.3fs" % (label, endpoint, time.time() - started))
+        return client
+
+
 def _key_loaders():
-    """Available paramiko key classes (DSSKey was removed in paramiko 5)."""
-    names = ("Ed25519Key", "RSAKey", "ECDSAKey", "DSSKey")
+    """Available paramiko key classes, best algorithm first.
+
+    Mirrors DEFAULT_KEY_NAMES' ordering. DSSKey was removed in paramiko 5,
+    hence the hasattr filter rather than a plain tuple.
+    """
+    names = ("Ed25519Key", "ECDSAKey", "RSAKey", "DSSKey")
     return [getattr(paramiko, n) for n in names if hasattr(paramiko, n)]
 
 
@@ -493,16 +616,46 @@ def install_pubkey(client, endpoint, pubkey, opts, label):
     return True
 
 
+def _tunnel_factory(client, hop, nxt, opts, index, total):
+    """Return a callable that opens a fresh channel from `hop` to `nxt`.
+
+    connect_hop may need more than one channel: a failed auth attempt
+    leaves the channel unusable, so each retry asks for a new one.
+    """
+    def open_channel():
+        transport = client.get_transport()
+        opened = time.time()
+        try:
+            chan = transport.open_channel(
+                "direct-tcpip",
+                dest_addr=(nxt.host, nxt.port),
+                src_addr=("127.0.0.1", 0),
+                timeout=opts.timeout,
+            )
+        except paramiko.SSHException as exc:
+            raise SystemExit(
+                "mssh: hop %d: %s refused to forward to %s:%d: %s"
+                % (index + 1, hop, nxt.host, nxt.port, exc)
+            )
+        verbose(opts, "hop %d/%d: tunnel %s -> %s:%d open in %.3fs"
+                % (index + 1, total, hop, nxt.host, nxt.port,
+                   time.time() - opened))
+        return chan
+
+    return open_channel
+
+
 def build_chain(jumps, target, opts):
     """Connect through every jump host, return (clients, target_client)."""
     clients = []
-    sock = None
+    factory = None
     hops = jumps + [target]
     pubkey = read_pubkey(opts.copy_id) if opts.copy_id else None
 
     try:
         for i, hop in enumerate(hops):
-            client = connect_hop(hop, sock=sock, opts=opts, index=i, total=len(hops))
+            client = connect_hop(hop, sock_factory=factory, opts=opts,
+                                 index=i, total=len(hops))
             clients.append(client)
 
             if pubkey is not None:
@@ -510,24 +663,8 @@ def build_chain(jumps, target, opts):
                                "hop %d/%d" % (i + 1, len(hops)))
 
             if i + 1 < len(hops):
-                nxt = hops[i + 1]
-                transport = client.get_transport()
-                opened = time.time()
-                try:
-                    sock = transport.open_channel(
-                        "direct-tcpip",
-                        dest_addr=(nxt.host, nxt.port),
-                        src_addr=("127.0.0.1", 0),
-                        timeout=opts.timeout,
-                    )
-                except paramiko.SSHException as exc:
-                    raise SystemExit(
-                        "mssh: hop %d: %s refused to forward to %s:%d: %s"
-                        % (i + 1, hop, nxt.host, nxt.port, exc)
-                    )
-                verbose(opts, "hop %d/%d: tunnel %s -> %s:%d open in %.3fs"
-                        % (i + 1, len(hops), hop, nxt.host, nxt.port,
-                           time.time() - opened))
+                factory = _tunnel_factory(client, hop, hops[i + 1], opts,
+                                          i, len(hops))
     except BaseException:
         close_all(clients)
         raise
@@ -767,6 +904,16 @@ first-time key setup (then no more passwords):
   ssh-keygen -t ed25519                       # if you have no key yet
   mssh --copy-id -j ops:pw1@10.0.0.1 root:pw2@10.0.0.9
   mssh -j ops@10.0.0.1 root@10.0.0.9          # subsequent logins, key auth
+
+key types:
+  ed25519 (recommended), ecdsa (nistp256/384/521) and rsa.  DSA is gone:
+  paramiko 5 dropped it, as did OpenSSH 9.8.  An OpenSSH certificate is
+  used automatically when <key>-cert.pub sits next to the private key.
+
+idle connections:
+  mssh sends a keepalive every 30s (-k SEC, 0 to disable), so an idle
+  session survives NAT and firewall timeouts.  It cannot override a
+  server-side ClientAliveInterval or a shell TMOUT -- those still apply.
 
 security note:
   passwords on the command line are visible in `ps` and shell history.
