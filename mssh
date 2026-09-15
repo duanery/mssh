@@ -28,13 +28,28 @@ absolute or relative to the remote home directory.
     mssh -j jump@ip ./app.tar target@ip:/tmp/          # upload
     mssh -j jump@ip target@ip:/var/log/syslog ./       # download
     mssh -rp -j jump@ip ./dist target@ip:/srv/www/     # tree, keep attrs
+
+Persistent session: a plain run connects, executes and tears everything
+down, so nothing survives to the next call.  --session NAME keeps a local
+daemon holding the chain and one long-lived remote shell; later calls send
+one command each into that shell, and the working directory, the variables
+and any loaded state persist between them.
+    mssh --session s -j jump@ip target@ip     # first call, detaches
+    mssh --session s 'cd /var/log && ls'      # runs in the live shell
+    mssh --session s --stop                   # end it
+Output streams as it is produced, so a long-running command prints as it
+goes; Ctrl-C interrupts that command and leaves the session usable.
+With -c the session holds an interactive program (gdb, python, sqlite3)
+instead of a shell, and --prompt REGEX marks where one of its replies ends.
 """
 
 from __future__ import print_function
 
 import argparse
+import base64
 import datetime
 import getpass
+import json
 import os
 import re
 import select
@@ -75,6 +90,17 @@ DEFAULT_KEY_NAMES = ("id_ed25519", "id_ecdsa", "id_rsa")
 # up front; an interrupt then has to drain all of them before the channel
 # can close, so Ctrl-C appears to hang.  OpenSSH's own sftp uses 64.
 MAX_PREFETCH = 64
+
+# Persistent sessions.  A session name becomes a file name, so keep it to
+# characters that cannot escape the session directory.  \Z, not $: '$' also
+# matches before a trailing newline, so 'evil\n' would slip through.
+SESSION_NAME_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\Z")
+
+# How long a client waits for one command's output before giving up (the
+# session survives; --interrupt clears it), and how long the framing falls
+# back to "no new bytes for this long" when --prompt was not given.
+DEFAULT_SESSION_WAIT = 30.0
+DEFAULT_SESSION_IDLE = 0.4
 
 
 # --------------------------------------------------------------------------
@@ -1419,8 +1445,1320 @@ def run_copy(client, plan, opts):
 
 
 # --------------------------------------------------------------------------
+# persistent session
+# --------------------------------------------------------------------------
+#
+# A plain `mssh target -c cmd` cannot help a caller that wants to keep state:
+# every run is a new process, so a `cd /var/log` in one call is gone by the
+# next, along with the exported variables and the chain that took seconds to
+# build.  A session keeps one local daemon holding the SSH chain and one
+# long-lived remote program; each later call is a short connection to that
+# daemon over a unix socket, which feeds in one command and prints its output.
+#
+# The remote program runs behind a pty, for two reasons found by measurement:
+# without one a program's stdout and stderr arrive as two unordered streams
+# (error text detaches from the output it belongs to), and only a pty gives a
+# working Ctrl-C -- over pipes, signalling the foreground child leaves the
+# shell to run the *rest* of the command list, which is the wrong semantics.
+# The costs are that the pty turns '\n' into '\r\n' (stripped on the way out)
+# and merges stderr into stdout (the exit status, not the stream, is what
+# tells a caller whether a command failed).
+
+# A dumb terminal keeps programs from emitting colour and cursor escapes, but
+# column-aware ones (ls, ps) still format for the width we claim here.
+SESSION_TERM = "dumb"
+SESSION_COLS = 200
+SESSION_ROWS = 50
+
+# Shell mode runs bash when the target has it, since the framing below wants
+# a POSIX shell and a login $SHELL could be anything, csh included.
+SESSION_SHELL = '"$(command -v bash 2>/dev/null || echo /bin/sh)"'
+
+# How one command is framed in shell mode.  The naive form -- appending
+# "; printf ..." to the user's line -- is broken on ordinary input: 'sleep 1 &',
+# 'echo x |', a trailing '# comment', 'if true', a heredoc and any unterminated
+# quote each wedge the session, because the framing is then parsed in the same
+# syntactic position as the command.  Sending the command base64-encoded and
+# unwrapping it remotely puts it inside an eval instead, where none of that can
+# happen.  '</dev/null' is what keeps a bare 'cat' from swallowing the next
+# control line, and $__M holds the marker so the literal marker string never
+# travels the channel and cannot be echoed back by accident.
+SESSION_FRAME = ('eval "$(echo %s | base64 -d)" </dev/null'
+                 ' ; printf \'\\n%%s%%s\\n\' "$__M" "$?"\n')
+# Resynchronisation after an interrupt or a timeout: the marker carries a
+# one-shot token instead of a status, so it cannot be confused with the frame
+# of the command that was abandoned, however late that one arrives.
+SESSION_RESYNC = 'printf \'\\n%%s%s\\n\' "$__M"\n'
+SESSION_SETUP = "unset PS1 PS2 PROMPT_COMMAND; __M='%s'\n"
+
+# Only the tail of the buffer is tested against --prompt: a prompt is short,
+# and scanning megabytes of output on every poll would be quadratic.
+SESSION_TAIL = 4096
+
+# Terminal escapes, stripped in interactive mode before --prompt is matched.
+# TERM=dumb stops most of them, but not all: a coloured prompt would put
+# '\x1b[0m' after the text the user's regex anchors on, and shell-integration
+# markers (OSC 633) trail every prompt in some environments -- either one
+# makes a correct '...$'-anchored regex silently never match.
+SESSION_ESC_RE = re.compile(
+    rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"      # OSC ... BEL / ST
+    rb"|\x1b\[[0-?]*[ -/]*[@-~]"               # CSI
+    rb"|\x1b[@-Z\\-_]"                         # two-character escapes
+)
+
+
+class SessionGone(Exception):
+    """No live daemon is listening on that session's socket."""
+
+
+class _SessionDead(Exception):
+    """The remote program behind the session has exited."""
+
+
+def session_dir():
+    """Directory holding session sockets, created 0700 and checked on use.
+
+    Always ~/.mssh/sessions, never $XDG_RUNTIME_DIR: that variable is set in
+    some shells and not others (a desktop terminal has it, a cron job or an
+    `ssh host` command does not), so keying off it split one user's sessions
+    into two namespaces -- a session started from one shell was invisible to
+    `--sessions` in another.  $HOME is the thing that actually identifies the
+    user here.
+
+    Holding one of these sockets is equivalent to being logged in on the
+    target, so the directory is guarded like a private key rather than like a
+    temp file: never a predictable path in /tmp, owner-only, and re-verified
+    on every use rather than only at creation.
+    """
+    path = os.path.join(os.path.expanduser("~"), ".mssh", "sessions")
+
+    try:
+        os.makedirs(path, 0o700)
+    except OSError:
+        pass
+
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise SystemExit("mssh: cannot use session directory %s: %s"
+                         % (path, exc))
+    if not statmod.S_ISDIR(st.st_mode):
+        raise SystemExit("mssh: session directory %s is not a directory"
+                         % path)
+    if st.st_uid != os.getuid():
+        raise SystemExit("mssh: session directory %s belongs to uid %d, not "
+                         "you -- refusing to use it" % (path, st.st_uid))
+    if st.st_mode & 0o077:
+        os.chmod(path, 0o700)
+    return path
+
+
+def session_path(name):
+    """Socket path for a session name, with the name validated first."""
+    if not SESSION_NAME_RE.match(name or ""):
+        raise SystemExit(
+            "mssh: invalid session name %r; use up to 64 characters from "
+            "A-Z a-z 0-9 . _ - starting with a letter, digit or _" % (name,)
+        )
+    return os.path.join(session_dir(), name + ".sock")
+
+
+def _peer_uid(conn):
+    """uid of the process on the other end of a unix socket, or None."""
+    import struct
+    try:
+        blob = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                               struct.calcsize("3i"))
+    except (AttributeError, OSError):
+        return None
+    _pid, uid, _gid = struct.unpack("3i", blob)
+    return uid
+
+
+class _Session(object):
+    """One live remote program behind a pty, framed into request/response.
+
+    Output is streamed, not buffered: a command that runs for minutes and
+    prints as it goes (a poller, a tail, a build) must show its lines while it
+    runs, not all at once when --wait expires.  So framing works a line at a
+    time and every completed line is handed straight to the client.
+    """
+
+    def __init__(self, chan, mark, mode, prompt_re, idle, target, command):
+        self.chan = chan
+        self.mark = mark.encode("utf-8")
+        self.mode = mode                  # "shell" or "interactive"
+        self.prompt_re = prompt_re        # compiled bytes pattern, or None
+        self.idle = idle
+        self.target = target
+        self.command = command
+        self.lock = threading.Lock()
+        self.started = time.time()
+        self.last = self.started
+        self.served = 0
+        self.dead = None
+        # Frames we have asked for but not yet seen the marker of.  A command
+        # that timed out leaves one behind, and its marker will still turn up
+        # later; without this count the next command would frame on that stale
+        # marker and report the stale command's exit status as its own.
+        self.outstanding = 0
+        # Set to ask an in-flight command to stop.  An interrupt cannot wait
+        # for the lock -- the command holding it is exactly what needs
+        # interrupting -- so it signals through this instead.
+        self.abort = threading.Event()
+
+    @property
+    def pending(self):
+        return self.outstanding > 0
+
+    # -- channel i/o ------------------------------------------------------
+
+    def _write(self, text):
+        try:
+            self.chan.sendall(text.encode("utf-8"))
+        except Exception as exc:
+            raise _SessionDead("write failed: %s" % exc)
+
+    def _recv(self):
+        try:
+            data = self.chan.recv(65536)
+        except socket.timeout:
+            return None
+        except Exception as exc:
+            raise _SessionDead("read failed: %s" % exc)
+        if data == b"":
+            raise _SessionDead("the remote program exited")
+        return data
+
+    # -- framing ----------------------------------------------------------
+
+    def _clean(self, line):
+        """One line, as the caller should see it."""
+        if line.endswith(b"\r"):
+            line = line[:-1]
+        if self.mode == "interactive":
+            line = SESSION_ESC_RE.sub(b"", line)
+        return line
+
+    def _marker_payload(self, line):
+        """Whatever follows the marker on this line, or None if not a marker."""
+        if not line.startswith(self.mark):
+            return None
+        return line[len(self.mark):]
+
+    def _marker_status(self, line):
+        """The exit status if this line is our frame marker, else None.
+
+        A marker whose digits did not survive gives -1 rather than None: it
+        still frames the command, we just cannot say how it ended.  Treating
+        it as output instead would leak the marker to the caller and leave the
+        session one frame out of step.
+        """
+        payload = self._marker_payload(line)
+        if payload is None:
+            return None
+        return int(payload) if payload.isdigit() else -1
+
+    def _stream_shell(self, deadline):
+        """Yield output as it arrives, ending at our frame marker.
+
+        Emission lags by one line, because the framing printf writes a newline
+        of its own that is not part of the command's output: only when the
+        marker arrives do we know whether that held line was real output
+        (a command whose last line had no newline) or just the frame's.
+        """
+        tail = b""
+        held = None
+        last_data = time.time()
+        self.chan.settimeout(0.05)
+
+        while True:
+            data = self._recv()
+            if data:
+                last_data = time.time()
+                tail += data
+                lines = tail.split(b"\n")
+                tail = lines.pop()
+                for raw in lines:
+                    line = self._clean(raw)
+                    status = self._marker_status(line)
+                    if status is None:
+                        if held is not None:
+                            yield ("out", held + b"\n")
+                        held = line
+                        continue
+                    if held:
+                        # A last line that had no newline of its own.
+                        yield ("out", held)
+                    self.outstanding = 0
+                    yield ("end", status, False)
+                    return
+
+            now = time.time()
+            if self.abort.is_set():
+                self.abort.clear()
+                # Ctrl-C destroyed the whole command list, the framing printf
+                # included, so no marker is coming; resynchronise instead.
+                if held:
+                    yield ("out", held)
+                    held = None
+                if tail:
+                    yield ("out", self._clean(tail))
+                    tail = b""
+                self._resync()
+                yield ("end", 130, False)
+                return
+            if (tail and now - last_data >= self.idle
+                    and not self.mark.startswith(tail.rstrip(b"\r"))):
+                # A partial line that has gone quiet: a prompt, a progress bar,
+                # a status line.  Release it once it cannot be the start of the
+                # marker, so a command that asks a question is not held back.
+                if held is not None:
+                    yield ("out", held + b"\n")
+                    held = None
+                yield ("out", self._clean(tail))
+                tail = b""
+            if now >= deadline:
+                if held is not None:
+                    yield ("out", held + b"\n")
+                if tail:
+                    yield ("out", self._clean(tail))
+                yield ("end", None, True)
+                return
+
+    def _resync(self):
+        """Stop whatever is running and get the shell back to a known state.
+
+        The obvious alternative -- wait for the abandoned command's own marker
+        to turn up -- does not work: a command that never ends (a poller, a
+        tail -f) never produces one, and waiting for it wedges every later
+        command.  So the leftover is interrupted, and a marker carrying a
+        one-shot token is requested.  The token is what makes this
+        unambiguous: however many stale markers are still in flight, this
+        drains past all of them and stops at exactly the right place.
+        """
+        if self.mode == "interactive":
+            self._write("\x03")
+            self._drain_interactive()
+            return
+
+        for attempt in range(2):
+            token = os.urandom(6).hex().encode("ascii")
+            if attempt == 0:
+                self._write("\x03")
+                # The Ctrl-C makes the pty discard whatever input is queued
+                # behind it, and a write issued in the same breath is part of
+                # that queue: measured, the resync line reached the shell as
+                # 'rintf ...', its first byte eaten.  Let the interrupt land.
+                time.sleep(0.3)
+            self._write(SESSION_RESYNC % token.decode("ascii"))
+            if self._await_token(token, 20 if attempt == 0 else 10):
+                self.outstanding = 0
+                return
+        # The shell never answered.  Leave the count set so the next command
+        # tries to resynchronise again rather than framing on a stale marker.
+
+    def _await_token(self, token, limit):
+        """Read until a marker line carries this token.  True if it came."""
+        tail = b""
+        deadline = time.time() + limit
+        self.chan.settimeout(0.05)
+        while time.time() < deadline:
+            try:
+                data = self._recv()
+            except _SessionDead:
+                return False
+            if not data:
+                continue
+            tail += data
+            lines = tail.split(b"\n")
+            tail = lines.pop()
+            for raw in lines:
+                if self._marker_payload(self._clean(raw)) == token:
+                    return True
+        return False
+
+    def _stream_interactive(self, deadline):
+        """Yield output as it arrives, ending at --prompt or at an idle pause.
+
+        --prompt is matched against one line at a time -- the trailing partial
+        line first, since that is where an interactive program leaves its
+        prompt, then whole lines, for the rarer program that ends its prompt
+        with a newline.  Matching the whole buffer instead would frame early
+        on output that merely quoted something prompt-shaped.
+        """
+        tail = b""
+        last_data = time.time()
+        self.chan.settimeout(0.05)
+
+        while True:
+            data = self._recv()
+            if data:
+                last_data = time.time()
+                tail += data
+                lines = tail.split(b"\n")
+                tail = lines.pop()
+                for raw in lines:
+                    line = self._clean(raw)
+                    if self.prompt_re is not None:
+                        match = self._prompt_at_end(line)
+                        if match is not None:
+                            if match:
+                                yield ("out", match)
+                            yield ("end", None, False)
+                            return
+                    yield ("out", line + b"\n")
+                if self.prompt_re is not None:
+                    match = self._prompt_at_end(self._clean(tail))
+                    if match is not None:
+                        if match:
+                            yield ("out", match)
+                        yield ("end", None, False)
+                        return
+
+            now = time.time()
+            if self.abort.is_set():
+                self.abort.clear()
+                if tail:
+                    yield ("out", self._clean(tail))
+                # The program itself handled the Ctrl-C and will print its own
+                # prompt again; drain that so the next command frames cleanly.
+                self._drain_interactive()
+                yield ("end", 130, False)
+                return
+            if self.prompt_re is None and now - last_data >= self.idle:
+                # No --prompt: fall back to "nothing new for a while".  This
+                # is a heuristic, which is why --prompt exists.
+                if tail:
+                    yield ("out", self._clean(tail))
+                    tail = b""
+                    continue
+                yield ("end", None, False)
+                return
+            if now >= deadline:
+                if tail:
+                    yield ("out", self._clean(tail))
+                yield ("end", None, True)
+                return
+
+    def _prompt_at_end(self, line):
+        """Text before the prompt if this line ends with one, else None."""
+        found = None
+        for found in self.prompt_re.finditer(line[-SESSION_TAIL:]):
+            pass
+        if found is None or line[-SESSION_TAIL:][found.end():].strip():
+            return None
+        return line[:len(line) - (min(len(line), SESSION_TAIL) - found.start())]
+
+    # -- operations -------------------------------------------------------
+
+    def stream(self, line, wait):
+        """Run one command, yielding ('out', bytes) then ('end', status, bool).
+
+        The caller must exhaust the generator: the pty lock is held for its
+        whole life, since two commands interleaved on one pty would each read
+        the other's output.
+        """
+        with self.lock:
+            self.abort.clear()
+            if self.outstanding:
+                # A previous command timed out and may still be running.  It
+                # has to be stopped before this one starts, or its output would
+                # be mixed into ours and its marker would frame us early.
+                self._resync()
+            if self.mode == "shell":
+                blob = base64.b64encode(line.encode("utf-8")).decode("ascii")
+                self._write(SESSION_FRAME % blob)
+                self.outstanding = 1
+                producer = self._stream_shell(time.time() + wait)
+            else:
+                self._write(line.rstrip("\r\n") + "\n")
+                self.outstanding = 1
+                producer = self._stream_interactive(time.time() + wait)
+
+            self.served += 1
+            try:
+                for event in producer:
+                    if event[0] == "end":
+                        if not event[2]:
+                            self.outstanding = 0
+                        self.last = time.time()
+                        yield event
+                        return
+                    self.last = time.time()
+                    yield event
+            finally:
+                producer.close()
+
+    def interrupt_running(self):
+        """Ctrl-C.  Returns True if a command was in flight and was signalled.
+
+        Deliberately does not take the lock when something is running: the
+        command holding it is the one that needs interrupting.  Writing into
+        the pty while another thread reads from it is safe.
+        """
+        if self.lock.acquire(False):
+            try:
+                if self.outstanding:
+                    # A timed-out command, still running with nobody watching.
+                    self._resync()
+                    return True
+                # Nothing running: the Ctrl-C only clears the remote line
+                # editor, but resync anyway so a half-typed state cannot
+                # linger into the next command.
+                self._resync()
+                self.last = time.time()
+                return False
+            finally:
+                self.lock.release()
+        self.abort.set()
+        return True
+
+    def _drain_interactive(self):
+        """Discard what an abandoned interactive command left behind.
+
+        There is no marker to aim at here -- an arbitrary program has no exit
+        codes to report -- so this reads until the output stops, which is the
+        same heuristic --prompt exists to replace during normal operation.
+        """
+        self.chan.settimeout(0.05)
+        quiet_for = max(self.idle, 0.2)
+        last_data = time.time()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                data = self._recv()
+            except _SessionDead:
+                break
+            if data:
+                last_data = time.time()
+            elif time.time() - last_data >= quiet_for:
+                break
+        self.outstanding = 0
+
+    def setup(self, wait):
+        """Bring the program to a known state; return its banner."""
+        if self.mode == "interactive":
+            limit = wait if self.prompt_re is not None else max(self.idle * 4, 1.0)
+            chunks = []
+            for event in self._stream_interactive(time.time() + limit):
+                if event[0] == "end":
+                    break
+                chunks.append(event[1])
+            return b"".join(chunks)
+
+        self._write(SESSION_SETUP % self.mark.decode("ascii"))
+        blob = base64.b64encode(b"echo ready").decode("ascii")
+        self._write(SESSION_FRAME % blob)
+        self.outstanding = 1
+        chunks, status, timed_out = [], None, False
+        for event in self._stream_shell(time.time() + wait):
+            if event[0] == "end":
+                status, timed_out = event[1], event[2]
+                break
+            chunks.append(event[1])
+        out = b"".join(chunks)
+        if timed_out or status is None:
+            raise SystemExit(
+                "mssh: the remote shell never answered; it may not be a "
+                "POSIX shell (got %r)" % out[-200:]
+            )
+        if b"ready" not in out:
+            raise SystemExit(
+                "mssh: the remote shell cannot decode base64 -- a 'base64' "
+                "command is required on the target for session mode (got %r)"
+                % out[-200:]
+            )
+        return b""
+
+
+# -- wire protocol ---------------------------------------------------------
+#
+# One request per connection, so a wedged request cannot block the socket for
+# everyone else.  The request is one line of JSON.  The reply is a stream of
+# newline-terminated JSON messages -- any number of {"out": <base64>} as the
+# command produces output, then exactly one final message carrying the status.
+# It has to be a stream rather than a single reply: a command that prints for
+# minutes must show its lines while it runs, and buffering the whole response
+# would show nothing until it finished.
+
+
+def _send_json(conn, payload):
+    conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+
+
+def _reply(conn, payload):
+    try:
+        _send_json(conn, payload)
+        conn.shutdown(socket.SHUT_WR)
+    except (socket.error, OSError):
+        pass
+
+
+def _connect_session(name, timeout):
+    import errno
+
+    path = session_path(name)
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(timeout)
+    try:
+        conn.connect(path)
+    except socket.timeout:
+        conn.close()
+        raise SystemExit("mssh: session %s: timed out connecting to the "
+                         "session daemon" % name)
+    except (socket.error, OSError) as exc:
+        conn.close()
+        if exc.errno in (errno.ENOENT, errno.ECONNREFUSED):
+            raise SessionGone(path)
+        raise SystemExit("mssh: session %s: %s" % (name, exc))
+    return conn
+
+
+def session_stream(name, payload, timeout=None):
+    """Send one request and yield each JSON message of the reply in turn."""
+    conn = _connect_session(name, timeout)
+    buf = b""
+    seen = False
+    try:
+        conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+        conn.shutdown(socket.SHUT_WR)
+        while True:
+            try:
+                data = conn.recv(65536)
+            except socket.timeout:
+                raise SystemExit("mssh: session %s: the session daemon "
+                                 "stopped responding" % name)
+            if not data:
+                break
+            buf += data
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                if not raw.strip():
+                    continue
+                seen = True
+                try:
+                    yield json.loads(raw.decode("utf-8", "replace"))
+                except ValueError:
+                    raise SystemExit("mssh: session %s: malformed reply from "
+                                     "the session daemon" % name)
+    finally:
+        conn.close()
+
+    if not seen:
+        raise SystemExit("mssh: session %s: the session daemon closed the "
+                         "connection without replying" % name)
+
+
+def session_request(name, payload, timeout=None):
+    """Send one request and return its last reply message."""
+    last = None
+    for message in session_stream(name, payload, timeout):
+        last = message
+    return last
+
+
+def session_alive(name):
+    try:
+        session_request(name, {"op": "status"}, timeout=10.0)
+        return True
+    except SessionGone:
+        return False
+
+
+# -- daemon ----------------------------------------------------------------
+
+
+def _session_lock():
+    """Hold the spawn window: probe, clear a stale socket, bind.
+
+    Without it two simultaneous first calls could both find no daemon, both
+    unlink and both bind.  Once the socket is listening it is its own guard, so
+    the lock is released as soon as bind() returns.
+
+    One shared lock file rather than one per session: spawns are brief and
+    rare, so serializing them all costs nothing, and a per-name file would
+    litter the directory with a lock for every session ever started -- there is
+    no safe moment to delete one of those, since another process may be
+    holding it.
+    """
+    import fcntl
+    fd = os.open(os.path.join(session_dir(), ".spawn.lock"),
+                 os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _session_listen(name):
+    """Create the listening socket for a new session, 0600."""
+    path = session_path(name)
+    lock_fd = _session_lock()
+    try:
+        if session_alive(name):
+            raise SystemExit(
+                "mssh: session %r is already running; --status to inspect "
+                "it, --stop to end it" % name
+            )
+        try:
+            os.unlink(path)               # a stale socket from a killed daemon
+        except OSError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old = os.umask(0o177)
+        try:
+            srv.bind(path)
+        finally:
+            os.umask(old)
+        os.chmod(path, 0o600)
+        srv.listen(16)
+    finally:
+        os.close(lock_fd)
+    return srv, path
+
+
+def _ready(fd, payload):
+    try:
+        os.write(fd, json.dumps(payload).encode("utf-8") + b"\n")
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _session_predetach():
+    """Prepare the daemon-to-be, but keep the controlling terminal.
+
+    Called in the forked child before the chain is built.  Deliberately does
+    NOT setsid yet: setsid destroys the controlling terminal (measured --
+    /dev/tty stops opening immediately afterwards), and the chain still has to
+    be able to ask for a password.  connect_hop's getpass reads /dev/tty, so it
+    works here and would fail on the far side of a setsid.
+
+    stdin, stdout and stderr are all left alone for the same reason, plus one
+    more: -v logs the chain being built, and redirecting stderr here would send
+    exactly the interesting part to a file while the terminal showed only the
+    last line.  _session_detach() takes all of it away once the session is up.
+    """
+    os.chdir("/")
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+
+def _session_detach(name, opts):
+    """Become a daemon for real: leave the session, drop the std fds.
+
+    Split from _session_predetach because everything here has to happen after
+    the chain is built: setsid gives up the controlling terminal, so no
+    password can be asked for beyond this point.
+
+    Under -v, stderr goes on to <session>.log.  That is decided here rather
+    than by the caller because this is the only place it matters, and the log
+    therefore holds only what happens after this moment -- the startup trace
+    has already gone to the terminal.
+
+    There is deliberately no second fork here.  The usual reason for one is to
+    guarantee the daemon can never reacquire a controlling terminal, but it
+    would have to happen after paramiko's threads exist, and forking a
+    multi-threaded process is exactly what this design goes out of its way to
+    avoid (Python warns about it, too).  setsid alone already detaches us; the
+    session leader could only reacquire a terminal by opening one deliberately,
+    which nothing here does.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    os.setsid()
+
+    null = os.open(os.devnull, os.O_RDWR)
+    os.dup2(null, 0)
+    os.dup2(null, 1)
+    if opts.verbose:
+        out = os.open(os.path.join(session_dir(), name + ".log"),
+                      os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.dup2(out, 2)
+        os.close(out)
+    else:
+        os.dup2(null, 2)
+    if null > 2:
+        os.close(null)
+
+
+def _session_serve(session, srv, path, clients, opts):
+    """Answer requests until stopped, the program dies, or idle expires."""
+    state = {"stop": False}
+
+    def handle(conn):
+        try:
+            uid = _peer_uid(conn)
+            if uid is not None and uid != os.getuid():
+                _reply(conn, {"error": "mssh: permission denied: uid %d is "
+                                       "not the session owner" % uid})
+                return
+            conn.settimeout(30.0)
+            data = b""
+            while b"\n" not in data:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            if not data.strip():
+                return
+            req = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+            dispatch(conn, req)
+        except Exception as exc:                          # never kill the loop
+            _reply(conn, {"error": "mssh: session daemon: %s" % exc})
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def dispatch(conn, req):
+        op = req.get("op")
+        if op == "status":
+            _reply(conn, {
+                "target": str(session.target), "command": session.command,
+                "mode": session.mode, "started": session.started,
+                "served": session.served, "pid": os.getpid(),
+                "dead": session.dead, "running": session.lock.locked(),
+            })
+            return
+        if op == "stop":
+            state["stop"] = True
+            _reply(conn, {"ok": True})
+            return
+        if op not in ("send", "interrupt"):
+            _reply(conn, {"error": "mssh: unknown request %r" % (op,)})
+            return
+        if session.dead:
+            _reply(conn, {"error": "mssh: session ended: %s" % session.dead})
+            return
+
+        if op == "interrupt":
+            try:
+                signalled = session.interrupt_running()
+            except _SessionDead as exc:
+                die(str(exc))
+                _reply(conn, {"error": "mssh: session ended: %s" % exc})
+                return
+            # Whatever output the interrupt produced belongs to the client
+            # that is still streaming the interrupted command, not to this
+            # one, so there is nothing to return but the fact of it.
+            _reply(conn, {"interrupted": signalled, "status": None,
+                          "timed_out": False})
+            return
+
+        wait = req.get("wait")
+        wait = DEFAULT_SESSION_WAIT if wait is None else float(wait)
+        if wait <= 0:
+            wait = float("inf")           # --wait 0: until it ends or Ctrl-C
+        # Streaming holds the pty lock for the command's whole life, so a
+        # client that walks away must not pin it: the send below fails once
+        # its socket buffer fills and the connection is gone, which closes
+        # the generator and releases the lock.
+        try:
+            for event in session.stream(req.get("line", ""), wait):
+                if event[0] == "out":
+                    _send_json(conn, {
+                        "out": base64.b64encode(event[1]).decode("ascii")})
+                else:
+                    _send_json(conn, {"status": event[1],
+                                      "timed_out": event[2], "end": True})
+        except _SessionDead as exc:
+            die(str(exc))
+            _reply(conn, {"error": "mssh: session ended: %s" % exc})
+            return
+        except (socket.error, OSError):
+            return                        # the client hung up mid-command
+        try:
+            conn.shutdown(socket.SHUT_WR)
+        except (socket.error, OSError):
+            pass
+
+    def die(reason):
+        session.dead = reason
+        state["stop"] = True
+
+    srv.settimeout(1.0)
+    try:
+        while not state["stop"]:
+            try:
+                conn, _addr = srv.accept()
+            except socket.timeout:
+                if session.dead or session.chan.exit_status_ready():
+                    break
+                if opts.session_idle > 0 and \
+                        time.time() - session.last > opts.session_idle:
+                    verbose(opts, "session idle for %gs, exiting"
+                            % opts.session_idle)
+                    break
+                continue
+            except OSError:
+                break
+            worker = threading.Thread(target=handle, args=(conn,))
+            worker.daemon = True
+            worker.start()
+    finally:
+        try:
+            srv.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        try:
+            session.chan.close()
+        except Exception:
+            pass
+        close_all(clients)
+
+
+def serve_session(name, srv, path, readyfd, jumps, target, opts):
+    """The daemon: build the chain, detach, then serve.
+
+    Runs in the forked child, which still has the terminal: build_chain may
+    need to ask for a password, and its -v trace belongs on the screen.  Only
+    once the session is up does this detach for good.
+    """
+    clients = []
+    try:
+        clients, tgt = build_chain(jumps, target, opts)
+        chan = tgt.get_transport().open_session(timeout=opts.timeout)
+        chan.get_pty(term=SESSION_TERM, width=SESSION_COLS,
+                     height=SESSION_ROWS)
+        program = opts.command or SESSION_SHELL
+        # 'exec' makes the program the channel's process leader, so a Ctrl-C
+        # written into the pty reaches it; 'stty -echo' stops our own input
+        # from coming straight back as output.
+        chan.exec_command("stty -echo 2>/dev/null; exec " + program)
+
+        mark = "__MSSH_%s__" % os.urandom(8).hex()
+        prompt_re = re.compile(opts.prompt.encode("utf-8")) if opts.prompt else None
+        session = _Session(chan, mark,
+                           "interactive" if opts.command else "shell",
+                           prompt_re, opts.idle, target, opts.command)
+        banner = session.setup(opts.wait)
+    except SystemExit as exc:
+        # A SystemExit carries its own message and nothing has printed it yet
+        # -- raising it is how mssh reports a failed hop -- so print it here,
+        # on the terminal we still hold.  The parent only needs to know that we
+        # failed; it deliberately says nothing more, or the same failure would
+        # appear twice.
+        message = str(exc).rstrip("\n")
+        if message and message != "None":
+            sys.stderr.write(message + "\n")
+            sys.stderr.flush()
+        _ready(readyfd, {"ok": False})
+        close_all(clients)
+        return 1
+    except BaseException as exc:
+        # Same reasoning: we still have the terminal, so report here.  The type
+        # is included because an unexpected exception's str() is often empty.
+        sys.stderr.write("mssh: session %s: %s: %s\n"
+                         % (name, type(exc).__name__, exc))
+        sys.stderr.flush()
+        _ready(readyfd, {"ok": False})
+        close_all(clients)
+        return 1
+
+    verbose(opts, "session %s ready, pid %d" % (name, os.getpid()))
+    banner64 = base64.b64encode(banner).decode("ascii")
+
+    # Detach before signalling readiness, not after: the parent exits the
+    # moment it hears, and its shell then prints a prompt.  Anything we wrote
+    # to the terminal after that would land on top of it.
+    _session_detach(name, opts)
+    _ready(readyfd, {"ok": True, "banner": banner64})
+
+    verbose(opts, "session %s: serving on %s, everything below happened after "
+                  "startup" % (name, path))
+    _session_serve(session, srv, path, clients, opts)
+    return 0
+
+
+def run_session_spawn(name, jumps, target, opts):
+    """Start a session daemon in the background and wait for it to be ready.
+
+    The child keeps stdin and the terminal until the chain is up, so a hop that
+    needs a password can still ask for one.  That is why there is no separate
+    "collect the passwords first" step: connect_hop's own prompting works, in
+    the process that actually needs the answer.
+    """
+    srv, path = _session_listen(name)
+    readfd, writefd = os.pipe()
+
+    # Fork before paramiko builds anything: a Transport starts threads, and
+    # only the forking thread survives into the child -- measured, the channel
+    # times out in a child forked from a process with a live transport.
+    pid = os.fork()
+    if pid == 0:
+        os.close(readfd)
+        try:
+            _session_predetach()
+            serve_session(name, srv, path, writefd, jumps, target, opts)
+        except BaseException:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        finally:
+            os._exit(0)
+
+    os.close(writefd)
+    srv.close()
+    return _await_session(name, readfd, pid, opts)
+
+
+def _await_session(name, readfd, pid, opts):
+    chunks = []
+    while True:
+        try:
+            chunk = os.read(readfd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(readfd)
+    # The daemon is our direct child and outlives us, so it cannot be reaped
+    # here; only a failed one has already exited.  WNOHANG collects that case
+    # without blocking on the one that succeeded.
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+
+    raw = b"".join(chunks).strip()
+    if not raw:
+        # The daemon keeps stderr until it is serving, so whatever killed it
+        # has already been printed; there is nothing to point at.
+        sys.stderr.write("mssh: session %s: the session daemon exited before "
+                         "it was ready\n" % name)
+        return 1
+    try:
+        info = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        sys.stderr.write("mssh: session %s: the session daemon sent garbage\n"
+                         % name)
+        return 1
+    if not info.get("ok"):
+        # serve_session still had the terminal when it failed, so it printed
+        # the reason itself, in full.  Relaying a summary of it here would only
+        # print the same failure twice.
+        return 1
+
+    banner = base64.b64decode(info.get("banner") or "")
+    if banner:
+        sys.stdout.buffer.write(banner if banner.endswith(b"\n")
+                                else banner + b"\n")
+        sys.stdout.buffer.flush()
+    verbose(opts, "session %s listening on %s" % (name, session_path(name)))
+    return 0
+
+
+# -- client ----------------------------------------------------------------
+
+
+def _looks_like_target(args):
+    """True if the positionals read as a login endpoint, not as a command.
+
+    Only used to tell a mistyped second start apart from a command, so that
+    'mssh --session s root@host' against a live session says "already
+    running" instead of silently running 'root@host' in the shell.
+    """
+    if len(args) != 1:
+        return False
+    try:
+        parse_endpoint(args[0])
+    except ValueError:
+        return False
+    return not re.search(r"[\s;|&<>$`]", args[0])
+
+
+def _no_session(name):
+    raise SystemExit(
+        "mssh: no session %r; start one with:\n"
+        "    mssh --session %s [-j <jump>...] <target>" % (name, name)
+    )
+
+
+def run_session_send(name, line, opts):
+    """Stream one command's output to stdout, then exit with its status.
+
+    Ctrl-C here interrupts the remote command, the way it would in a terminal,
+    rather than killing this process and leaving the command running: an agent
+    or a script that gives up on a command needs the session left usable.
+    """
+    interrupted = {"count": 0}
+
+    def on_sigint(_signum, _frame):
+        interrupted["count"] += 1
+        if interrupted["count"] > 1:
+            # A second Ctrl-C means "let me out", even if the remote side is
+            # not responding.
+            raise KeyboardInterrupt
+        sys.stderr.write("\nmssh: interrupting the remote command "
+                         "(Ctrl-C again to leave it running)\n")
+        try:
+            session_request(name, {"op": "interrupt"}, timeout=15.0)
+        except (SessionGone, SystemExit, OSError):
+            pass
+
+    previous = signal.getsignal(signal.SIGINT)
+    try:
+        signal.signal(signal.SIGINT, on_sigint)
+    except ValueError:
+        previous = None                   # not the main thread; leave it alone
+
+    try:
+        verbose(opts, "session %s: sending %d byte(s), waiting up to %s"
+                % (name, len(line),
+                   ("%gs" % opts.wait) if opts.wait > 0 else "forever"))
+        started = time.time()
+        code = _emit_session_stream(
+            name,
+            session_stream(name, {"op": "send", "line": line,
+                                  "wait": opts.wait}, timeout=None),
+            opts, interrupted)
+        verbose(opts, "session %s: finished in %.3fs, exit %d"
+                % (name, time.time() - started, code))
+        return code
+    except KeyboardInterrupt:
+        sys.stderr.write("mssh: detached; the command may still be running "
+                         "(mssh --session %s --status)\n" % name)
+        return 130
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
+
+
+def run_session_interrupt(name):
+    reply = session_request(name, {"op": "interrupt"}, timeout=30.0)
+    if reply.get("error"):
+        sys.stderr.write(reply["error"].rstrip("\n") + "\n")
+        return 1
+    if reply.get("interrupted"):
+        sys.stderr.write("mssh: session %s: interrupted the running command\n"
+                         % name)
+    else:
+        sys.stderr.write("mssh: session %s: nothing was running\n" % name)
+    return 0
+
+
+def _emit_session_stream(name, messages, opts, interrupted=None):
+    """Write each output message as it arrives; return the exit status."""
+    out = sys.stdout.buffer
+    status, timed_out, error = None, False, None
+    for message in messages:
+        if message.get("error"):
+            error = message["error"]
+            continue
+        if "out" in message:
+            out.write(base64.b64decode(message["out"]))
+            out.flush()
+            continue
+        status = message.get("status")
+        timed_out = bool(message.get("timed_out"))
+
+    if error:
+        sys.stderr.write(error.rstrip("\n") + "\n")
+        return 1
+    if interrupted and interrupted["count"]:
+        return 130
+    if timed_out:
+        sys.stderr.write(
+            "mssh: session %s: no end of output after %gs -- the command may "
+            "still be running (raise --wait, or --interrupt it)\n"
+            % (name, opts.wait)
+        )
+        return 124
+    return int(status) if status is not None else 0
+
+
+def _uptime(seconds):
+    seconds = int(seconds)
+    return "%d:%02d:%02d" % (seconds // 3600, seconds // 60 % 60, seconds % 60)
+
+
+def run_session_status(name):
+    info = session_request(name, {"op": "status"}, timeout=15.0)
+    sys.stdout.write(
+        "session:  %s\n"
+        "target:   %s\n"
+        "mode:     %s\n"
+        "program:  %s\n"
+        "uptime:   %s\n"
+        "commands: %d\n"
+        "state:    %s\n"
+        "pid:      %d\n"
+        % (name, info.get("target", "?"), info.get("mode", "?"),
+           info.get("command") or "login shell",
+           _uptime(time.time() - float(info.get("started") or time.time())),
+           int(info.get("served") or 0),
+           "running a command" if info.get("running") else "idle",
+           int(info.get("pid") or 0))
+    )
+    if info.get("dead"):
+        sys.stdout.write("state:    ended (%s)\n" % info["dead"])
+    return 0
+
+
+def run_session_stop(name):
+    session_request(name, {"op": "stop"}, timeout=15.0)
+    # The daemon acknowledges before it unwinds, so wait for the socket to go:
+    # otherwise an immediate restart races the teardown.
+    path = session_path(name)
+    deadline = time.time() + 15
+    while time.time() < deadline and os.path.exists(path):
+        time.sleep(0.05)
+    sys.stderr.write("mssh: session %s stopped\n" % name)
+    return 0
+
+
+def run_session_list():
+    directory = session_dir()
+    rows = []
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.endswith(".sock"):
+            continue
+        name = entry[:-len(".sock")]
+        try:
+            info = session_request(name, {"op": "status"}, timeout=5.0)
+        except SessionGone:
+            continue                      # stale socket, a killed daemon
+        except SystemExit:
+            rows.append((name, "?", "?", "?", 0))
+            continue
+        rows.append((name, info.get("target", "?"), info.get("mode", "?"),
+                     _uptime(time.time() - float(info.get("started") or 0)),
+                     int(info.get("served") or 0)))
+
+    if not rows:
+        sys.stderr.write("mssh: no live sessions in %s\n" % directory)
+        return 1
+    width = max(len(r[0]) for r in rows + [("NAME",)])
+    tgtw = max(len(r[1]) for r in rows) if rows else 6
+    sys.stdout.write("%-*s  %-*s  %-11s  %-9s  %s\n"
+                     % (width, "NAME", tgtw, "TARGET", "MODE", "UPTIME",
+                        "SENT"))
+    for row in rows:
+        sys.stdout.write("%-*s  %-*s  %-11s  %-9s  %d\n"
+                         % (width, row[0], tgtw, row[1], row[2], row[3],
+                            row[4]))
+    return 0
+
+
+def run_session(parser, opts):
+    """Dispatch every --session invocation."""
+    name = opts.session
+    if not SESSION_NAME_RE.match(name):
+        parser.error("invalid session name %r; use up to 64 characters from "
+                     "A-Z a-z 0-9 . _ - starting with a letter, digit or _"
+                     % name)
+        return 2
+
+    controls = [flag for flag in ("stop", "interrupt", "status")
+                if getattr(opts, flag)]
+    if len(controls) > 1:
+        parser.error("--%s and --%s cannot be combined" % tuple(controls[:2]))
+        return 2
+    if controls:
+        if opts.args:
+            parser.error("--%s takes no other arguments" % controls[0])
+            return 2
+        try:
+            if controls[0] == "status":
+                return run_session_status(name)
+            if controls[0] == "stop":
+                return run_session_stop(name)
+            return run_session_interrupt(name)
+        except SessionGone:
+            _no_session(name)
+
+    if opts.copy_id:
+        parser.error("--copy-id cannot be combined with --session")
+        return 2
+    if opts.force_tty:
+        parser.error("-t cannot be combined with --session; a session always "
+                     "allocates a pty")
+        return 2
+    if opts.recursive or opts.preserve:
+        parser.error("-r/-p only apply to a file copy, not to --session")
+        return 2
+    if opts.prompt is not None and not opts.command:
+        parser.error("--prompt marks the end of an interactive program's "
+                     "reply, so it needs -c to say which program to run")
+        return 2
+    if opts.prompt is not None:
+        try:
+            re.compile(opts.prompt)
+        except re.error as exc:
+            parser.error("--prompt is not a valid regular expression: %s" % exc)
+            return 2
+
+    # A live session takes commands; only a dead one can be started.  That
+    # split is by existence, not by guessing whether the argument looks more
+    # like a command or a host.
+    if session_alive(name):
+        if opts.jump or opts.command or _looks_like_target(opts.args):
+            raise SystemExit(
+                "mssh: session %r is already running; --status to inspect "
+                "it, --stop to end it" % name
+            )
+        if not opts.args:
+            parser.error("--session %s: nothing to send -- pass a command, "
+                         "or --status/--stop/--interrupt" % name)
+            return 2
+        try:
+            return run_session_send(name, " ".join(opts.args), opts)
+        except SessionGone:
+            # It answered a moment ago, so it ended in between -- usually
+            # because the previous command was an 'exit'.  Same message as a
+            # session that was never there: from here they are the same thing.
+            _no_session(name)
+
+    if len(opts.args) != 1:
+        _no_session(name)
+    try:
+        target = parse_endpoint(opts.args[0])
+    except ValueError:
+        _no_session(name)
+    try:
+        jumps = [parse_endpoint(spec) for spec in opts.jump]
+    except ValueError as exc:
+        parser.error(str(exc))
+        return 2
+    _setup_paramiko_logging(opts)
+    return run_session_spawn(name, jumps, target, opts)
+
+
+# --------------------------------------------------------------------------
 # cli
 # --------------------------------------------------------------------------
+
+def _setup_paramiko_logging(opts):
+    import logging
+    if opts.verbose:
+        # Match paramiko's own output to the mssh timestamp format so the
+        # two interleave readably on stderr.
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter(
+            fmt="[%(asctime)s.%(msecs)03d] paramiko: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        plog = logging.getLogger("paramiko")
+        plog.handlers = [handler]
+        plog.setLevel(logging.WARNING)
+        plog.propagate = False
+    else:
+        logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+
 
 def verbose(opts, message):
     if opts.verbose:
@@ -1454,6 +2792,45 @@ file copy (SOURCE... DEST; the remote side carries the endpoint):
   mssh ./x root@10.0.0.9:36001:/tmp/      # with a port
   The path after ':' may be absolute or relative to the remote home.
   Runs over sftp on the target; add -C to compress large transfers.
+
+persistent session (keep one connection and one shell alive):
+  mssh --session s -j ops@10.0.0.1 root@10.0.0.9   # first call: detaches
+  mssh --session s 'cd /var/log && ls'             # runs in that shell
+  mssh --session s 'grep -c error messages'        # exit code is grep's
+  mssh --session s 'X=1'; mssh --session s 'echo $X'   # state persists
+  Each call is a separate process, but the working directory, variables
+  and background jobs live on in the session, which a plain -c cannot do.
+
+  -c holds an interactive program instead of a shell, and --prompt names
+  the regex that ends one of its replies:
+  mssh --session g --prompt '\\(gdb\\) $' -j ops@10.0.0.1 root@10.0.0.9 \\
+       -c 'gdb -q -ex "set pagination off" -p 1234'
+  mssh --session g 'bt'                            # output, then exit 0
+
+  mssh --session s --status    # target, uptime, commands served
+  mssh --session s --interrupt # Ctrl-C, to unstick a hung command
+  mssh --session s --stop      # end it; --sessions lists live ones
+
+  Output streams as the command produces it, so a long-running command
+  (a poller, a tail, a build) prints as it goes.  --wait bounds how long
+  to keep watching, 0 for no bound; a timeout leaves the session usable
+  and the next command stops whatever was still running.  Ctrl-C
+  interrupts the remote command rather than killing the local one, so the
+  session stays usable; press it twice to walk away and leave it running.
+
+  The session runs behind a pty, so output is stdout and stderr merged in
+  the order the program wrote them, and the exit code -- not the stream --
+  is what says whether a command failed.  Each command's stdin is
+  /dev/null, so a bare 'cat' ends instead of hanging the session.  A
+  program that paginates will stall at its pager until --interrupt, so
+  turn paging off in the program itself (gdb: -ex 'set pagination off').
+
+  Sessions live in ~/.mssh/sessions, one socket each, mode 0600: holding
+  one is equivalent to being logged in on the target.
+
+  The first call keeps your terminal until the chain is up, so a hop that
+  needs a password still asks for one, and -v still shows each hop; only
+  then does it detach.
 
 first-time key setup (then no more passwords):
   ssh-keygen -t ed25519                       # if you have no key yet
@@ -1493,7 +2870,7 @@ def build_parser():
         help="jump host as user[:password]@host[:port]; repeat for each hop, in order",
     )
     parser.add_argument(
-        "args", metavar="TARGET|PATH", nargs="+",
+        "args", metavar="TARGET|PATH", nargs="*",
         help="either one login target, user[:password]@host[:port], or copy "
              "arguments SOURCE... DEST in which the remote side carries that "
              "same endpoint with ':' and a path appended: "
@@ -1557,6 +2934,54 @@ def build_parser():
         "--no-prompt", action="store_true",
         help="never prompt for a missing password (fail instead)",
     )
+    group = parser.add_argument_group("persistent sessions")
+    group.add_argument(
+        "--session", metavar="NAME",
+        help="keep the connection alive under NAME.  The first call carries "
+             "the chain and detaches a local daemon holding a remote shell; "
+             "every later 'mssh --session NAME CMD' runs CMD in that same "
+             "shell, so the working directory, variables and any loaded "
+             "state persist between calls",
+    )
+    group.add_argument(
+        "--sessions", action="store_true", help="list live sessions and exit",
+    )
+    group.add_argument(
+        "--stop", action="store_true",
+        help="end the --session named session and close its connection",
+    )
+    group.add_argument(
+        "--interrupt", action="store_true",
+        help="send Ctrl-C to the session, as if at its keyboard",
+    )
+    group.add_argument(
+        "--status", action="store_true",
+        help="print the session's target, uptime and command count",
+    )
+    group.add_argument(
+        "--prompt", metavar="REGEX",
+        help="with --session -c: the regex marking the end of the program's "
+             r"reply, e.g. '\(gdb\) $' or '>>> $'.  Without it mssh guesses, "
+             "treating a --idle pause in the output as the end",
+    )
+    group.add_argument(
+        "--idle", type=float, default=DEFAULT_SESSION_IDLE, metavar="SEC",
+        help="without --prompt, how long output must pause before it counts "
+             "as finished (default: %g)" % DEFAULT_SESSION_IDLE,
+    )
+    group.add_argument(
+        "--wait", type=float, default=DEFAULT_SESSION_WAIT, metavar="SEC",
+        help="how long to wait for a command to finish; its output streams "
+             "as it arrives either way, and the session survives a timeout.  "
+             "0 waits indefinitely, so a command that never ends keeps "
+             "printing until you Ctrl-C it (default: %g)"
+             % DEFAULT_SESSION_WAIT,
+    )
+    group.add_argument(
+        "--session-idle", type=float, default=0, metavar="SEC",
+        help="end the session after SEC of no commands, so a forgotten one "
+             "does not hold a connection open forever (default: 0, never)",
+    )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="log each hop to stderr",
     )
@@ -1569,6 +2994,30 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     opts = parser.parse_args(argv)
+
+    if opts.sessions:
+        if opts.session or opts.args:
+            parser.error("--sessions lists sessions and exits; it takes no "
+                         "other arguments")
+            return 2
+        return run_session_list()
+
+    if opts.session:
+        return run_session(parser, opts)
+
+    for flag in ("stop", "interrupt", "status"):
+        if getattr(opts, flag):
+            parser.error("--%s acts on a session; name it with --session NAME"
+                         % flag)
+            return 2
+    if opts.prompt is not None:
+        parser.error("--prompt only applies to --session -c")
+        return 2
+
+    if not opts.args:
+        parser.error("no target given; pass user[:password]@host[:port] "
+                     "(mssh --help for the full syntax)")
+        return 2
 
     # One positional is a login target; several mean a copy, and then the
     # target is whichever host the remote paths name.
@@ -1632,21 +3081,7 @@ def main(argv=None):
         parser.error("-r/-p only apply to a file copy; pass SOURCE and DEST")
         return 2
 
-    import logging
-    if opts.verbose:
-        # Match paramiko's own output to the mssh timestamp format so the
-        # two interleave readably on stderr.
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter(
-            fmt="[%(asctime)s.%(msecs)03d] paramiko: %(message)s",
-            datefmt="%H:%M:%S",
-        ))
-        plog = logging.getLogger("paramiko")
-        plog.handlers = [handler]
-        plog.setLevel(logging.WARNING)
-        plog.propagate = False
-    else:
-        logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+    _setup_paramiko_logging(opts)
 
     clients = []
     try:
