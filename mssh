@@ -24,10 +24,11 @@ Endpoint format:
 
 File copy (instead of logging in), scp-style: the remote side of the copy
 carries the endpoint, with ':' and the path appended.  The path may be
-absolute or relative to the remote home directory.
+absolute or relative to the remote home directory.  Permissions travel
+with the file the way scp sends them, so an executable arrives executable.
     mssh -j jump@ip ./app.tar target@ip:/tmp/          # upload
     mssh -j jump@ip target@ip:/var/log/syslog ./       # download
-    mssh -rp -j jump@ip ./dist target@ip:/srv/www/     # tree, keep attrs
+    mssh -rp -j jump@ip ./dist target@ip:/srv/www/     # tree, exact attrs
 
 Persistent session: a plain run connects, executes and tears everything
 down, so nothing survives to the next call.  --session NAME keeps a local
@@ -1253,6 +1254,58 @@ def _remote_isdir(sftp, path):
         return False
 
 
+def _remote_isfile(sftp, path):
+    """Does ``path`` already exist remotely?  Decides whether to set a mode."""
+    try:
+        sftp.stat(path)
+        return True
+    except IOError:
+        return False
+
+
+def local_umask():
+    """This process's umask, for filtering a copied file's mode.
+
+    Read from /proc where possible: the portable way to query a umask is
+    umask(0) followed by umask(old), which briefly sets it to 0 -- a race
+    against anything else creating a file in the meantime.
+
+    Used for both directions.  scp filters by the *receiving* side's umask,
+    and on upload that is the remote's, which SFTP gives us no way to ask
+    for.  The local one is the best available answer and the same number in
+    the overwhelming majority of cases (both sides 022); where it differs,
+    the result is still sane -- a mode the user's own environment considers
+    appropriate -- and -p is there for anyone who wants the exact bits.
+    """
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (IOError, OSError, ValueError, IndexError):
+        pass
+    # No /proc (or an unexpected format): fall back to the racy dance, which
+    # is still better than guessing.
+    current = os.umask(0o022)
+    os.umask(current)
+    return current
+
+
+def _copy_mode(source_mode, umask):
+    """The mode a freshly copied file or directory should get.
+
+    Mirrors what open(2)/mkdir(2) do for scp on the receiving side: the
+    source's permission bits filtered by the umask, with
+    setuid/setgid/sticky carried through untouched, as scp carries them.
+
+    Only applied to something this copy created.  An existing file or
+    directory keeps its own mode -- overwriting a 0600 config on the target
+    must not widen it because our copy happened to be 0644, and scp behaves
+    the same way (measured, in both directions).
+    """
+    return (source_mode & ~umask & 0o777) | (source_mode & 0o7000)
+
+
 def _apply_local_attrs(path, attrs):
     """Copy mode and mtime from a remote stat onto a local path (-p)."""
     try:
@@ -1277,16 +1330,30 @@ def _apply_remote_attrs(sftp, path, st):
                          % (path, exc))
 
 
-def _remote_mkdir(sftp, path):
+def _remote_mkdir(sftp, path, mode=None):
+    """Create ``path`` remotely, at ``mode`` if given.
+
+    ``mode`` is forced writable and searchable by us for the duration: a
+    0555 source directory cannot be filled after it is created, so the
+    narrowing happens once the contents are in (upload_path does it).
+    """
     if _remote_isdir(sftp, path):
-        return
+        return None
     try:
-        sftp.mkdir(path)
+        if mode is None:
+            sftp.mkdir(path)
+        else:
+            sftp.mkdir(path, mode | 0o700)
     except IOError as exc:
         # A parallel creation or an existing dir is fine; anything else is not.
         if not _remote_isdir(sftp, path):
             raise SystemExit("mssh: cannot create remote directory :%s: %s"
                              % (path, exc))
+        return None
+    try:
+        return statmod.S_IMODE(sftp.stat(path).st_mode)
+    except IOError:
+        return None
 
 
 def _check_abort():
@@ -1303,18 +1370,36 @@ def upload_path(sftp, local, remote, opts):
     """Copy a local file or tree to ``remote`` (which is the final name)."""
     _check_abort()
     st = os.stat(local)                      # follows symlinks, like scp
+    mode = statmod.S_IMODE(st.st_mode)
 
     if statmod.S_ISDIR(st.st_mode):
         if not opts.recursive:
             raise SystemExit("mssh: omitting directory %s (use -r)" % local)
-        _remote_mkdir(sftp, remote)
+        created = _remote_mkdir(sftp, remote, mode)
         for name in sorted(os.listdir(local)):
             upload_path(sftp, os.path.join(local, name),
                         remote.rstrip("/") + "/" + name, opts)
-        # Attributes last: writing the contents bumps the directory mtime.
+        # Attributes last: writing the contents bumps the directory mtime,
+        # and a read-only source directory can only be narrowed once it is
+        # full.  Only a directory we created ourselves is touched -- an
+        # existing one keeps its own mode, as it does under scp.
         if opts.preserve:
             _apply_remote_attrs(sftp, remote, st)
+        elif created is not None:
+            want = _copy_mode(mode, local_umask())
+            if want != created:
+                try:
+                    sftp.chmod(remote, want)
+                except IOError as exc:
+                    sys.stderr.write("mssh: cannot set mode on :%s: %s\n"
+                                     % (remote, exc))
         return
+
+    # Does it exist already?  If so it keeps its own mode, as under scp --
+    # overwriting a 0600 config on the target must not widen it just because
+    # our copy happens to be 0644.  Asked before the transfer, since the
+    # transfer is what creates it.
+    fresh = not opts.preserve and not _remote_isfile(sftp, remote)
 
     try:
         sftp.put(local, remote, callback=_transfer_callback(sftp, local))
@@ -1322,8 +1407,19 @@ def upload_path(sftp, local, remote, opts):
         raise
     except IOError as exc:
         raise SystemExit("mssh: cannot write :%s: %s" % (remote, exc))
+
+    # paramiko's put() sends no mode at all, so the file arrives at the
+    # server's default 0666 & ~its umask and an executable source lands
+    # non-executable -- the reported bug.  Set it afterwards.
     if opts.preserve:
         _apply_remote_attrs(sftp, remote, st)
+    elif fresh:
+        want = _copy_mode(mode, local_umask())
+        try:
+            sftp.chmod(remote, want)
+        except IOError as exc:
+            sys.stderr.write("mssh: cannot set mode on :%s: %s\n"
+                             % (remote, exc))
 
 
 def download_path(sftp, remote, local, opts):
@@ -1338,9 +1434,12 @@ def download_path(sftp, remote, local, opts):
         if not opts.recursive:
             raise SystemExit("mssh: omitting remote directory :%s (use -r)"
                              % remote)
+        created = False
         if not os.path.isdir(local):
             try:
-                os.makedirs(local)
+                # Writable while we fill it; narrowed below, as on upload.
+                os.makedirs(local, statmod.S_IMODE(attrs.st_mode) | 0o700)
+                created = True
             except OSError as exc:
                 raise SystemExit("mssh: cannot create %s: %s" % (local, exc))
         for entry in sorted(sftp.listdir_attr(remote),
@@ -1349,7 +1448,20 @@ def download_path(sftp, remote, local, opts):
                           os.path.join(local, entry.filename), opts)
         if opts.preserve:
             _apply_local_attrs(local, attrs)
+        elif created:
+            try:
+                want = _copy_mode(statmod.S_IMODE(attrs.st_mode),
+                                  local_umask())
+                if want != statmod.S_IMODE(os.stat(local).st_mode):
+                    os.chmod(local, want)
+            except OSError as exc:
+                sys.stderr.write("mssh: cannot set mode on %s: %s\n"
+                                 % (local, exc))
         return
+
+    # As on upload: an existing file keeps its own mode, so only a file this
+    # copy creates gets one.  Asked before the transfer creates it.
+    fresh = not opts.preserve and not os.path.exists(local)
 
     try:
         sftp.get(remote, local,
@@ -1366,8 +1478,19 @@ def download_path(sftp, remote, local, opts):
         raise
     except IOError as exc:
         raise SystemExit("mssh: cannot write %s: %s" % (local, exc))
+
+    # paramiko's get() opens the local file with a plain open(), so the mode
+    # comes from our umask alone and a downloaded script arrived
+    # non-executable.  Set it afterwards, mirroring the upload side.
     if opts.preserve:
         _apply_local_attrs(local, attrs)
+    elif fresh and attrs.st_mode is not None:
+        want = _copy_mode(statmod.S_IMODE(attrs.st_mode), local_umask())
+        try:
+            os.chmod(local, want)
+        except OSError as exc:
+            sys.stderr.write("mssh: cannot set mode on %s: %s\n"
+                             % (local, exc))
 
 
 def run_copy(client, plan, opts):
@@ -2787,11 +2910,15 @@ file copy (SOURCE... DEST; the remote side carries the endpoint):
   mssh -j ops@10.0.0.1 root@10.0.0.9:/var/log/syslog ./    # download
   mssh ./a ./b root@10.0.0.9:/opt/pkg/    # several, DEST must be a dir
   mssh -r ./dist root@10.0.0.9:/srv/www/  # -r recurses into directories
-  mssh -rp root@10.0.0.9:/etc/nginx ./    # -p keeps mode and mtime
+  mssh -rp root@10.0.0.9:/etc/nginx ./    # -p also keeps the mtime
   mssh ./x root@10.0.0.9:                 # bare ':' is the remote $HOME
   mssh ./x root@10.0.0.9:36001:/tmp/      # with a port
   The path after ':' may be absolute or relative to the remote home.
   Runs over sftp on the target; add -C to compress large transfers.
+  A copied file keeps its permissions, as under scp: an executable stays
+  executable, filtered by your umask.  A file that already exists keeps its
+  own mode, so overwriting never widens one.  -p asks for the exact mode
+  instead, umask and all, plus the modification time.
 
 persistent session (keep one connection and one shell alive):
   mssh --session s -j ops@10.0.0.1 root@10.0.0.9   # first call: detaches
@@ -2883,7 +3010,9 @@ def build_parser():
     )
     parser.add_argument(
         "-p", "--preserve", action="store_true",
-        help="preserve mode and modification time on copied files",
+        help="preserve the exact mode and the modification time on copied "
+             "files.  Without it a copy still keeps its permissions, as scp "
+             "does, but your umask filters them",
     )
     parser.add_argument(
         "-c", "--command", metavar="CMD",
