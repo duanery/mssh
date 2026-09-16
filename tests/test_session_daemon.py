@@ -8,6 +8,7 @@ that the socket is as private as it claims to be.
 """
 
 import importlib.util
+import glob
 import json
 import os
 import pty
@@ -39,8 +40,18 @@ SOCKDIR = os.path.join(RUNDIR, ".mssh", "sessions")
 
 
 def run(*args, **kw):
-    return subprocess.run([sys.executable, FAKE] + list(args), env=ENV,
-                          capture_output=True, timeout=kw.get("timeout", 60))
+    """One mssh process.  stdin defaults to /dev/null, which is deliberate:
+    it is the one stdin kind that is never forwarded, so a test that says
+    nothing about stdin gets the plain '</dev/null' framing whether the suite
+    is run from a terminal or from a pipe.  Pass input=b'...' to feed a pipe.
+    """
+    kwargs = {"env": ENV, "capture_output": True,
+              "timeout": kw.get("timeout", 60)}
+    if "input" in kw:
+        kwargs["input"] = kw["input"]
+    else:
+        kwargs["stdin"] = kw.get("stdin", subprocess.DEVNULL)
+    return subprocess.run([sys.executable, FAKE] + list(args), **kwargs)
 
 
 class SessionTest(unittest.TestCase):
@@ -58,8 +69,8 @@ class SessionTest(unittest.TestCase):
                          "start failed: %s%s" % (proc.stdout, proc.stderr))
         return proc
 
-    def send(self, line, *extra):
-        return run("--session", self.name, line, *extra)
+    def send(self, line, *extra, **kw):
+        return run("--session", self.name, line, *extra, **kw)
 
 
 class TestLifecycle(SessionTest):
@@ -488,11 +499,104 @@ class TestOutputFidelity(SessionTest):
         self.assertEqual(lines[0], b"1")
         self.assertEqual(lines[49999], b"50000")
 
-    def test_stdin_is_devnull(self):
+    def test_stdin_is_devnull_when_nothing_is_piped(self):
+        # /dev/null is never forwarded, so a bare 'cat' still ends at once
+        # instead of waiting for input that is not coming.
         self.start()
         proc = self.send("cat", "--wait", "5")
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, b"")
+
+
+class TestStdinForwarding(SessionTest):
+    """'echo aa | mssh --session s cat' must behave like the same pipe to ssh."""
+
+    def test_a_pipe_reaches_the_command(self):
+        self.start()
+        proc = self.send("cat", input=b"aa\n")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"aa\n")
+
+    def test_a_file_reaches_the_command(self):
+        self.start()
+        path = os.path.join(RUNDIR, "in.txt")
+        with open(path, "wb") as handle:
+            handle.write(b"one\ntwo\nthree\n")
+        with open(path, "rb") as handle:
+            proc = run("--session", self.name, "wc -l", stdin=handle)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.strip(), b"3")
+
+    def test_binary_survives_intact(self):
+        self.start()
+        blob = bytes(range(256)) * 200
+        proc = self.send("wc -c", input=blob, timeout=90)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.strip(), str(len(blob)).encode())
+
+    def test_no_trailing_newline_is_preserved(self):
+        self.start()
+        proc = self.send("wc -c", input=b"abc")
+        self.assertEqual(proc.stdout.strip(), b"3")
+
+    def test_exit_status_is_still_the_commands(self):
+        self.start()
+        self.assertEqual(self.send("grep -q zzz", input=b"abc\n").returncode, 1)
+        self.assertEqual(self.send("grep -q abc", input=b"abc\n").returncode, 0)
+
+    def test_state_persists_across_a_send_with_stdin(self):
+        # The whole reason the command runs in the session shell rather than on
+        # the stdin channel: a fresh channel would lose the working directory.
+        self.start()
+        self.send("cd /tmp", input=b"ignored\n")
+        self.assertEqual(self.send("pwd").stdout, b"/tmp\n")
+        self.send("MSSH_KEPT=yes", input=b"ignored\n")
+        self.assertEqual(self.send("echo $MSSH_KEPT").stdout, b"yes\n")
+
+    def test_a_command_that_ignores_stdin_still_ends(self):
+        # The reader never opens the fifo, so the writer takes SIGPIPE; that
+        # must not hang the send or wedge the session.
+        self.start()
+        proc = self.send("echo hi", input=b"x" * 100000, timeout=90)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"hi\n")
+        self.assertEqual(self.send("echo after").stdout, b"after\n")
+
+    def test_reading_only_part_of_the_input(self):
+        self.start()
+        payload = b"".join(b"L%d\n" % i for i in range(50000))
+        proc = self.send("head -1", input=payload, timeout=90)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"L0\n")
+
+    def test_no_stdin_flag_suppresses_forwarding(self):
+        self.start()
+        proc = self.send("cat", "-n", input=b"unread\n")
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+
+    def test_interactive_mode_refuses_stdin(self):
+        # A -c session's program owns the pty, so there is nowhere safe to put
+        # the data; saying so beats silently dropping it.
+        self.start("-c", "cat", "--prompt", "$^")
+        proc = self.send("anything", input=b"data\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"interactive program", proc.stderr)
+
+    def test_no_fifos_are_left_on_the_target(self):
+        # The fake chain runs the writer locally, so the fifo it makes is a
+        # real file on this machine: a leak would show up here.
+        self.start()
+        for i in range(3):
+            self.send("cat", input=b"d%d\n" % i)
+        self.assertEqual(glob.glob("/tmp/.mssh-in-*"), [])
+
+    def test_a_timed_out_send_with_stdin_leaves_the_session_usable(self):
+        self.start()
+        proc = self.send("sleep 30", "--wait", "2", input=b"x\n")
+        self.assertEqual(proc.returncode, 124)
+        self.assertEqual(self.send("echo alive").stdout, b"alive\n")
+        self.assertEqual(glob.glob("/tmp/.mssh-in-*"), [])
 
 
 class TestInteractiveMode(SessionTest):

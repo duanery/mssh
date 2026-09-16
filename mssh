@@ -40,6 +40,9 @@ and any loaded state persist between them.
     mssh --session s --stop                   # end it
 Output streams as it is produced, so a long-running command prints as it
 goes; Ctrl-C interrupts that command and leaves the session usable.
+A pipe or a file on mssh's own stdin is forwarded to the command, so
+'echo aa | mssh --session s cat' works as it would through ssh; a
+terminal is not, unless --stdin asks for it.
 With -c the session holds an interactive program (gdb, python, sqlite3)
 instead of a shell, and --prompt REGEX marks where one of its replies ends.
 """
@@ -1608,6 +1611,54 @@ SESSION_SHELL = '"$(command -v bash 2>/dev/null || echo /bin/sh)"'
 # travels the channel and cannot be echoed back by accident.
 SESSION_FRAME = ('eval "$(echo %s | base64 -d)" </dev/null'
                  ' ; printf \'\\n%%s%%s\\n\' "$__M" "$?"\n')
+
+# The same frame, but with local stdin fed to the command:
+# 'echo aa | mssh --session s cat' should behave like 'echo aa | ssh host cat'.
+#
+# The data does not travel through the pty at all.  It goes over a second SSH
+# channel, into a fifo, which the session's own shell reads -- so the command
+# still runs in the long-lived shell (cwd, variables and functions intact) while
+# its stdin arrives out of band.  Three simpler designs were tried first and
+# each is worse:
+#
+#   * running the command on the second channel instead, with stdin forwarded
+#     natively, loses the session: open_session starts a *new* process on the
+#     target, so 'cd /tmp' and every unexported variable, function, shell
+#     option, open fd and background job of the live shell do not apply to it.
+#     Measured: a fresh channel saw '/' and an empty $PLAIN after the session
+#     shell had done 'cd /var/log; PLAIN=p'.
+#   * a base64 heredoc into a temp file keeps the shell but crawls: the pty
+#     carries every byte as text for the remote shell to decode, measured at
+#     0.4 MiB/s against bash, and it cannot stream -- the command sees nothing
+#     until the last line arrives, so 'tail -f | mssh ...' could not work.
+#   * feeding the pty directly cannot work at all: canonical mode truncates a
+#     line at 4095 bytes and reads control bytes as signals -- measured, a 0x03
+#     in the data killed the program.
+#
+# The fifo is created by the writer channel, which announces it ('echo R')
+# before blocking on the open; only then is the command framed.  That ordering
+# is what makes it race-free -- a reader framed against a path that does not
+# exist yet fails immediately with "No such file or directory".  Opening a fifo
+# for writing blocks until the reader arrives, so by the time 'rm' runs both
+# ends hold the inode: the name goes away at once while the pipe itself lives
+# until both sides close.  Nothing is left on the target even if the daemon is
+# killed mid-command.
+SESSION_FRAME_IN = ('eval "$(echo %s | base64 -d)" < "%s"'
+                    ' ; printf \'\\n%%s%%s\\n\' "$__M" "$?"\n')
+# The writer channel's program.  'mkfifo -m 600' before anything else, so the
+# path is never briefly world-writable; the readiness byte then tells the daemon
+# the fifo exists.  'exec cat' replaces the shell so the channel's EOF closes
+# fd 3 directly, which is what the reader sees as end of input.
+SESSION_WRITER = ('mkfifo -m 600 %(path)s 2>/dev/null && echo R && '
+                  'exec 3> %(path)s && rm -f %(path)s && exec cat >&3\n')
+SESSION_WRITER_READY = b"R"
+# A fifo per command, never one reused path.  Measured, sharing one path
+# misroutes data: when a command times out its reader stays queued on the fifo,
+# so the *next* command's stdin was delivered to the abandoned reader instead --
+# cmd2's payload landed in cmd1's output file while cmd2 read nothing.  A unique
+# path per send makes that impossible.  mkfifo costs ~5ms.
+SESSION_IN_PATH = "/tmp/.mssh-in-%s"
+
 # Resynchronisation after an interrupt or a timeout: the marker carries a
 # one-shot token instead of a status, so it cannot be confused with the frame
 # of the command that was abandoned, however late that one arrives.
@@ -1636,6 +1687,74 @@ class SessionGone(Exception):
 
 class _SessionDead(Exception):
     """The remote program behind the session has exited."""
+
+
+def stdin_kind(fd=None):
+    """What the client's stdin is: 'pipe', 'file', 'tty', 'null' or 'none'.
+
+    The kind, not the command, is what decides whether stdin is forwarded.
+    Guessing from the command line cannot work -- 'cat' reads it, 'ls' does not,
+    and 'sh -c "..."' could do either -- while fstat answers for free and reads
+    nothing, so a command that turns out to ignore its input costs nothing.
+
+    'null' is told apart from 'pipe' by device number, not by name: a command
+    reading /dev/null and one given no input at all are indistinguishable, so
+    forwarding it would set up a channel and a fifo to deliver nothing.  That
+    matters because scripts, cron jobs and agents write '</dev/null' routinely.
+    """
+    if fd is None:
+        fd = stdin_fd()
+    if fd is None:
+        return "none"
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        return "none"
+    if statmod.S_ISFIFO(st.st_mode) or statmod.S_ISSOCK(st.st_mode):
+        return "pipe"
+    if statmod.S_ISREG(st.st_mode):
+        return "file"
+    if statmod.S_ISCHR(st.st_mode):
+        try:
+            if st.st_rdev == os.stat(os.devnull).st_rdev:
+                return "null"
+        except OSError:
+            pass
+        try:
+            if os.isatty(fd):
+                return "tty"
+        except OSError:
+            pass
+        return "pipe"                     # some other character device
+    return "pipe"
+
+
+def want_stdin(opts):
+    """True if this send should carry the client's stdin to the remote command.
+
+    A pipe or a regular file is forwarded: that is 'echo aa | mssh --session s
+    cat' and 'mssh --session s wc -l <file', both of which mean to send data.
+
+    A terminal is not, unless --stdin asks for it.  Forwarding it by default
+    would make the ordinary interactive 'mssh --session s ls' sit waiting for
+    the user to type an EOF before the command could finish.
+
+    /dev/null and a closed stdin are never forwarded; there is nothing to send.
+    """
+    if opts.no_stdin:
+        return False
+    kind = stdin_kind()
+    if kind == "tty":
+        return bool(opts.stdin)
+    return kind in ("pipe", "file")
+
+
+def session_frame(line, in_path=None):
+    """The remote text that runs one command and prints its frame marker."""
+    blob = base64.b64encode(line.encode("utf-8")).decode("ascii")
+    if in_path is None:
+        return SESSION_FRAME % blob
+    return SESSION_FRAME_IN % (blob, in_path)
 
 
 def session_dir():
@@ -1707,7 +1826,8 @@ class _Session(object):
     time and every completed line is handed straight to the client.
     """
 
-    def __init__(self, chan, mark, mode, prompt_re, idle, target, command):
+    def __init__(self, chan, mark, mode, prompt_re, idle, target, command,
+                 transport=None, timeout=DEFAULT_TIMEOUT):
         self.chan = chan
         self.mark = mark.encode("utf-8")
         self.mode = mode                  # "shell" or "interactive"
@@ -1715,6 +1835,10 @@ class _Session(object):
         self.idle = idle
         self.target = target
         self.command = command
+        # Kept to open the stdin writer channel; the session's own channel
+        # cannot carry it, since the pty would read the data as keystrokes.
+        self.transport = transport
+        self.timeout = timeout
         self.lock = threading.Lock()
         self.started = time.time()
         self.last = self.started
@@ -1785,10 +1909,19 @@ class _Session(object):
     def _stream_shell(self, deadline):
         """Yield output as it arrives, ending at our frame marker.
 
-        Emission lags by one line, because the framing printf writes a newline
-        of its own that is not part of the command's output: only when the
-        marker arrives do we know whether that held line was real output
-        (a command whose last line had no newline) or just the frame's.
+        One line is held back, because the framing printf writes a newline of
+        its own that is not part of the command's output: when the marker comes
+        straight after a line, that line was the command's last and its newline
+        was the frame's, so emitting it earlier would append a newline the
+        command never printed.
+
+        The hold is released after --idle of quiet, which is what lets an
+        interactive filter work.  Without that release the holdback was
+        unbounded: 'mssh --session s --stdin cat' showed nothing at all until
+        Ctrl-D, because each typed line sat here waiting for the next one.  A
+        held line is safe to release once the output goes quiet, since a real
+        frame marker follows its line immediately -- far inside --idle -- so
+        anything still held after a pause had a newline of its own.
         """
         tail = b""
         held = None
@@ -1831,14 +1964,17 @@ class _Session(object):
                 self._resync()
                 yield ("end", 130, False)
                 return
-            if (tail and now - last_data >= self.idle
+            quiet = now - last_data >= self.idle
+            if held is not None and quiet:
+                # Nothing followed it, so its newline was real: hand it over
+                # rather than waiting for a line that may never come.
+                yield ("out", held + b"\n")
+                held = None
+            if (tail and quiet
                     and not self.mark.startswith(tail.rstrip(b"\r"))):
                 # A partial line that has gone quiet: a prompt, a progress bar,
                 # a status line.  Release it once it cannot be the start of the
                 # marker, so a command that asks a question is not held back.
-                if held is not None:
-                    yield ("out", held + b"\n")
-                    held = None
                 yield ("out", self._clean(tail))
                 tail = b""
             if now >= deadline:
@@ -1973,10 +2109,76 @@ class _Session(object):
             return None
         return line[:len(line) - (min(len(line), SESSION_TAIL) - found.start())]
 
+    # -- stdin forwarding -------------------------------------------------
+
+    def open_stdin_writer(self):
+        """Start the channel that will feed one command's stdin.
+
+        Returns (channel, remote fifo path).  The channel's program creates the
+        fifo and prints one byte before it blocks opening it, and this waits for
+        that byte: the command must not be framed against a path that does not
+        exist yet, which fails at once with "No such file or directory".
+        """
+        if self.transport is None:
+            raise _SessionDead("no transport for a stdin channel")
+        path = SESSION_IN_PATH % os.urandom(8).hex()
+        chan = self.transport.open_session(timeout=self.timeout)
+        chan.exec_command(SESSION_WRITER % {"path": path})
+
+        chan.settimeout(max(self.timeout, 1.0))
+        seen = b""
+        while SESSION_WRITER_READY not in seen:
+            try:
+                data = chan.recv(64)
+            except socket.timeout:
+                break
+            except Exception as exc:
+                chan.close()
+                raise _SessionDead("stdin channel failed: %s" % exc)
+            if not data:
+                break
+            seen += data
+        if SESSION_WRITER_READY not in seen:
+            # No readiness byte: mkfifo is missing, /tmp is read-only, or the
+            # target refused the channel.  Say which, since the alternative is
+            # a command that mysteriously reports a missing file.
+            err = b""
+            try:
+                if chan.recv_stderr_ready():
+                    err = chan.recv_stderr(200)
+            except Exception:
+                pass
+            chan.close()
+            raise _SessionDead(
+                "could not set up a stdin channel on the target (mkfifo in "
+                "/tmp must work)%s" % (": %s" % err.decode("utf-8", "replace").strip()
+                                       if err.strip() else "")
+            )
+        return chan, path
+
+    @staticmethod
+    def close_stdin_writer(chan):
+        """Shut the writer channel down, which is what the remote sees as EOF."""
+        if chan is None:
+            return
+        try:
+            chan.shutdown_write()
+        except Exception:
+            pass
+        try:
+            chan.close()
+        except Exception:
+            pass
+
     # -- operations -------------------------------------------------------
 
-    def stream(self, line, wait):
+    def stream(self, line, wait, in_path=None):
         """Run one command, yielding ('out', bytes) then ('end', status, bool).
+
+        in_path is the remote fifo a stdin writer channel has already created,
+        or None to leave the command reading /dev/null.  It only applies in
+        shell mode -- an interactive program owns the pty, so its input is the
+        command line itself.
 
         The caller must exhaust the generator: the pty lock is held for its
         whole life, since two commands interleaved on one pty would each read
@@ -1990,8 +2192,7 @@ class _Session(object):
                 # be mixed into ours and its marker would frame us early.
                 self._resync()
             if self.mode == "shell":
-                blob = base64.b64encode(line.encode("utf-8")).decode("ascii")
-                self._write(SESSION_FRAME % blob)
+                self._write(session_frame(line, in_path))
                 self.outstanding = 1
                 producer = self._stream_shell(time.time() + wait)
             else:
@@ -2104,6 +2305,13 @@ class _Session(object):
 # It has to be a stream rather than a single reply: a command that prints for
 # minutes must show its lines while it runs, and buffering the whole response
 # would show nothing until it finished.
+#
+# A request that says "stdin": true is followed by the client's stdin as raw
+# bytes on the same connection, terminated by a half-close.  Raw, not framed:
+# the data is a byte stream of unknown length that must reach the remote command
+# as it arrives ('tail -f | mssh --session s cat' has to work), so there is
+# nothing to count and nothing to buffer.  The JSON line is already delimited by
+# its newline, so everything after that newline is data.
 
 
 def _send_json(conn, payload):
@@ -2138,20 +2346,39 @@ def _connect_session(name, timeout):
     return conn
 
 
-def session_stream(name, payload, timeout=None):
-    """Send one request and yield each JSON message of the reply in turn."""
+def session_stream(name, payload, timeout=None, send_stdin=False):
+    """Send one request and yield each JSON message of the reply in turn.
+
+    With send_stdin, local stdin is copied to the daemon in a thread for as long
+    as the command runs, and the half-close that ends it is what the remote
+    command sees as EOF.  A thread rather than a select loop over both fds: this
+    generator's consumer decides when to read the next reply, so the two
+    directions cannot share one loop without stalling whichever the consumer is
+    not draining.
+    """
     conn = _connect_session(name, timeout)
     buf = b""
     seen = False
+    feeder = None
     try:
         conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
-        conn.shutdown(socket.SHUT_WR)
+        if send_stdin:
+            feeder = threading.Thread(target=_feed_stdin, args=(conn,))
+            feeder.daemon = True
+            feeder.start()
+        else:
+            conn.shutdown(socket.SHUT_WR)
         while True:
             try:
                 data = conn.recv(65536)
             except socket.timeout:
                 raise SystemExit("mssh: session %s: the session daemon "
                                  "stopped responding" % name)
+            except ConnectionResetError:
+                # The daemon replied and closed while the feeder was still
+                # writing, so our unsent data came back as a reset.  Whatever
+                # it said is already in buf; a reset is not an error of its own.
+                break
             if not data:
                 break
             buf += data
@@ -2167,10 +2394,36 @@ def session_stream(name, payload, timeout=None):
                                      "the session daemon" % name)
     finally:
         conn.close()
+        if feeder is not None:
+            # The socket is closed, so a feeder blocked in recv or send comes
+            # back at once; it is a daemon thread either way.
+            feeder.join(timeout=1.0)
 
     if not seen:
         raise SystemExit("mssh: session %s: the session daemon closed the "
                          "connection without replying" % name)
+
+
+def _feed_stdin(conn):
+    """Copy local stdin to the daemon, then half-close to signal EOF."""
+    fd = stdin_fd()
+    try:
+        while fd is not None:
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                break
+            if not data:
+                break
+            try:
+                conn.sendall(data)
+            except (socket.error, OSError):
+                return                # daemon gone or command over; stop quietly
+    finally:
+        try:
+            conn.shutdown(socket.SHUT_WR)
+        except (socket.error, OSError):
+            pass
 
 
 def session_request(name, payload, timeout=None):
@@ -2307,6 +2560,47 @@ def _session_detach(name, opts):
         os.close(null)
 
 
+def _pump_stdin(conn, chan, rest, session):
+    """Copy the client's stdin off the socket into the writer channel.
+
+    Runs in its own thread for the length of the command: the data arrives as
+    the client produces it, and a filter ('mssh --session s cat' fed by a slow
+    producer) must see each piece as it comes rather than at the end.
+
+    A half-close from the client is the end of input, and it is turned into a
+    channel EOF so the remote command's read() returns 0.  Every error is
+    swallowed: the command still frames on its own marker, and a broken writer
+    must not take the daemon down.
+    """
+    try:
+        if rest:
+            chan.sendall(rest)
+        conn.settimeout(1.0)
+        while True:
+            try:
+                data = conn.recv(65536)
+            except socket.timeout:
+                if chan.closed or chan.exit_status_ready():
+                    break             # the command ended; nobody is reading
+                continue
+            except (socket.error, OSError):
+                break
+            if not data:
+                break                 # the client half-closed: end of input
+            try:
+                chan.sendall(data)
+            except Exception:
+                break                 # remote 'cat' gone (the command ignored
+                                      # its stdin); drop the rest, as a pipe does
+    except Exception:
+        pass
+    finally:
+        try:
+            chan.shutdown_write()
+        except Exception:
+            pass
+
+
 def _session_serve(session, srv, path, clients, opts):
     """Answer requests until stopped, the program dies, or idle expires."""
     state = {"stop": False}
@@ -2328,7 +2622,11 @@ def _session_serve(session, srv, path, clients, opts):
             if not data.strip():
                 return
             req = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
-            dispatch(conn, req)
+            # Whatever followed that newline is already stdin data, not part of
+            # the request: keep it, or the first bytes of a fast writer's input
+            # would be dropped.
+            rest = data.split(b"\n", 1)[1] if b"\n" in data else b""
+            dispatch(conn, req, rest)
         except Exception as exc:                          # never kill the loop
             _reply(conn, {"error": "mssh: session daemon: %s" % exc})
         finally:
@@ -2337,7 +2635,7 @@ def _session_serve(session, srv, path, clients, opts):
             except Exception:
                 pass
 
-    def dispatch(conn, req):
+    def dispatch(conn, req, rest=b""):
         op = req.get("op")
         if op == "status":
             _reply(conn, {
@@ -2376,12 +2674,42 @@ def _session_serve(session, srv, path, clients, opts):
         wait = DEFAULT_SESSION_WAIT if wait is None else float(wait)
         if wait <= 0:
             wait = float("inf")           # --wait 0: until it ends or Ctrl-C
+        with_stdin = bool(req.get("stdin"))
+        if with_stdin and session.mode != "shell":
+            # Interactive mode has nowhere safe to put it.  The program owns
+            # the pty, so input could only be typed at it, and a pty in
+            # canonical mode truncates a line at 4095 bytes and reads control
+            # bytes as signals -- measured, a 0x03 in the data killed the
+            # program.  Silently dropping the data would be worse: the command
+            # would appear to work while reading nothing.
+            _reply(conn, {"error":
+                          "mssh: this session holds an interactive program "
+                          "(-c %s), whose input is the command line itself; "
+                          "stdin cannot be forwarded to it"
+                          % (session.command or "")})
+            return
+
+        in_chan, in_path, pump = None, None, None
+        if with_stdin:
+            # Open the writer channel *before* the command is framed: it is what
+            # creates the fifo, and a command framed against a path that does
+            # not exist yet fails at once with "No such file or directory".
+            try:
+                in_chan, in_path = session.open_stdin_writer()
+            except _SessionDead as exc:
+                _reply(conn, {"error": "mssh: %s" % exc})
+                return
+            pump = threading.Thread(target=_pump_stdin,
+                                    args=(conn, in_chan, rest, session))
+            pump.daemon = True
+            pump.start()
+
         # Streaming holds the pty lock for the command's whole life, so a
         # client that walks away must not pin it: the send below fails once
         # its socket buffer fills and the connection is gone, which closes
         # the generator and releases the lock.
         try:
-            for event in session.stream(req.get("line", ""), wait):
+            for event in session.stream(req.get("line", ""), wait, in_path):
                 if event[0] == "out":
                     _send_json(conn, {
                         "out": base64.b64encode(event[1]).decode("ascii")})
@@ -2394,6 +2722,14 @@ def _session_serve(session, srv, path, clients, opts):
             return
         except (socket.error, OSError):
             return                        # the client hung up mid-command
+        finally:
+            # The command is over, so nothing will read the fifo again: closing
+            # the writer releases the remote 'cat' even if the client is still
+            # sending, which is what makes 'yes | mssh --session s "echo hi"'
+            # end instead of streaming forever.
+            session.close_stdin_writer(in_chan)
+            if pump is not None:
+                pump.join(timeout=5.0)
         try:
             conn.shutdown(socket.SHUT_WR)
         except (socket.error, OSError):
@@ -2461,7 +2797,8 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
         prompt_re = re.compile(opts.prompt.encode("utf-8")) if opts.prompt else None
         session = _Session(chan, mark,
                            "interactive" if opts.command else "shell",
-                           prompt_re, opts.idle, target, opts.command)
+                           prompt_re, opts.idle, target, opts.command,
+                           tgt.get_transport(), opts.timeout)
         banner = session.setup(opts.wait)
     except SystemExit as exc:
         # A SystemExit carries its own message and nothing has printed it yet
@@ -2629,21 +2966,29 @@ def run_session_send(name, line, opts):
         except (SessionGone, SystemExit, OSError):
             pass
 
+    with_stdin = want_stdin(opts)
+
     previous = signal.getsignal(signal.SIGINT)
     try:
         signal.signal(signal.SIGINT, on_sigint)
     except ValueError:
         previous = None                   # not the main thread; leave it alone
 
+    request = {"op": "send", "line": line, "wait": opts.wait}
+    if with_stdin:
+        request["stdin"] = True
+
     try:
-        verbose(opts, "session %s: sending %d byte(s), waiting up to %s"
+        verbose(opts, "session %s: sending %d byte(s)%s, waiting up to %s"
                 % (name, len(line),
+                   " and forwarding stdin (%s)" % stdin_kind()
+                   if with_stdin else "",
                    ("%gs" % opts.wait) if opts.wait > 0 else "forever"))
         started = time.time()
         code = _emit_session_stream(
             name,
-            session_stream(name, {"op": "send", "line": line,
-                                  "wait": opts.wait}, timeout=None),
+            session_stream(name, request, timeout=None,
+                           send_stdin=with_stdin),
             opts, interrupted)
         verbose(opts, "session %s: finished in %.3fs, exit %d"
                 % (name, time.time() - started, code))
@@ -2928,6 +3273,18 @@ persistent session (keep one connection and one shell alive):
   Each call is a separate process, but the working directory, variables
   and background jobs live on in the session, which a plain -c cannot do.
 
+  stdin is forwarded when it is a pipe or a file, as it would be to ssh:
+  echo hello | mssh --session s cat                # prints hello
+  mssh --session s 'wc -l' < access.log            # counts the local file
+  tar cf - ./dir | mssh --session s 'tar xf - -C /srv'
+  It streams, so a filter fed by a slow producer prints as it goes, and the
+  command still runs in the session's shell -- a 'cd' before it still
+  applies.  A terminal is NOT forwarded by default, since with --stdin the
+  command reads until you type Ctrl-D: that is what you want for 'cat', and
+  not what you want for a plain 'mssh --session s ls'.  -n never forwards,
+  for when mssh's stdin belongs to something else (a script read from a pipe).
+  /dev/null is never forwarded: it cannot be told from having no input.
+
   -c holds an interactive program instead of a shell, and --prompt names
   the regex that ends one of its replies:
   mssh --session g --prompt '\\(gdb\\) $' -j ops@10.0.0.1 root@10.0.0.9 \\
@@ -2947,8 +3304,8 @@ persistent session (keep one connection and one shell alive):
 
   The session runs behind a pty, so output is stdout and stderr merged in
   the order the program wrote them, and the exit code -- not the stream --
-  is what says whether a command failed.  Each command's stdin is
-  /dev/null, so a bare 'cat' ends instead of hanging the session.  A
+  is what says whether a command failed.  With nothing piped in, a command's
+  stdin is /dev/null, so a bare 'cat' ends instead of hanging the session.  A
   program that paginates will stall at its pager until --interrupt, so
   turn paging off in the program itself (gdb: -ex 'set pagination off').
 
@@ -3036,6 +3393,13 @@ def build_parser():
         help="allocate a pty even with -c",
     )
     parser.add_argument(
+        "-n", "--no-stdin", action="store_true",
+        help="never forward stdin; the remote command reads /dev/null.  With "
+             "--session, stdin is otherwise forwarded whenever it is a pipe or "
+             "a file, so use this when this process's stdin belongs to "
+             "something else, such as a script being read from a pipe",
+    )
+    parser.add_argument(
         "-o", "--timeout", type=float, default=DEFAULT_TIMEOUT, metavar="SEC",
         help="per-hop connect timeout in seconds (default: %d)" % DEFAULT_TIMEOUT,
     )
@@ -3092,6 +3456,13 @@ def build_parser():
         help="with --session -c: the regex marking the end of the program's "
              r"reply, e.g. '\(gdb\) $' or '>>> $'.  Without it mssh guesses, "
              "treating a --idle pause in the output as the end",
+    )
+    group.add_argument(
+        "--stdin", action="store_true",
+        help="also forward stdin when it is a terminal, so the remote command "
+             "reads what you type until you end it with Ctrl-D.  A pipe or a "
+             "file is forwarded without this; a terminal is not, because the "
+             "Ctrl-D would then be needed by every command, 'ls' included",
     )
     group.add_argument(
         "--idle", type=float, default=DEFAULT_SESSION_IDLE, metavar="SEC",

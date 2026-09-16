@@ -10,6 +10,9 @@ is the whole point of the feature and cannot be tested in one.
 
 import importlib.util
 import os
+import select
+import socket
+import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
 
@@ -42,22 +45,93 @@ class FakeClient(object):
 
 
 class _PtyChan(FakeChan):
-    """A channel that starts its program on exec_command, not on __init__."""
+    """A channel that starts its program on exec_command, not on __init__.
+
+    A pty is allocated only when get_pty() is asked for, as a real channel does.
+    That distinction matters for the stdin writer channel: it gets no pty, so its
+    stdin is a plain pipe whose close is a real EOF -- through a pty it would be
+    line-disciplined instead, and the remote 'cat' would never see end of input.
+    """
 
     def __init__(self):
         self._timeout = None
         self.eof = False
         self.pid = None
         self.fd = None
+        self.want_pty = False
+        self.proc = None                  # set when running without a pty
+        self.closed = False
 
     def get_pty(self, term=None, width=0, height=0):
-        pass
+        self.want_pty = True
 
     def exec_command(self, command):
-        self.pid, self.fd = os.forkpty()
-        if self.pid == 0:
-            os.environ["TERM"] = "dumb"
-            os.execvp("/bin/sh", ["/bin/sh", "-c", command])
+        if self.want_pty:
+            self.pid, self.fd = os.forkpty()
+            if self.pid == 0:
+                os.environ["TERM"] = "dumb"
+                os.execvp("/bin/sh", ["/bin/sh", "-c", command])
+            return
+        # No pty: pipes, so shutdown_write() below is a genuine EOF.
+        self.proc = subprocess.Popen(
+            ["/bin/sh", "-c", command], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    # -- the pipe-backed half, used by the stdin writer channel -----------
+
+    def sendall(self, data):
+        if self.proc is None:
+            return FakeChan.sendall(self, data)
+        self.proc.stdin.write(data)
+        self.proc.stdin.flush()
+
+    def recv(self, size):
+        if self.proc is None:
+            return FakeChan.recv(self, size)
+        ready, _, _ = select.select([self.proc.stdout], [], [], self._timeout)
+        if not ready:
+            raise socket.timeout()
+        data = self.proc.stdout.read1(size) if hasattr(self.proc.stdout, "read1") \
+            else self.proc.stdout.read(size)
+        if not data:
+            self.eof = True
+        return data
+
+    def recv_stderr_ready(self):
+        if self.proc is None:
+            return False
+        return bool(select.select([self.proc.stderr], [], [], 0)[0])
+
+    def recv_stderr(self, size):
+        if self.proc is None:
+            return b""
+        return self.proc.stderr.read1(size)
+
+    def shutdown_write(self):
+        if self.proc is not None and self.proc.stdin and not self.proc.stdin.closed:
+            self.proc.stdin.close()
+
+    def exit_status_ready(self):
+        if self.proc is not None:
+            return self.proc.poll() is not None
+        return FakeChan.exit_status_ready(self)
+
+    def close(self):
+        self.closed = True
+        if self.proc is not None:
+            for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+                try:
+                    if stream and not stream.closed:
+                        stream.close()
+                except Exception:
+                    pass
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
+            return
+        FakeChan.close(self)
 
 
 def fake_build_chain(jumps, target, opts):

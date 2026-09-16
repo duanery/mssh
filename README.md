@@ -138,6 +138,14 @@ background jobs live on between calls. Output streams as it is produced, so a
 long-running command (a build, a poller, a `tail`) prints as it goes rather
 than arriving all at once at the end.
 
+Piping into a session works the way it does with `ssh`:
+
+```bash
+echo hello | mssh --session s cat               # prints hello
+mssh --session s 'wc -l' < access.log           # counts the local file
+tar cf - ./dir | mssh --session s 'tar xf - -C /srv'
+```
+
 Managing them:
 
 ```bash
@@ -171,8 +179,17 @@ can.
   because the session runs behind a pty. The exit code, not the stream, is what
   tells you whether a command failed. (A pty is not optional here: without one
   the two streams arrive unordered, and Ctrl-C cannot be delivered correctly.)
-- **Each command's stdin is `/dev/null`**, so a bare `cat` ends instead of
-  wedging the session.
+- **stdin is forwarded when it is a pipe or a file**, so `echo hello | mssh
+  --session s cat` behaves as it would through `ssh`, and it streams — a filter
+  fed by a slow producer prints as it goes. The command still runs in the
+  session's own shell, so a `cd` from an earlier call still applies. A terminal
+  is *not* forwarded by default: with `--stdin` the command reads until you
+  type Ctrl-D, which is what you want for `cat` and not for a plain
+  `mssh --session s ls`.
+  `-n` never forwards, for when mssh's stdin belongs to something else, such as
+  a script being read from a pipe. `/dev/null` is never forwarded — it cannot be
+  told apart from having no input, so a bare `cat` still ends instead of wedging
+  the session.
 - **`--wait SEC`** (default 30) bounds how long one command is watched; `0`
   means indefinitely. A timeout exits 124 and leaves the session usable — the
   next command stops whatever was still running.
@@ -229,6 +246,7 @@ points at a specific file.
 | `-j, --jump SPEC` | Add a jump host; repeat for each hop, in order |
 | `-c, --command CMD` | Run `CMD` instead of opening a shell |
 | `-t, --force-tty` | Allocate a pty even with `-c` |
+| `-n, --no-stdin` | Never forward stdin; the remote command reads `/dev/null` |
 | `-r, --recursive` | Copy directories recursively |
 | `-p, --preserve` | Keep the exact mode and mtime on copied files |
 | `-i, --identity KEYFILE` | Private key to authenticate with; repeatable |
@@ -245,7 +263,7 @@ points at a specific file.
 | `-V, --version` | Print the version |
 
 Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
-`--interrupt`, `--prompt REGEX`, `--idle SEC`, `--wait SEC`,
+`--interrupt`, `--prompt REGEX`, `--stdin`, `--idle SEC`, `--wait SEC`,
 `--session-idle SEC`.
 
 `mssh --help` carries the same detail plus worked examples.
@@ -279,8 +297,8 @@ order.
 ## Tests
 
 ```bash
-python3 tests/test_session_unit.py     # framing, names, flags        (33)
-python3 tests/test_session_daemon.py   # daemon, protocol, client     (39)
+python3 tests/test_session_unit.py     # framing, names, flags        (42)
+python3 tests/test_session_daemon.py   # daemon, protocol, client     (51)
 python3 tests/test_copy_mode.py        # copy permissions vs real scp (51)
 ```
 

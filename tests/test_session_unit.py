@@ -6,6 +6,7 @@ running the same programs a session would hold on the target.
 """
 
 import importlib.util
+import base64
 import io
 import os
 import pty
@@ -148,6 +149,93 @@ class TestPromptFraming(unittest.TestCase):
         self.assertEqual(sess._prompt_at_end(b">>> junk >>> "), b">>> junk ")
 
 
+class TestStdinKind(unittest.TestCase):
+    """What stdin *is* decides whether it is forwarded, not what the command is."""
+
+    def test_pipe_and_regular_file_and_devnull(self):
+        readfd, writefd = os.pipe()
+        try:
+            self.assertEqual(mssh.stdin_kind(readfd), "pipe")
+        finally:
+            os.close(readfd)
+            os.close(writefd)
+
+        with open(MSSH, "rb") as handle:
+            self.assertEqual(mssh.stdin_kind(handle.fileno()), "file")
+
+        fd = os.open(os.devnull, os.O_RDONLY)
+        try:
+            # /dev/null must not read as a pipe: it is indistinguishable from
+            # having no input, so forwarding it would set up a channel and a
+            # fifo to deliver nothing.
+            self.assertEqual(mssh.stdin_kind(fd), "null")
+        finally:
+            os.close(fd)
+
+    def test_a_tty_is_recognised(self):
+        primary, secondary = pty.openpty()
+        try:
+            self.assertEqual(mssh.stdin_kind(secondary), "tty")
+        finally:
+            os.close(primary)
+            os.close(secondary)
+
+    def test_closed_stdin_is_none(self):
+        readfd, writefd = os.pipe()
+        os.close(readfd)
+        os.close(writefd)
+        self.assertEqual(mssh.stdin_kind(readfd), "none")
+
+    def test_want_stdin_policy(self):
+        class Opts(object):
+            def __init__(self, **kw):
+                self.no_stdin = kw.get("no_stdin", False)
+                self.stdin = kw.get("stdin", False)
+
+        original = mssh.stdin_kind
+        try:
+            for kind, plain, forced in [("pipe", True, True),
+                                        ("file", True, True),
+                                        ("tty", False, True),
+                                        ("null", False, False),
+                                        ("none", False, False)]:
+                mssh.stdin_kind = lambda _fd=None, k=kind: k
+                self.assertEqual(mssh.want_stdin(Opts()), plain,
+                                 "%s, by default" % kind)
+                self.assertEqual(mssh.want_stdin(Opts(stdin=True)), forced,
+                                 "%s, with --stdin" % kind)
+                # -n always wins: it is the escape hatch for a stdin that
+                # belongs to something else, such as a script read from a pipe.
+                self.assertFalse(mssh.want_stdin(Opts(no_stdin=True)), kind)
+        finally:
+            mssh.stdin_kind = original
+
+
+class TestFrameBuilder(unittest.TestCase):
+    def test_without_stdin_the_command_reads_devnull(self):
+        frame = mssh.session_frame("echo hi")
+        self.assertIn("/dev/null", frame)
+        self.assertIn(base64.b64encode(b"echo hi").decode(), frame)
+
+    def test_with_stdin_the_command_reads_the_fifo(self):
+        frame = mssh.session_frame("cat", "/tmp/.mssh-in-abc")
+        self.assertIn('< "/tmp/.mssh-in-abc"', frame)
+        self.assertNotIn("/dev/null", frame)
+        # The command still travels base64-encoded, so nothing in it can be
+        # parsed as part of the framing.
+        self.assertIn(base64.b64encode(b"cat").decode(), frame)
+
+    def test_the_writer_program_creates_then_unlinks_the_fifo(self):
+        prog = mssh.SESSION_WRITER % {"path": "/tmp/.mssh-in-xyz"}
+        self.assertIn("mkfifo -m 600 /tmp/.mssh-in-xyz", prog)
+        # The readiness byte has to come before the blocking open, or the
+        # command could be framed against a path that does not exist yet.
+        self.assertLess(prog.index("echo R"), prog.index("exec 3>"))
+        # ...and the unlink after it, or the writer would remove the name
+        # before the reader could open it.
+        self.assertLess(prog.index("exec 3>"), prog.index("rm -f"))
+
+
 class TestShellFraming(unittest.TestCase):
     def _sess(self):
         sess = mssh._Session.__new__(mssh._Session)
@@ -273,13 +361,45 @@ class TestShellSessionLive(unittest.TestCase):
                 self.assertEqual(event[1], 0)
         self.assertEqual([a[1].strip() for a in arrivals],
                          [b"tick1", b"tick2", b"tick3"])
-        # Each tick must arrive near its own moment, not all at the end.  A
-        # line is held until the next one comes (the framing printf's newline
-        # is indistinguishable until then), so tick1 lands with tick2 at ~0.4s
-        # -- still streaming, since the command runs for 1.2s.
+        # Each tick must arrive near its own moment, not all at the end.
         self.assertLess(arrivals[0][0], 0.8,
                         "first line arrived at %.2fs" % arrivals[0][0])
         self.assertGreater(arrivals[2][0] - arrivals[0][0], 0.5)
+
+    def test_a_single_line_is_released_without_a_following_line(self):
+        """The reported bug: 'cat' fed one line showed nothing until EOF.
+
+        A line is held back so the framing printf's newline cannot be mistaken
+        for the command's own, but the hold has to end at an idle pause: an
+        interactive filter produces one line and then waits, so holding until
+        the *next* line meant holding until the input was closed.
+        """
+        started = time.time()
+        first = None
+        events = []
+        # 'read' then 'echo' produces exactly one line and keeps running, the
+        # same shape as a filter waiting for more input.
+        for event in self.sess.stream(
+                "echo only-line; sleep 3", 12.0):
+            if event[0] == "out":
+                if first is None:
+                    first = time.time() - started
+                events.append(event[1])
+            else:
+                self.assertEqual(event[1], 0)
+        self.assertIn(b"only-line", b"".join(events))
+        self.assertIsNotNone(first, "the line was never emitted")
+        # It must appear on the idle release, not 3s later when the sleep ends.
+        self.assertLess(first, 2.0,
+                        "one-line output waited %.2fs for a second line" % first)
+
+    def test_a_held_line_does_not_gain_a_newline(self):
+        # The reason the holdback exists: a command whose last line has no
+        # newline of its own must not be given one, even though the idle
+        # release now hands lines over early.
+        out, status, _ = drain(self.sess, "echo one; sleep 1; printf two", 15.0)
+        self.assertEqual(status, 0)
+        self.assertEqual(out, b"one\ntwo")
 
     def test_endless_command_streams_then_times_out(self):
         """The reported bug: a command that never ends showed nothing."""
