@@ -12,9 +12,11 @@ through every jump host, so no credentials or traffic are exposed to the
 intermediate boxes beyond the TCP forwarding itself.
 
 Endpoint format:
-    user[:password]@host[:port]
+    [user[:password]@]host[:port]
 
   * port defaults to 22 and may be omitted:      user@host
+  * the user defaults to the local one, so the
+    whole credential part may go too:            host
   * the password goes before the '@':            user:secret@host
   * the credential part splits on the LAST '@', and the password is the
     rest after the first ':', so ':' and '@' inside it are fine:
@@ -22,13 +24,18 @@ Endpoint format:
   * omit the password to use key auth / ssh-agent, or to be prompted.
   * IPv6 must be bracketed:                      user:pw@[::1]:22
 
-File copy (instead of logging in), scp-style: the remote side of the copy
-carries the endpoint, with ':' and the path appended.  The path may be
-absolute or relative to the remote home directory.  Permissions travel
-with the file the way scp sends them, so an executable arrives executable.
+File copy (instead of logging in), scp-style: the local side of the copy
+is a plain path and the remote side is an endpoint with the path appended,
+[user[:password]@]host[:port]:path, absolute or relative to the remote
+home.  Permissions travel with the file the way scp sends them, so an
+executable arrives executable.
     mssh -j jump@ip ./app.tar target@ip:/tmp/          # upload
     mssh -j jump@ip target@ip:/var/log/syslog ./       # download
     mssh -rp -j jump@ip ./dist target@ip:/srv/www/     # tree, exact attrs
+As under scp, an argument is remote when what precedes its first ':' could
+be a host name, so a local file named 'notes:2024.txt' must be written
+'./notes:2024.txt'.  'h:8900' is host and port and carries no path, and
+'h::8900' leaves the port empty; both are refused rather than guessed.
 
 Persistent session: a plain run connects, executes and tears everything
 down, so nothing survives to the next call.  --session NAME keeps a local
@@ -82,6 +89,16 @@ _START_TIME = time.time()
 DEFAULT_PORT = 22
 DEFAULT_TIMEOUT = 20
 
+# What may be a host name.  The user part of an endpoint is optional, so a
+# bare word is a whole endpoint and these are what keep a shell command from
+# parsing as one: no spaces, no '/', no shell metacharacters.  A trailing dot
+# (a fully qualified name) and '_' (common on LANs, though not strictly legal)
+# are both allowed, since resolvers accept them.
+HOST_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# Inside brackets: an IPv6 literal, optionally with a %zone suffix naming an
+# interface ('[fe80::1%eth0]'), which may be any interface name.
+HOST6_RE = re.compile(r"\A[0-9A-Fa-f:.]+(%[A-Za-z0-9._-]+)?\Z")
+
 # Standard key names, best algorithm first. Single source of truth for
 # both "which key would we use" and "do we have any key at all".
 # ed25519 leads: it is the modern default and, unlike RSA, still works
@@ -133,42 +150,82 @@ class Endpoint(object):
         )
 
 
+def local_user():
+    """The user to log in as when an endpoint does not name one.
+
+    getpass.getuser() honours $LOGNAME/$USER before the passwd database, which
+    is what ssh(1) effectively does too, and matters when mssh runs under
+    sudo or in a container whose uid has no passwd entry.
+    """
+    try:
+        return getpass.getuser()
+    except Exception:
+        # No environment and no passwd entry: nothing sensible to default to.
+        raise ValueError(
+            "cannot tell who you are, so the user cannot be defaulted; "
+            "write the endpoint as user@host"
+        )
+
+
+def valid_host(host, bracketed=False):
+    """True if ``host`` can be a host name at all.
+
+    With the user now optional, a bare word is a valid endpoint, so this is
+    what tells a hostname apart from a shell command: 'echo hi' and
+    'cd /var/log && ls' must not parse as hosts, or a mistyped session send
+    would try to connect to them.  Deliberately permissive about what a name
+    may contain and strict about what it may not -- spaces and shell
+    metacharacters.
+    """
+    if not host:
+        return False
+    if bracketed:
+        # An IPv6 literal, optionally with a %zone suffix.
+        return HOST6_RE.match(host) is not None
+    return HOST_RE.match(host) is not None
+
+
 def parse_endpoint(spec):
-    """Parse 'user[:password]@host[:port]' into an Endpoint.
+    """Parse '[user[:password]@]host[:port]' into an Endpoint.
 
     The credential part is split from the host part on the LAST '@', so a
     password may itself contain '@' and ':'.  The port, when given, must be
     numeric -- unlike the old trailing-password format there is no ambiguity
-    between a port and a password.
+    between a port and a password.  With no '@' at all the whole spec is the
+    host and the user is the local one, as with ssh(1).
     """
     if not spec:
         raise ValueError("empty endpoint")
 
-    if "@" not in spec:
-        raise ValueError(
-            "missing '@' in %r, expected user[:password]@host[:port]" % spec
-        )
+    if "@" in spec:
+        # Split on the LAST '@': the host part never contains '@', but a
+        # password may.
+        cred, _, hostpart = spec.rpartition("@")
 
-    # Split on the LAST '@': the host part never contains '@', but a
-    # password may.
-    cred, _, hostpart = spec.rpartition("@")
-
-    # Credentials: user[:password]; the password is the remainder, so ':'
-    # inside it is fine.
-    user, sep, password = cred.partition(":")
-    if not user:
-        raise ValueError("missing user in %r" % spec)
-    if not sep:
-        password = None
-    elif password == "":
-        # 'user:@host' -- an explicit but empty password means "ask me".
-        password = None
+        # Credentials: user[:password]; the password is the remainder, so ':'
+        # inside it is fine.
+        user, sep, password = cred.partition(":")
+        if not user:
+            # '@host' is a typo, not a request for the default: a user who
+            # wants the default writes no '@' at all.
+            raise ValueError(
+                "missing user before '@' in %r; drop the '@' to log in as "
+                "%s" % (spec, local_user())
+            )
+        if not sep:
+            password = None
+        elif password == "":
+            # 'user:@host' -- an explicit but empty password means "ask me".
+            password = None
+    else:
+        user, password, hostpart = local_user(), None, spec
 
     if not hostpart:
         raise ValueError("missing host in %r" % spec)
 
     # Host: bare, or a bracketed IPv6 literal, each with an optional :port.
-    if hostpart.startswith("["):
+    bracketed = hostpart.startswith("[")
+    if bracketed:
         end = hostpart.find("]")
         if end < 0:
             raise ValueError("unterminated '[' in %r" % spec)
@@ -184,8 +241,8 @@ def parse_endpoint(spec):
         if hostpart.count(":") > 1:
             # Most likely the old user@host:port:password layout.
             raise ValueError(
-                "too many ':' in host part of %r; the format is now "
-                "user[:password]@host[:port] -- move the password before "
+                "too many ':' in host part of %r; the format is "
+                "[user[:password]@]host[:port] -- move the password before "
                 "the '@' (bracket IPv6 as user@[::1]:port)" % spec
             )
         host, sep, rest = hostpart.partition(":")
@@ -193,13 +250,18 @@ def parse_endpoint(spec):
 
     if not host:
         raise ValueError("missing host in %r" % spec)
+    if not valid_host(host, bracketed):
+        raise ValueError(
+            "%r is not a host name; the format is "
+            "[user[:password]@]host[:port]" % host
+        )
 
     port = DEFAULT_PORT
     if portstr is not None:
         if not portstr.isdigit():
             raise ValueError(
-                "port must be numeric in %r, got %r; the format is now "
-                "user[:password]@host[:port] -- if that was a password, "
+                "port must be numeric in %r, got %r; the format is "
+                "[user[:password]@]host[:port] -- if that was a password, "
                 "move it before the '@'" % (spec, portstr)
             )
         port = int(portstr)
@@ -985,33 +1047,47 @@ def split_copy_arg(arg):
     """Split a copy argument into (endpoint_or_None, path).
 
     A remote file is written the way a login target is, with ':' and the
-    path appended:  user[:password]@host[:port]:path.  The path may be
+    path appended:  [user[:password]@]host[:port]:path.  The path may be
     absolute or relative to the remote home directory, and a trailing ':'
     with nothing after it means that home directory, as in scp.
 
         root@10.0.0.9:/var/log/syslog      absolute
+        10.0.0.9:/var/log/syslog           as the local user
         root@10.0.0.9:logs/today.log       relative to ~
         root@10.0.0.9:36001:/var/log/x     with a port
         root@10.0.0.9:                     the home directory itself
 
-    A local path is told apart by its lack of a credential part: everything
-    before the last '@' must be non-empty and hold no '/', so
-    './mail@archive/x' stays local.  Two things cannot be written here: a
-    password containing '/', and a relative remote path that is all digits
-    (it would read as a port -- write './2222' instead).
-    """
-    if "@" not in arg:
-        return None, arg
+    A local path is told apart the way scp tells one: what sits before the
+    first ':' has to be able to be a host name.  So './x' and '/tmp/a:b' and
+    './mail@archive/x' stay local -- '/' cannot appear in a host name -- while
+    'notes:2024.txt' does not: with the user optional that reads as host
+    'notes', exactly as it does under scp, and a local file of that name has
+    to be written './notes:2024.txt'.  Any other file name a host name cannot
+    spell is local too, so an odd name is a path rather than a usage error.
 
-    cred, _, hostpart = arg.rpartition("@")
-    if not cred or "/" in cred:
-        # No user name, or a '/' before the '@': a local path that happens
-        # to contain '@', like ./mail@archive/x.
-        return None, arg
+    Three things cannot be written here at all, and each raises ValueError
+    naming the way round it.  A password containing '/', because a host name
+    has no '/' and that is what tells a local path from a credential.  A
+    remote path that is all digits: 'h:8900' is host h on port 8900, as it is
+    everywhere else in mssh, so as a copy argument it carries no path -- write
+    'h:8900:8900' for that file, or './h:8900' for a local one.  And an empty
+    port field, 'h::8900', which is either a port left out or a path beginning
+    with ':' and says nothing about which -- write 'h:./:8900' for the path.
+    """
+    cred, sep, hostpart = arg.rpartition("@")
+    if sep:
+        if not cred or "/" in cred:
+            # No user name, or a '/' before the '@': a local path that happens
+            # to contain '@', like ./mail@archive/x.
+            return None, arg
+    # With no '@' at all, rpartition has already left the whole argument in
+    # hostpart and cred empty, which is what we want: host[:port]:path with
+    # the user defaulted.
 
     # Skip a bracketed IPv6 literal, whose own ':'s are not separators.
     start = 0
-    if hostpart.startswith("["):
+    bracketed = hostpart.startswith("[")
+    if bracketed:
         end = hostpart.find("]")
         if end < 0:
             raise ValueError("unterminated '[' in %r" % arg)
@@ -1019,24 +1095,74 @@ def split_copy_arg(arg):
 
     colon = hostpart.find(":", start)
     if colon < 0:
-        return None, arg              # no path at all: a plain login target
+        # No ':' anywhere: a local path ('./x', 'x'), or a login target with
+        # no path appended ('root@h').  Either way there is no remote path
+        # here, and the caller reads arg as a plain path.
+        return None, arg
 
     host, rest = hostpart[:colon], hostpart[colon + 1:]
-    head, sep, tail = rest.partition(":")
+
+    # Settle whether this is a remote argument at all before reading the rest
+    # of it.  A host part that cannot be a host name means the ':' belonged to
+    # a local file name ('./x:y', '/tmp/a:b', ':leading'), which goes back as
+    # a plain path -- an odd file name is not a usage error.  Deciding it here
+    # keeps the complaints below for arguments that really do name a host.
+    if bracketed:
+        named_host = colon == end + 1 and valid_host(host[1:end], True)
+    else:
+        named_host = valid_host(host)
+    if not named_host:
+        return None, arg
+
+    head, tail_sep, tail = rest.partition(":")
+
+    if tail_sep and not head:
+        # 'h::8900'.  The field a port would go in is empty, and that is not
+        # a spelling mssh can read: it is either the port left out by mistake
+        # or a path that really begins with ':', and the argument says nothing
+        # about which.  Both are writable, just not like this.
+        raise ValueError(
+            "%r leaves the field before the second ':' empty, where the port "
+            "goes; that is either a missing port or a path starting with "
+            "':', and nothing here says which -- write %r for the path, or "
+            "fill the port in (%s:PORT:%s)"
+            % (arg, "%s:./%s" % (host, rest), host, tail)
+        )
 
     if head.isdigit():
         # A numeric field is the port.  What follows it, if anything, is the
         # path; on its own it is just a login target with no path.
-        if not sep:
-            return None, arg
+        if not tail_sep:
+            # '10.0.0.9:8900' is host and port, the way it is everywhere else
+            # in mssh -- not the remote file named '8900', and not a local
+            # file with a ':' in its name.  So it is a usable endpoint but
+            # carries no path, which as a copy argument is incomplete: say so
+            # instead of silently picking one of the three readings.  A lone
+            # argument never reaches this message; main() catches it and logs
+            # in to that port.
+            raise ValueError(
+                "%r names host %s on port %s, with no path to copy; append "
+                "':' and a path (%r), or './%s' for a local file of that "
+                "name" % (arg, host, head, arg + ":/tmp/", arg)
+            )
         host = "%s:%s" % (host, head)
         path = tail or "."
     else:
         # Everything after the first ':' is the path, colons included, so a
-        # name like /tmp/a:b survives.
+        # remote name like 'h:/tmp/a:b' survives whole.  (A *local* '/tmp/a:b'
+        # never reaches here -- '/tmp/a' is not a host name, so the check
+        # above sent it back as a path.)
         path = rest or "."
 
-    return parse_endpoint(cred + "@" + host), path
+    spec = cred + "@" + host if sep else host
+    try:
+        return parse_endpoint(spec), path
+    except ValueError:
+        # The host name passed, so what is left to reject is the credential
+        # part -- ':pw@h:/tmp' has no user before the ':'.  Read it as a local
+        # path with a ':' in it; plan_copy then reports "no remote path",
+        # which names the fix.
+        return None, arg
 
 
 def plan_copy(args):
@@ -1066,7 +1192,7 @@ def plan_copy(args):
     if not remote:
         raise ValueError(
             "no remote path among %s; write the remote side as "
-            "user@host:/path" % ", ".join(args)
+            "[user@]host:/path" % ", ".join(args)
         )
 
     # One target per copy: every remote argument has to name the same host,
@@ -2921,22 +3047,6 @@ def _await_session(name, readfd, pid, opts):
 # -- client ----------------------------------------------------------------
 
 
-def _looks_like_target(args):
-    """True if the positionals read as a login endpoint, not as a command.
-
-    Only used to tell a mistyped second start apart from a command, so that
-    'mssh --session s root@host' against a live session says "already
-    running" instead of silently running 'root@host' in the shell.
-    """
-    if len(args) != 1:
-        return False
-    try:
-        parse_endpoint(args[0])
-    except ValueError:
-        return False
-    return not re.search(r"[\s;|&<>$`]", args[0])
-
-
 def _no_session(name):
     raise SystemExit(
         "mssh: no session %r; start one with:\n"
@@ -3172,9 +3282,12 @@ def run_session(parser, opts):
 
     # A live session takes commands; only a dead one can be started.  That
     # split is by existence, not by guessing whether the argument looks more
-    # like a command or a host.
+    # like a command or a host: against a live session every positional is a
+    # command, so 'mssh --session s root@host' runs that word in the shell
+    # and says "command not found" rather than being second-guessed here.
+    # Only the start-only flags are still refused.
     if session_alive(name):
-        if opts.jump or opts.command or _looks_like_target(opts.args):
+        if opts.jump or opts.command:
             raise SystemExit(
                 "mssh: session %r is already running; --status to inspect "
                 "it, --stop to end it" % name
@@ -3239,26 +3352,35 @@ def verbose(opts, message):
 
 EPILOG = """\
 endpoint format:
-  user[:password]@host[:port]
-  port defaults to 22 and must be numeric; the password goes before the '@'
+  [user[:password]@]host[:port]
+  port defaults to 22 and must be numeric; the user defaults to the local
+  one, so 'mssh 10.0.0.9' logs in as you; the password goes before the '@'
   and may contain ':' and '@'.  Bracket IPv6 hosts: user:pw@[::1]:22
 
 examples:
+  mssh 192.168.1.10                                # as the local user
   mssh -j ops:jumppw@10.0.0.1:22 root:rootpw@192.168.1.10:22
   mssh -j a:pw1@1.1.1.1:2222 -j b:pw2@10.0.0.5 app:pw3@172.16.0.9:22
   mssh -j ops@10.0.0.1 root@192.168.1.10 -i ~/.ssh/id_ed25519
   mssh -j ops:pw@10.0.0.1 root@192.168.1.10 -i ~/.ssh/id_rsa
   mssh -j ops:pw@10.0.0.1 root:pw@192.168.1.10 -c 'uptime; df -h'
 
-file copy (SOURCE... DEST; the remote side carries the endpoint):
+file copy (SOURCE... DEST; remote side [user[:password]@]host[:port]:path):
   mssh -j ops@10.0.0.1 ./app.tar root@10.0.0.9:/tmp/       # upload
   mssh -j ops@10.0.0.1 root@10.0.0.9:/var/log/syslog ./    # download
+  mssh ./app.tar 10.0.0.9:/tmp/           # user defaults here too
   mssh ./a ./b root@10.0.0.9:/opt/pkg/    # several, DEST must be a dir
   mssh -r ./dist root@10.0.0.9:/srv/www/  # -r recurses into directories
   mssh -rp root@10.0.0.9:/etc/nginx ./    # -p also keeps the mtime
   mssh ./x root@10.0.0.9:                 # bare ':' is the remote $HOME
   mssh ./x root@10.0.0.9:36001:/tmp/      # with a port
   The path after ':' may be absolute or relative to the remote home.
+  An argument is remote when what precedes its first ':' could be a host
+  name, as under scp, so a local file named 'notes:2024.txt' has to be
+  written './notes:2024.txt'.  Two spellings are refused rather than
+  guessed: 'h:8900' is host and port with no path (write 'h:8900:8900',
+  or './h:8900' for a local file), and 'h::8900' leaves the port field
+  empty (write 'h:./:8900' for that path, or fill the port in).
   Runs over sftp on the target; add -C to compress large transfers.
   A copied file keeps its permissions, as under scp: an executable stays
   executable, filtered by your umask.  A file that already exists keeps its
@@ -3272,6 +3394,8 @@ persistent session (keep one connection and one shell alive):
   mssh --session s 'X=1'; mssh --session s 'echo $X'   # state persists
   Each call is a separate process, but the working directory, variables
   and background jobs live on in the session, which a plain -c cannot do.
+  Once a session is live every positional is a command, so a repeated
+  start runs the endpoint as one; --status says whether one is live.
 
   stdin is forwarded when it is a pipe or a file, as it would be to ssh:
   echo hello | mssh --session s cat                # prints hello
@@ -3351,13 +3475,14 @@ def build_parser():
     )
     parser.add_argument(
         "-j", "--jump", action="append", default=[], metavar="SPEC",
-        help="jump host as user[:password]@host[:port]; repeat for each hop, in order",
+        help="jump host as [user[:password]@]host[:port]; repeat for each hop, in order",
     )
     parser.add_argument(
         "args", metavar="TARGET|PATH", nargs="*",
-        help="either one login target, user[:password]@host[:port], or copy "
-             "arguments SOURCE... DEST in which the remote side carries that "
-             "same endpoint with ':' and a path appended: "
+        help="either one login target, [user[:password]@]host[:port] with the "
+             "user defaulting to the local one, or copy arguments SOURCE... "
+             "DEST in which the remote side carries that same endpoint with "
+             "':' and a path appended: "
              "'./app.tar root@10.0.0.9:/tmp/' uploads, "
              "'root@10.0.0.9:/var/log/syslog ./' downloads",
     )
@@ -3515,7 +3640,7 @@ def main(argv=None):
         return 2
 
     if not opts.args:
-        parser.error("no target given; pass user[:password]@host[:port] "
+        parser.error("no target given; pass [user[:password]@]host[:port] "
                      "(mssh --help for the full syntax)")
         return 2
 

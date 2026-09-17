@@ -52,10 +52,12 @@ paramiko install is not the one `python3` resolves to, run it explicitly
 Every host, jump or target, is written the same way:
 
 ```
-user[:password]@host[:port]
+[user[:password]@]host[:port]
 ```
 
 - Port defaults to 22: `user@host`
+- The user defaults to the local one, so the credential part may go too:
+  `10.0.0.9`, exactly as `ssh` would take it
 - The password goes **before** the `@`: `user:secret@host`
 - The credential part splits on the **last** `@`, and the password is
   everything after the first `:`, so both characters are fine inside it:
@@ -69,14 +71,14 @@ user[:password]@host[:port]
 ## Logging in
 
 ```bash
+# no jump at all: a direct login as the local user
+mssh 10.0.0.9
+
 # one jump host
 mssh -j ops@10.0.0.1 root@192.168.1.10
 
 # several, applied in the order given
 mssh -j a@1.1.1.1:2222 -j b@10.0.0.5 app@172.16.0.9
-
-# no jump at all: a direct login
-mssh root@10.0.0.9
 
 # run a command instead of opening a shell
 mssh -j ops@10.0.0.1 root@10.0.0.9 -c 'uptime; df -h'
@@ -88,18 +90,42 @@ force a pty for something that insists on one.
 
 ## Copying files
 
-The same argument shape as `scp`: `SOURCE... DEST`, where the remote side
-carries the endpoint with `:` and a path appended.
+The same argument shape as `scp`: `SOURCE... DEST`, where the local side is a
+plain path and the remote side is an endpoint with `:` and a path appended:
+
+```
+[user[:password]@]host[:port]:path
+```
+
+`path` may be absolute or relative to the remote `$HOME`, and a bare `:` with
+nothing after it means that home directory.
 
 ```bash
 mssh -j ops@10.0.0.1 ./app.tar root@10.0.0.9:/tmp/        # upload
 mssh -j ops@10.0.0.1 root@10.0.0.9:/var/log/syslog ./     # download
+mssh ./app.tar 10.0.0.9:/tmp/            # the user defaults here too
 mssh ./a ./b root@10.0.0.9:/opt/pkg/     # several sources; DEST must be a dir
 mssh -r ./dist root@10.0.0.9:/srv/www/   # -r recurses into directories
 mssh -rp root@10.0.0.9:/etc/nginx ./     # -p also keeps the exact mode + mtime
 mssh ./x root@10.0.0.9:                  # bare ':' means the remote $HOME
 mssh ./x root@10.0.0.9:36001:/tmp/       # with a port
 ```
+
+An argument is remote when whatever sits before its first `:` can be a host
+name — scp's rule, and what makes `10.0.0.9:/tmp/` work without a user. Since
+no host name holds a `/`, `./x` and `/tmp/a:b` stay local; but a *local* file
+whose name holds a colon needs a `./` in front, or `notes:2024.txt` reads as
+host `notes`.
+
+Two spellings are ambiguous enough that `mssh` refuses them instead of
+guessing, each naming the way round it:
+
+- `10.0.0.9:8900` — host and port, as everywhere else in `mssh`, so it carries
+  no path to copy. Write `10.0.0.9:8900:8900` for that remote file, or
+  `./10.0.0.9:8900` for a local one.
+- `10.0.0.9::8900` — the port field is empty, so this is either a port left out
+  or a path starting with `:`. Write `10.0.0.9:./:8900` for the path, or fill
+  the port in.
 
 Transfers run over SFTP on the target and show progress on a tty. `-C`
 compresses, which is worth it on a slow link and not otherwise.
@@ -137,6 +163,10 @@ Separate processes, one shell: the working directory, the environment and any
 background jobs live on between calls. Output streams as it is produced, so a
 long-running command (a build, a poller, a `tail`) prints as it goes rather
 than arriving all at once at the end.
+
+Once a session is live, every positional is a command — nothing is guessed — so
+a repeated start runs the endpoint as one and the shell reports it. `--status`
+says whether a session is live, and `-j` or `-c` on a live one is refused.
 
 Piping into a session works the way it does with `ssh`:
 
@@ -297,8 +327,8 @@ order.
 ## Tests
 
 ```bash
-python3 tests/test_session_unit.py     # framing, names, flags        (42)
-python3 tests/test_session_daemon.py   # daemon, protocol, client     (51)
+python3 tests/test_session_unit.py     # framing, endpoints, flags     (56)
+python3 tests/test_session_daemon.py   # daemon, protocol, client      (53)
 python3 tests/test_copy_mode.py        # copy permissions vs real scp (51)
 ```
 

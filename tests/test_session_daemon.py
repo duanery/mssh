@@ -8,6 +8,7 @@ that the socket is as private as it claims to be.
 """
 
 import importlib.util
+import getpass
 import glob
 import json
 import os
@@ -149,13 +150,33 @@ class TestLifecycle(SessionTest):
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, b"slow\n")
 
-    def test_second_start_is_refused(self):
+    def test_a_repeated_start_runs_as_a_command(self):
+        # A live session takes every positional as a command, with no
+        # guessing: 'root@10.0.0.1' is not a program, so the shell says so
+        # and the session is left alone.
         self.start()
-        proc = run("--session", self.name, "root@10.0.0.1")
+        proc = self.send("root@10.0.0.1")
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn(b"already running", proc.stderr)
+        self.assertIn(b"not found", proc.stdout + proc.stderr)
+        self.assertEqual(self.send("echo alive").stdout, b"alive\n")
+
+    def test_a_second_start_with_start_only_flags_is_refused(self):
+        self.start()
+        for extra in (["-j", "ops@10.0.0.2", "root@10.0.0.1"],
+                      ["-c", "gdb -q", "root@10.0.0.1"]):
+            proc = run("--session", self.name, *extra)
+            self.assertNotEqual(proc.returncode, 0, extra)
+            self.assertIn(b"already running", proc.stderr, extra)
         # and the first session still works
         self.assertEqual(self.send("echo alive").stdout, b"alive\n")
+
+    def test_a_start_without_a_user_logs_in_as_the_local_one(self):
+        proc = run("--session", self.name, "10.0.0.1")
+        self.assertEqual(proc.returncode, 0,
+                         "start failed: %s%s" % (proc.stdout, proc.stderr))
+        out = run("--session", self.name, "--status").stdout.decode()
+        self.assertIn("target:   %s@10.0.0.1:22" % getpass.getuser(), out)
+        self.assertEqual(self.send("echo up").stdout, b"up\n")
 
     def test_stale_socket_is_cleared(self):
         self.start()
@@ -665,9 +686,15 @@ class TestSpawnRace(SessionTest):
                    for proc in procs]
         winners = [r for r in results if r[2] == 0]
         self.assertEqual(len(winners), 1, results)
-        for _out, err, code in results:
+        # A loser takes one of two paths, decided by where in the winner's
+        # startup it looked: it either lost the spawn lock, or found the
+        # session already live and sent the endpoint as a command, which the
+        # shell then reports.  Both leave the winner's session intact.
+        for out, err, code in results:
             if code != 0:
-                self.assertIn(b"already running", err)
+                self.assertTrue(b"already running" in err
+                                or b"not found" in out + err,
+                                (out, err, code))
         # and the one that won is a working session
         self.assertEqual(self.send("echo survived").stdout, b"survived\n")
 

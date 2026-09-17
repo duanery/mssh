@@ -7,6 +7,7 @@ running the same programs a session would hold on the target.
 
 import importlib.util
 import base64
+import getpass
 import io
 import os
 import pty
@@ -118,6 +119,142 @@ class TestNames(unittest.TestCase):
         st = os.lstat(mssh.session_dir())
         self.assertEqual(st.st_mode & 0o777, 0o700)
         self.assertEqual(st.st_uid, os.getuid())
+
+
+class TestEndpointParsing(unittest.TestCase):
+    """The user part is optional, so a bare word is a whole endpoint."""
+
+    def test_the_user_may_be_omitted(self):
+        me = getpass.getuser()
+        for spec, host, port in [("h", "h", 22),
+                                 ("10.0.0.9", "10.0.0.9", 22),
+                                 ("h:2222", "h", 2222),
+                                 ("host.example.com.", "host.example.com.", 22),
+                                 ("my_host", "my_host", 22),
+                                 ("[::1]", "::1", 22),
+                                 ("[::1]:22", "::1", 22),
+                                 ("[fe80::1%eth0]:22", "fe80::1%eth0", 22)]:
+            ep = mssh.parse_endpoint(spec)
+            self.assertEqual((ep.user, ep.host, ep.port), (me, host, port),
+                             spec)
+            self.assertIsNone(ep.password, spec)
+
+    def test_an_explicit_user_still_wins(self):
+        for spec, want in [("user@h", ("user", "h", 22, None)),
+                           ("user:pw@h", ("user", "h", 22, "pw")),
+                           ("user:p:a@ss@h:22", ("user", "h", 22, "p:a@ss")),
+                           # 'user:@h' asks to be prompted, not for an empty
+                           # password.
+                           ("user:@h", ("user", "h", 22, None))]:
+            ep = mssh.parse_endpoint(spec)
+            self.assertEqual((ep.user, ep.host, ep.port, ep.password), want,
+                             spec)
+
+    def test_the_default_follows_the_environment(self):
+        # getpass.getuser() reads $LOGNAME first, so a sudo-style environment
+        # picks the invoking user rather than the uid's passwd entry.
+        old = os.environ.get("LOGNAME")
+        os.environ["LOGNAME"] = "someoneelse"
+        try:
+            self.assertEqual(mssh.parse_endpoint("h").user, "someoneelse")
+        finally:
+            if old is None:
+                del os.environ["LOGNAME"]
+            else:
+                os.environ["LOGNAME"] = old
+
+    def test_a_command_is_not_a_host(self):
+        # This is what keeps a mistyped session send from being dialled: with
+        # the user optional, nothing else tells these from a hostname.
+        bad = ["", "@h", "a b", "echo hi", "cd /var/log && ls", "./x", "-foo",
+               "a;b", "h:22:pw", "h:notaport", "h:", "[::1", "x@[::1]junk",
+               "h:99999", "wc -l"]
+        for spec in bad:
+            with self.assertRaises(ValueError, msg=repr(spec)):
+                mssh.parse_endpoint(spec)
+
+    def test_an_empty_user_is_a_typo_not_a_default(self):
+        with self.assertRaises(ValueError) as caught:
+            mssh.parse_endpoint("@h")
+        self.assertIn("drop the '@'", str(caught.exception))
+
+
+class TestCopyArgSplitting(unittest.TestCase):
+    """Which copy arguments are remote, now that the user may be absent."""
+
+    def test_local_paths_stay_local(self):
+        # Remote means the part before the first ':' could be a host name.
+        # No host name holds a '/', and ':leading' names none at all.
+        for arg in ["./x", "/tmp/a:b", "./mail@archive/x", "x", ":leading",
+                    "./notes:2024.txt", "root@h", "10.0.0.9", "./x:y",
+                    "[::1]junk:/tmp", ":pw@h:/tmp"]:
+            self.assertEqual(mssh.split_copy_arg(arg), (None, arg), arg)
+
+    def test_a_bare_port_is_a_port_not_a_path(self):
+        # 'h:2222' is host and port, as it is everywhere else in mssh, so as
+        # a copy argument it names no file at all -- which is a usage error
+        # rather than a silent guess between the three possible readings.
+        for arg in ["h:22", "root@h:2222", "10.0.0.9:8900"]:
+            with self.assertRaises(ValueError, msg=arg) as caught:
+                mssh.split_copy_arg(arg)
+            self.assertIn("no path to copy", str(caught.exception), arg)
+
+    def test_an_empty_port_field_is_refused(self):
+        # 'h::8900' is either a port left out or a path starting with ':',
+        # and the argument says nothing about which, so neither is assumed.
+        for arg in ["10.0.0.9::8900", "10.0.0.9::", "h::/tmp/x",
+                    "[::1]::8900"]:
+            with self.assertRaises(ValueError, msg=arg) as caught:
+                mssh.split_copy_arg(arg)
+            self.assertIn("empty", str(caught.exception), arg)
+
+    def test_the_port_reading_can_be_escaped_either_way(self):
+        # Both escapes named by the error message have to work.
+        ep, path = mssh.split_copy_arg("10.0.0.9:8900:8900")
+        self.assertEqual((ep.host, ep.port, path), ("10.0.0.9", 8900, "8900"))
+        self.assertEqual(mssh.split_copy_arg("./10.0.0.9:8900"),
+                         (None, "./10.0.0.9:8900"))
+        # And the one out of the empty-port message: './' keeps the ':'.
+        ep, path = mssh.split_copy_arg("h:./:8900")
+        self.assertEqual((ep.host, path), ("h", "./:8900"))
+
+    def test_remote_paths_without_a_user(self):
+        me = getpass.getuser()
+        for arg, host, port, path in [
+                ("10.0.0.9:/tmp/x", "10.0.0.9", 22, "/tmp/x"),
+                ("10.0.0.9:", "10.0.0.9", 22, "."),
+                ("10.0.0.9:36001:/tmp/", "10.0.0.9", 36001, "/tmp/"),
+                ("[::1]:/tmp", "::1", 22, "/tmp"),
+                # scp reads this as a host too, which is why a local file of
+                # that name has to be written './notes:2024.txt'.
+                ("notes:2024.txt", "notes", 22, "2024.txt")]:
+            ep, got = mssh.split_copy_arg(arg)
+            self.assertIsNotNone(ep, arg)
+            self.assertEqual((ep.user, ep.host, ep.port, got),
+                             (me, host, port, path), arg)
+
+    def test_an_explicit_user_still_parses(self):
+        for arg, want in [("root@10.0.0.9:/var/log/syslog",
+                           ("root", "10.0.0.9", 22, "/var/log/syslog")),
+                          ("root@10.0.0.9:logs/today.log",
+                           ("root", "10.0.0.9", 22, "logs/today.log")),
+                          ("user@[::1]:22:/tmp", ("user", "::1", 22, "/tmp"))]:
+            ep, path = mssh.split_copy_arg(arg)
+            self.assertIsNotNone(ep, arg)
+            self.assertEqual((ep.user, ep.host, ep.port, path), want, arg)
+
+    def test_plan_copy_accepts_a_userless_endpoint(self):
+        direction, srcs, dest, ep = mssh.plan_copy(["./x", "10.0.0.9:/tmp/"])
+        self.assertEqual((direction, srcs, dest), ("up", ["./x"], "/tmp/"))
+        self.assertEqual((ep.user, ep.host), (getpass.getuser(), "10.0.0.9"))
+        direction, srcs, dest, _ = mssh.plan_copy(["10.0.0.9:/var/log/x", "./"])
+        self.assertEqual((direction, srcs, dest), ("down", ["/var/log/x"], "./"))
+
+    def test_all_local_is_still_rejected(self):
+        for args in [["./a", "./b"], ["./a", "./notes:2024.txt"]]:
+            with self.assertRaises(ValueError) as caught:
+                mssh.plan_copy(args)
+            self.assertIn("no remote path", str(caught.exception))
 
 
 class TestPromptFraming(unittest.TestCase):
@@ -598,11 +735,22 @@ class TestFlagRejection(unittest.TestCase):
         self.assertIn("no session", err)
         self.assertIn("mssh --session u-absent", err)
 
+    def test_a_dead_session_tells_a_command_from_a_host(self):
+        # With the user optional, only the host check keeps a quoted command
+        # from being read as a hostname and dialled.
+        for arg in ["echo hi", "cd /var/log && ls", "wc -l"]:
+            code, err = self.run_main(["--session", "u-absent", arg])
+            self.assertEqual(code, 1, "%r: %s" % (arg, err))
+            self.assertIn("no session", err)
+
     def test_regressions_still_parse(self):
         # A plain login target and a copy must still reach the connect stage,
-        # i.e. fail with something other than a usage error.
+        # i.e. fail with something other than a usage error.  The userless
+        # spellings take the same path.
         for argv in [["root@10.255.255.1", "-c", "true", "-o", "0.3"],
-                     ["./x", "root@10.255.255.1:/tmp/", "-o", "0.3"]]:
+                     ["10.255.255.1", "-c", "true", "-o", "0.3"],
+                     ["./x", "root@10.255.255.1:/tmp/", "-o", "0.3"],
+                     ["./x", "10.255.255.1:/tmp/", "-o", "0.3"]]:
             code, err = self.run_main(argv)
             self.assertNotEqual(code, 2, "%r: %s" % (argv, err))
 
