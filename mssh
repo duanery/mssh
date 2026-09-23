@@ -57,6 +57,7 @@ instead of a shell, and --prompt REGEX marks where one of its replies ends.
 from __future__ import print_function
 
 import argparse
+import array
 import base64
 import datetime
 import getpass
@@ -2423,24 +2424,33 @@ def _connect_session(name, timeout):
 def session_stream(name, payload, timeout=None, send_stdin=False):
     """Send one request and yield each JSON message of the reply in turn.
 
-    With send_stdin, local stdin is copied to the daemon in a thread for as long
-    as the command runs, and the half-close that ends it is what the remote
-    command sees as EOF.  A thread rather than a select loop over both fds: this
-    generator's consumer decides when to read the next reply, so the two
-    directions cannot share one loop without stalling whichever the consumer is
-    not draining.
+    The socket carries JSON only, in both directions.  With send_stdin the
+    request itself carries the local stdin descriptor (SCM_RIGHTS over the
+    same socket) and the daemon pumps the producer's bytes straight into the
+    remote command; relaying them through this process would take a second
+    thread and a half-close protocol on a connection that also carries
+    replies.  Without send_stdin the write side is half-closed right after
+    the request, which says the same thing: nothing else is coming.
     """
     conn = _connect_session(name, timeout)
     buf = b""
     seen = False
-    feeder = None
     try:
-        conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+        line = json.dumps(payload).encode("utf-8") + b"\n"
         if send_stdin:
-            feeder = threading.Thread(target=_feed_stdin, args=(conn,))
-            feeder.daemon = True
-            feeder.start()
+            fd = stdin_fd()
+            if fd is None:
+                raise SystemExit("mssh: session %s: stdin was requested but "
+                                 "there is none to pass" % name)
+            sent = conn.sendmsg([line],
+                                [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                  array.array("i", [fd]).tobytes())])
+            if sent < len(line):
+                # A request longer than the socket buffer went out in part;
+                # the descriptor rode on its first byte, the rest is plain.
+                conn.sendall(line[sent:])
         else:
+            conn.sendall(line)
             conn.shutdown(socket.SHUT_WR)
         while True:
             try:
@@ -2449,9 +2459,10 @@ def session_stream(name, payload, timeout=None, send_stdin=False):
                 raise SystemExit("mssh: session %s: the session daemon "
                                  "stopped responding" % name)
             except ConnectionResetError:
-                # The daemon replied and closed while the feeder was still
-                # writing, so our unsent data came back as a reset.  Whatever
-                # it said is already in buf; a reset is not an error of its own.
+                # The daemon closed the moment its last reply was out.  The
+                # request was fully read long before, so nothing of ours was
+                # lost: whatever it said is already in buf, and a reset is
+                # not an error of its own.
                 break
             if not data:
                 break
@@ -2468,36 +2479,10 @@ def session_stream(name, payload, timeout=None, send_stdin=False):
                                      "the session daemon" % name)
     finally:
         conn.close()
-        if feeder is not None:
-            # The socket is closed, so a feeder blocked in recv or send comes
-            # back at once; it is a daemon thread either way.
-            feeder.join(timeout=1.0)
 
     if not seen:
         raise SystemExit("mssh: session %s: the session daemon closed the "
                          "connection without replying" % name)
-
-
-def _feed_stdin(conn):
-    """Copy local stdin to the daemon, then half-close to signal EOF."""
-    fd = stdin_fd()
-    try:
-        while fd is not None:
-            try:
-                data = os.read(fd, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            try:
-                conn.sendall(data)
-            except (socket.error, OSError):
-                return                # daemon gone or command over; stop quietly
-    finally:
-        try:
-            conn.shutdown(socket.SHUT_WR)
-        except (socket.error, OSError):
-            pass
 
 
 def session_request(name, payload, timeout=None):
@@ -2634,33 +2619,45 @@ def _session_detach(name, opts):
         os.close(null)
 
 
-def _pump_stdin(conn, chan, rest, session):
-    """Copy the client's stdin off the socket into the writer channel.
+def _pump_stdin(fd, conn, chan, session):
+    """Copy the client's stdin descriptor into the writer channel.
 
+    The descriptor arrived over the request socket (SCM_RIGHTS), so this reads
+    the producer's bytes directly and the socket stays a pure JSON channel.
     Runs in its own thread for the length of the command: the data arrives as
-    the client produces it, and a filter ('mssh --session s cat' fed by a slow
+    the producer makes it, and a filter ('mssh --session s cat' fed by a slow
     producer) must see each piece as it comes rather than at the end.
 
-    A half-close from the client is the end of input, and it is turned into a
+    Two descriptors are polled.  The request socket is watched because the one
+    held here is a dup that stays readable after the client dies -- without
+    that watch, a killed client would leave the command waiting for input that
+    will never come.  The poll times out once a second so the channel can be
+    checked: a command that ended while input kept coming must stop being fed.
+
+    End of input -- real EOF, or the client going away -- is turned into a
     channel EOF so the remote command's read() returns 0.  Every error is
     swallowed: the command still frames on its own marker, and a broken writer
     must not take the daemon down.
     """
+    conn_fd = conn.fileno()
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    poller.register(conn_fd, select.POLLIN)
     try:
-        if rest:
-            chan.sendall(rest)
-        conn.settimeout(1.0)
         while True:
-            try:
-                data = conn.recv(65536)
-            except socket.timeout:
+            events = poller.poll(1000)
+            if not events:
                 if chan.closed or chan.exit_status_ready():
                     break             # the command ended; nobody is reading
                 continue
-            except (socket.error, OSError):
+            if any(src == conn_fd for src, _event in events):
+                break                 # the client hung up: end of input
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
                 break
             if not data:
-                break                 # the client half-closed: end of input
+                break                 # the producer is done: end of input
             try:
                 chan.sendall(data)
             except Exception:
@@ -2669,6 +2666,10 @@ def _pump_stdin(conn, chan, rest, session):
     except Exception:
         pass
     finally:
+        try:
+            os.close(fd)              # our dup; the client's own copy lives on
+        except OSError:
+            pass
         try:
             chan.shutdown_write()
         except Exception:
@@ -2680,6 +2681,7 @@ def _session_serve(session, srv, path, clients, opts):
     state = {"stop": False}
 
     def handle(conn):
+        held = [None]        # the client's stdin descriptor, while it is ours
         try:
             uid = _peer_uid(conn)
             if uid is not None and uid != os.getuid():
@@ -2689,28 +2691,62 @@ def _session_serve(session, srv, path, clients, opts):
             conn.settimeout(30.0)
             data = b""
             while b"\n" not in data:
-                chunk = conn.recv(65536)
+                chunk, ancdata, _flags, _addr = conn.recvmsg(
+                        65536, socket.CMSG_SPACE(array.array("i").itemsize))
+                for level, ctype, cred in ancdata:
+                    if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
+                        # The request may itself carry the stdin descriptor.
+                        # Anything beyond the first one is not part of the
+                        # protocol: close it rather than leak it.
+                        fds = array.array("i")
+                        fds.frombytes(cred[:len(cred) - (len(cred) % fds.itemsize)])
+                        for i, one in enumerate(fds):
+                            if i == 0 and held[0] is None:
+                                held[0] = one
+                            else:
+                                os.close(one)
                 if not chunk:
                     break
                 data += chunk
             if not data.strip():
                 return
             req = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
-            # Whatever followed that newline is already stdin data, not part of
-            # the request: keep it, or the first bytes of a fast writer's input
-            # would be dropped.
-            rest = data.split(b"\n", 1)[1] if b"\n" in data else b""
-            dispatch(conn, req, rest)
+            # Nothing follows the request line on this socket: stdin travels
+            # as the descriptor above, and what remains is a pure JSON
+            # channel in both directions.
+            dispatch(conn, req, held)
         except Exception as exc:                          # never kill the loop
             _reply(conn, {"error": "mssh: session daemon: %s" % exc})
         finally:
+            if held[0] is not None:
+                try:
+                    os.close(held[0])     # never taken over: leak nothing
+                except OSError:
+                    pass
             try:
                 conn.close()
             except Exception:
                 pass
 
-    def dispatch(conn, req, rest=b""):
+    def dispatch(conn, req, held):
+        """Handle one request.
+
+        held[0], when set, is the client's stdin descriptor that arrived with
+        the request.  Every path closes it except the one that hands it to
+        _pump_stdin, whose finally closes it in turn; the list is how the two
+        agree on who owns it.
+        """
+        def drop():
+            # A descriptor only means something to send-with-stdin.  Closing
+            # it on every other path matters: one kept open would hold the
+            # client's producer (a 'yes' pipe) for as long as the daemon lives.
+            if held[0] is not None:
+                os.close(held[0])
+                held[0] = None
+
         op = req.get("op")
+        if op != "send" or not req.get("stdin"):
+            drop()
         if op == "status":
             _reply(conn, {
                 "target": str(session.target), "command": session.command,
@@ -2727,6 +2763,7 @@ def _session_serve(session, srv, path, clients, opts):
             _reply(conn, {"error": "mssh: unknown request %r" % (op,)})
             return
         if session.dead:
+            drop()
             _reply(conn, {"error": "mssh: session ended: %s" % session.dead})
             return
 
@@ -2756,11 +2793,20 @@ def _session_serve(session, srv, path, clients, opts):
             # bytes as signals -- measured, a 0x03 in the data killed the
             # program.  Silently dropping the data would be worse: the command
             # would appear to work while reading nothing.
+            drop()
             _reply(conn, {"error":
                           "mssh: this session holds an interactive program "
                           "(-c %s), whose input is the command line itself; "
                           "stdin cannot be forwarded to it"
                           % (session.command or "")})
+            return
+        if with_stdin and held[0] is None:
+            # A client that asks for stdin owes a descriptor with the request;
+            # missing, it is a mismatch between client and running daemon.
+            _reply(conn, {"error": "mssh: stdin was requested but no "
+                                   "descriptor came with it; the running "
+                                   "daemon is older than this client -- "
+                                   "--stop the session and start it again"})
             return
 
         in_chan, in_path, pump = None, None, None
@@ -2771,12 +2817,14 @@ def _session_serve(session, srv, path, clients, opts):
             try:
                 in_chan, in_path = session.open_stdin_writer()
             except _SessionDead as exc:
+                drop()
                 _reply(conn, {"error": "mssh: %s" % exc})
                 return
             pump = threading.Thread(target=_pump_stdin,
-                                    args=(conn, in_chan, rest, session))
+                                    args=(held[0], conn, in_chan, session))
             pump.daemon = True
             pump.start()
+            held[0] = None           # the pump owns it now, and closes it
 
         # Streaming holds the pty lock for the command's whole life, so a
         # client that walks away must not pin it: the send below fails once
@@ -2798,9 +2846,10 @@ def _session_serve(session, srv, path, clients, opts):
             return                        # the client hung up mid-command
         finally:
             # The command is over, so nothing will read the fifo again: closing
-            # the writer releases the remote 'cat' even if the client is still
-            # sending, which is what makes 'yes | mssh --session s "echo hi"'
-            # end instead of streaming forever.
+            # the writer releases the remote 'cat' even while the pump is
+            # still feeding it, which is what makes
+            # 'yes | mssh --session s "echo hi"' end instead of streaming
+            # forever.
             session.close_stdin_writer(in_chan)
             if pump is not None:
                 pump.join(timeout=5.0)
