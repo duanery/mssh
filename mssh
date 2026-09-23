@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.12
 # -*- coding: utf-8 -*-
 """
 mssh - Multi-hop SSH login tool.
@@ -816,29 +816,60 @@ def term_size():
         return 80, 24
 
 
-def posix_shell(chan):
-    """Bridge the local tty and the remote channel until either closes."""
+def stdin_fd():
+    """The fd to forward to the remote, or None if there is nothing to read."""
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, ValueError, IOError):
+        return None
+    try:
+        os.fstat(fd)
+    except OSError:
+        return None
+    return fd
+
+
+def pump(chan, is_tty=False):
+    """Bridge local stdin/stdout/stderr and the remote channel until it closes.
+
+    Local stdin is forwarded to the channel, chan.recv() is written to stdout
+    and chan.recv_stderr() to stderr.  stdin matters more than it looks:
+    anything that reads input -- `-c cat`, a prompt, a pipeline fed from a
+    local file -- hangs forever if we only drain the channel, which is what
+    ssh(1) would never do.
+
+    With is_tty the local terminal is put in raw mode so keystrokes reach the
+    remote pty unwrapped, and SIGWINCH keeps the remote pty sized to the
+    window.  A pty merges the remote's stderr into stdout, so the stderr
+    stream only ever carries data in the non-tty case.
+    """
     import termios
     import tty
 
-    stdin_fd = sys.stdin.fileno()
-    old_attrs = termios.tcgetattr(stdin_fd)
+    out = sys.stdout.buffer
+    err = sys.stderr.buffer
+    chan.settimeout(0.0)
+    infd = stdin_fd()
 
     resized = [False]
 
     def on_winch(signum, frame):
         resized[0] = True
 
+    old_attrs = None
     old_winch = None
-    try:
-        old_winch = signal.signal(signal.SIGWINCH, on_winch)
-    except (ValueError, AttributeError, OSError):
-        pass
+    if is_tty:
+        try:
+            old_winch = signal.signal(signal.SIGWINCH, on_winch)
+        except (ValueError, AttributeError, OSError):
+            pass
+        if infd is not None:
+            old_attrs = termios.tcgetattr(infd)
 
     try:
-        tty.setraw(stdin_fd)
-        tty.setcbreak(stdin_fd)
-        chan.settimeout(0.0)
+        if old_attrs is not None:
+            tty.setraw(infd)
+            tty.setcbreak(infd)
 
         while True:
             if resized[0]:
@@ -849,75 +880,67 @@ def posix_shell(chan):
                 except Exception:
                     pass
 
+            # Drain whatever the remote has already sent, then wait.  Any
+            # error here -- a dropped connection most of all -- ends the
+            # session quietly; a terminal bridge has no business printing
+            # a traceback over the output it was carrying.
+            got = False
             try:
-                ready, _, _ = select.select([chan, stdin_fd], [], [], 0.2)
-            except select.error:
-                continue
-            except InterruptedError:
-                continue
-
-            if chan in ready:
-                try:
+                if chan.recv_ready():
                     data = chan.recv(65536)
-                except socket.timeout:
-                    data = b""
-                except Exception:
-                    break
-                if len(data) == 0:
-                    break
-                os.write(sys.stdout.fileno(), data)
+                    if not data:
+                        break
+                    out.write(data)
+                    out.flush()
+                    got = True
+                if chan.recv_stderr_ready():
+                    data = chan.recv_stderr(65536)
+                    if data:
+                        err.write(data)
+                        err.flush()
+                        got = True
+            except Exception:
+                break
+            if got:
+                continue
 
-            if stdin_fd in ready:
+            if chan.exit_status_ready() and not chan.recv_ready() \
+                    and not chan.recv_stderr_ready():
+                break
+
+            watch = [chan] if infd is None else [chan, infd]
+            try:
+                ready, _, _ = select.select(watch, [], [], 0.2)
+            except (select.error, InterruptedError):
+                continue
+
+            if infd is not None and infd in ready:
                 try:
-                    data = os.read(stdin_fd, 4096)
+                    data = os.read(infd, 65536)
                 except OSError:
-                    break
-                if len(data) == 0:
+                    data = b""
+                if data:
+                    try:
+                        chan.sendall(data)
+                    except Exception:
+                        break
+                else:
+                    # Local EOF: close the remote's stdin so it can finish,
+                    # then stay in the loop to collect whatever it still
+                    # prints -- stdin ending does not mean the remote has.
                     try:
                         chan.shutdown_write()
                     except Exception:
                         pass
-                    break
-                try:
-                    chan.sendall(data)
-                except Exception:
-                    break
+                    infd = None
     finally:
-        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
+        if old_attrs is not None:
+            termios.tcsetattr(infd, termios.TCSADRAIN, old_attrs)
         if old_winch is not None:
             try:
                 signal.signal(signal.SIGWINCH, old_winch)
             except Exception:
                 pass
-
-
-def pipe_shell(chan):
-    """Non-tty fallback: pump stdin/stdout without raw mode."""
-    def reader():
-        while True:
-            try:
-                data = chan.recv(65536)
-            except Exception:
-                break
-            if not data:
-                break
-            sys.stdout.buffer.write(data)
-            sys.stdout.flush()
-
-    thread = threading.Thread(target=reader)
-    thread.daemon = True
-    thread.start()
-
-    try:
-        while True:
-            data = sys.stdin.buffer.read(4096)
-            if not data:
-                break
-            chan.sendall(data)
-        chan.shutdown_write()
-    except Exception:
-        pass
-    thread.join(timeout=2)
 
 
 def run_interactive(client, opts):
@@ -931,10 +954,7 @@ def run_interactive(client, opts):
                      width=cols, height=rows)
     chan.invoke_shell()
 
-    if interactive:
-        posix_shell(chan)
-    else:
-        pipe_shell(chan)
+    pump(chan, is_tty=interactive)
 
     status = 0
     try:
@@ -958,85 +978,13 @@ def run_command(client, command, opts):
     if opts.force_tty and sys.stdin.isatty() and sys.stdout.isatty():
         # The remote pty echoes and handles line editing, so the local tty has
         # to stay out of the way -- the same bridge an interactive login uses.
-        posix_shell(chan)
+        pump(chan, is_tty=True)
     else:
-        pump_command(chan)
+        pump(chan)
 
     status = chan.recv_exit_status()
     chan.close()
     return status
-
-
-def stdin_fd():
-    """The fd to forward to the remote, or None if there is nothing to read."""
-    try:
-        fd = sys.stdin.fileno()
-    except (AttributeError, ValueError, IOError):
-        return None
-    try:
-        os.fstat(fd)
-    except OSError:
-        return None
-    return fd
-
-
-def pump_command(chan):
-    """Forward stdin to the remote command and its output back, until it exits.
-
-    stdin matters more than it looks: anything that reads input -- `-c cat`, a
-    prompt, a pipeline fed from a local file -- hangs forever if we only drain
-    the channel, which is what ssh(1) would never do.
-    """
-    chan.settimeout(0.0)
-    out = sys.stdout.buffer
-    err = sys.stderr.buffer
-    infd = stdin_fd()
-
-    while True:
-        got = False
-        if chan.recv_ready():
-            data = chan.recv(65536)
-            if data:
-                out.write(data)
-                out.flush()
-                got = True
-        if chan.recv_stderr_ready():
-            data = chan.recv_stderr(65536)
-            if data:
-                err.write(data)
-                err.flush()
-                got = True
-        if got:
-            continue
-
-        if chan.exit_status_ready() and not chan.recv_ready() \
-                and not chan.recv_stderr_ready():
-            break
-
-        watch = [chan] if infd is None else [chan, infd]
-        try:
-            ready, _, _ = select.select(watch, [], [], 0.1)
-        except (select.error, InterruptedError):
-            continue
-
-        if infd is not None and infd in ready:
-            try:
-                data = os.read(infd, 65536)
-            except OSError:
-                data = b""
-            if data:
-                try:
-                    chan.sendall(data)
-                except Exception:
-                    break
-            else:
-                # Local EOF: close the remote's stdin so it can finish, then
-                # stay in the loop to collect whatever it still prints.
-                infd = None
-                try:
-                    chan.shutdown_write()
-                except Exception:
-                    pass
 
 
 # --------------------------------------------------------------------------

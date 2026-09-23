@@ -736,8 +736,11 @@ class TestRegression(unittest.TestCase):
         # The fake chain only implements what a session needs, so the plain
         # -c and copy paths are checked for reaching run_command/run_copy
         # rather than for their output; the real ones are covered elsewhere.
+        # pump() runs to completion against the fake -- it treats every
+        # error as a dropped connection -- so the -c marker is the first
+        # thing only run_command itself asks for.
         for argv, want in [(["root@10.0.0.1", "-c", "echo plain"],
-                            b"recv_ready"),
+                            b"recv_exit_status"),
                            (["./setup.py", "root@10.0.0.1:/tmp/"],
                             b"open_sftp")]:
             proc = subprocess.run([sys.executable, FAKE] + argv,
