@@ -268,6 +268,21 @@ static void sync_winsize(int pty_fd)
 }
 
 /*
+ * Push the local window size into the pty directly with TIOCSWINSZ.
+ * Used when no sentinel is configured: there is no prompt boundary to
+ * wait for, and the ioctl also makes the kernel deliver SIGWINCH to
+ * the foreground process group behind the pty -- what a real terminal
+ * does on a resize.
+ */
+static void push_winsize(int pty_fd)
+{
+    struct winsize ws;
+
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+        ioctl(pty_fd, TIOCSWINSZ, &ws);
+}
+
+/*
  * Record bytes of pty output and check the unused patterns. A pattern
  * is a prompt: once printed, the peer stops and waits for input, so a
  * prompt always ends up as the TAIL of the output stream. The full
@@ -646,14 +661,21 @@ int main(int argc, char **argv)
         ssize_t n;
 
         /*
-         * Window changed while sitting at the command prompt: push the
-         * new size right away. Output streaming (not at a prompt)
-         * clears sentinel_seen, so the push defers to the next prompt
-         * instead of injecting stty into a running program.
+         * Window changed. With a sentinel: push the new size only while
+         * sitting at the command prompt -- output streaming (not at a
+         * prompt) clears sentinel_seen, so the stty push defers to the
+         * next prompt instead of injecting into a running program.
+         * Without a sentinel there is no prompt boundary to wait for:
+         * push the size into the pty via TIOCSWINSZ right away.
          */
-        if (sentinel_seen && winch_pending) {
-            winch_pending = 0;
-            sync_winsize(pty_fd);
+        if (winch_pending) {
+            if (sentinel_seen) {
+                winch_pending = 0;
+                sync_winsize(pty_fd);
+            } else if (!has_sentinel) {
+                winch_pending = 0;
+                push_winsize(pty_fd);
+            }
         }
 
         /*
