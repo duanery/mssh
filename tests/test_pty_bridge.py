@@ -79,7 +79,7 @@ target_name = os.ttyname(target_slave)
 # --- spawn pty_bridge under its own pty, so stdin is a controlling terminal ---
 pid, local_master = pty.fork()
 if pid == 0:
-    os.execv(BIN, ['pty-bridge', '-e', '^]', target_name])
+    os.execv(BIN, ['pty-bridge', '-e', '^]', '--pty', target_name])
 
 banner = read_avail(local_master, 0.5)
 check('escape banner printed', b'Escape character is ^]' in banner, repr(banner))
@@ -120,7 +120,7 @@ if p2 == 0:
     os.dup2(w, 2)
     os.close(r)
     os.close(w)
-    os.execv(BIN, ['pty-bridge', target_name])
+    os.execv(BIN, ['pty-bridge', '--pty', target_name])
 os.close(w)                      # parent reads the child's stderr from r
 status = wait_pid_exit(p2)
 err = read_avail(r, 0.5)
@@ -132,7 +132,7 @@ check('non-tty stdin message', b'not a terminal' in err, repr(err))
 # 7) non-tty argument -> refuse with exit code 2
 pid3, m3 = pty.fork()
 if pid3 == 0:
-    os.execv(BIN, ['pty-bridge', '/etc/passwd'])
+    os.execv(BIN, ['pty-bridge', '--pty', '/etc/passwd'])
 out3 = read_avail(m3, 0.8)
 status = wait_pid_exit(pid3)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
@@ -141,7 +141,7 @@ check('non-tty arg refused', ok, repr(status) + ' out=' + repr(out3))
 # 8) target pty closed by its master -> pty_bridge exits
 pid4, m4 = pty.fork()
 if pid4 == 0:
-    os.execv(BIN, ['pty-bridge', '-e', '^a', target_name])
+    os.execv(BIN, ['pty-bridge', '-e', '^a', '--pty', target_name])
 time.sleep(0.3)
 read_avail(m4, 0.2)
 os.close(target_master)
@@ -152,7 +152,7 @@ check('pts closed -> exit', status is not None and os.WIFEXITED(status), repr(st
 tm2, ts2 = pty.openpty()
 pid5, m5 = pty.fork()
 if pid5 == 0:
-    os.execv(BIN, ['pty-bridge', '-e', '^a', os.ttyname(ts2)])
+    os.execv(BIN, ['pty-bridge', '-e', '^a', '--pty', os.ttyname(ts2)])
 time.sleep(0.3)
 read_avail(m5, 0.2)
 os.write(m5, b'\x01')
@@ -164,7 +164,7 @@ check('custom escape ^a exits', ok, repr(status))
 tm3, ts3 = pty.openpty()
 pid6, m6 = pty.fork()
 if pid6 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', 'login: root', os.ttyname(ts3)])
+    os.execv(BIN, ['pty-bridge', '-p', 'login: root', '--pty', os.ttyname(ts3)])
 time.sleep(0.3)
 read_avail(m6, 0.3)
 read_avail(tm3, 0.3)    # drain the simulated startup Enter
@@ -181,7 +181,7 @@ check('pattern used only once', got == b'', repr(got))
 tm5, ts5 = pty.openpty()
 pid9, m9 = pty.fork()
 if pid9 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', 'login: root', os.ttyname(ts5)])
+    os.execv(BIN, ['pty-bridge', '-p', 'login: root', '--pty', os.ttyname(ts5)])
 time.sleep(0.3)
 read_avail(m9, 0.3)
 read_avail(tm5, 0.3)    # drain the simulated startup Enter
@@ -212,7 +212,7 @@ tm4, ts4 = pty.openpty()
 pid7, m7 = pty.fork()
 if pid7 == 0:
     os.execv(BIN, ['pty-bridge', '-p', 'login: root', '-p', 'Password: secret',
-                   os.ttyname(ts4)])
+                   '--pty', os.ttyname(ts4)])
 time.sleep(0.3)
 read_avail(m7, 0.3)
 read_avail(tm4, 0.3)    # drain the simulated startup Enter
@@ -227,12 +227,29 @@ status = wait_pid_exit(pid7)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('escape exits with patterns', ok, repr(status))
 
+# 13b) the reply keeps the spaces it has: -p ']# cd /tmp' runs "cd /tmp"
+#      (the split is at the FIRST space, so only the prompt is cut short)
+tm9, ts9 = pty.openpty()
+pid19, m19 = pty.fork()
+if pid19 == 0:
+    os.execv(BIN, ['pty-bridge', '-p', ']# cd /tmp', '--pty', os.ttyname(ts9)])
+time.sleep(0.3)
+read_avail(m19, 0.3)
+read_avail(tm9, 0.3)    # drain the simulated startup Enter
+os.write(tm9, b'[root@host ~]# ')
+got = read_avail(tm9)
+check('reply keeps its spaces', got == b'cd /tmp\r', repr(got))
+os.write(m19, b'\x1d')
+status = wait_pid_exit(pid19)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('escape exits after spaced reply', ok, repr(status))
+
 # 14) malformed -p value -> exit 2
 pid8 = os.fork()
 if pid8 == 0:
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 2)
-    os.execv(BIN, ['pty-bridge', '-p', 'nospace', '/dev/pts/1'])
+    os.execv(BIN, ['pty-bridge', '-p', 'nospace', '--pty', '/dev/pts/1'])
 status = wait_pid_exit(pid8)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
 check('malformed pattern refused', ok, repr(status))
@@ -243,7 +260,7 @@ if pid12 == 0:
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 2)
     os.execv(BIN, ['pty-bridge', '-p', ']# ', '-p', '$ ',
-                   '/dev/pts/1'])
+                   '--pty', '/dev/pts/1'])
 status = wait_pid_exit(pid12)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
 check('second sentinel refused', ok, repr(status))
@@ -255,7 +272,7 @@ tm6, ts6 = pty.openpty()
 pid10, m10 = pty.fork()
 if pid10 == 0:
     os.execv(BIN, ['pty-bridge', '-p', 'login: root', '-p', ']# ',
-                   os.ttyname(ts6)])
+                   '--pty', os.ttyname(ts6)])
 set_winsize(m10, 40, 100)
 time.sleep(0.3)
 read_avail(m10, 0.3)
@@ -302,7 +319,7 @@ tm7, ts7 = pty.openpty()
 pid11, m11 = pty.fork()
 if pid11 == 0:
     os.execv(BIN, ['pty-bridge', '-p', 'login: root', '-p', ']# ',
-                   os.ttyname(ts7)])
+                   '--pty', os.ttyname(ts7)])
 set_winsize(m11, 30, 90)
 time.sleep(0.3)
 read_avail(m11, 0.3)
@@ -318,6 +335,125 @@ os.write(m11, b'\x1d')
 status = wait_pid_exit(pid11)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('escape exits after login+sentinel', ok, repr(status))
+
+# 18) command mode: without --pty a new pty is created and COMMAND runs
+#     on its slave as the channel to a (remote) pty. The command may
+#     print BEFORE it puts the pty into raw mode: that early output is
+#     forwarded while the pty (and the local terminal) are still
+#     canonical, so its \n arrives display-ready. Once the command sets
+#     the pty raw, normal raw forwarding starts.
+pid13, m13 = pty.fork()
+if pid13 == 0:
+    os.execv(BIN, ['pty-bridge', '--',
+                   'sh', '-c', 'printf "banner\n"; stty raw -echo; cat'])
+got = read_avail(m13, 1.0)
+check('early output forwarded before pty is raw',
+      b'banner' in got and b'\r\n' in got, repr(got))
+time.sleep(0.3)
+os.write(m13, b'meow\n')
+got = read_avail(m13)
+check('command mode forwards to child pty', b'meow' in got, repr(got))
+os.write(m13, b'\x1d')
+status = wait_pid_exit(pid13)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('command mode escape exits 0', ok, repr(status))
+
+# 18b) a command that never sets the pty raw and never exits: the
+#      startup phase gives up after its timeout and normal forwarding
+#      (including the escape character) starts anyway
+pid13b, m13b = pty.fork()
+if pid13b == 0:
+    os.execv(BIN, ['pty-bridge', '--', 'cat'])
+time.sleep(0.3)
+read_avail(m13b, 0.3)
+time.sleep(3.5)          # let the startup timeout expire
+os.write(m13b, b'\x1d')
+status = wait_pid_exit(pid13b, 8.0)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('startup timeout falls back to forwarding', ok, repr(status))
+
+# 19) the channel command starts with the local window size (so e.g.
+#     ssh -tt relays the right size to the remote pty from the start)
+pid14, m14 = pty.fork()
+if pid14 == 0:
+    os.execv(BIN, ['pty-bridge', '--', 'sh', '-c', 'sleep 0.5; stty size'])
+set_winsize(m14, 24, 80)
+got = read_avail(m14, 3.0)
+check('command starts with local winsize', b'24 80' in got, repr(got))
+wait_pid_exit(pid14)
+
+# 19b) the new pty is seeded with the local terminal's termios, not
+#      with the driver defaults: ECHO is off on the terminal we hand
+#      to pty-bridge, so the channel command must see ECHO off too
+lm, ls = pty.openpty()
+attrs = termios.tcgetattr(ls)
+attrs[3] &= ~termios.ECHO
+termios.tcsetattr(ls, termios.TCSANOW, attrs)
+pid14b = os.fork()
+if pid14b == 0:
+    os.close(lm)
+    os.setsid()
+    fcntl.ioctl(ls, termios.TIOCSCTTY, 0)
+    os.dup2(ls, 0)
+    os.dup2(ls, 1)
+    os.dup2(ls, 2)
+    os.close(ls)
+    os.execv(BIN, ['pty-bridge', '--', 'sh', '-c', 'stty -a; sleep 5'])
+os.close(ls)
+got = read_avail(lm, 4.5)
+check('command pty inherits local termios', b'-echo' in got, repr(got))
+os.write(lm, b'\x1d')
+wait_pid_exit(pid14b)
+os.close(lm)
+
+# 20) the channel command exits -> pty-bridge exits by itself
+#     (master read fails with EIO once the slave is closed)
+pid15, m15 = pty.fork()
+if pid15 == 0:
+    os.execv(BIN, ['pty-bridge', '--', 'true'])
+status = wait_pid_exit(pid15)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('child exit closes the bridge', ok, repr(status))
+
+# 21) exec failure: the child prints the error and the bridge exits
+pid16, m16 = pty.fork()
+if pid16 == 0:
+    os.execv(BIN, ['pty-bridge', '--', 'no-such-command-xyz'])
+got = read_avail(m16, 2.0)
+status = wait_pid_exit(pid16)
+ok = status is not None and os.WIFEXITED(status) and b'No such file' in got
+check('exec failure exits the bridge', ok, repr(status) + ' out=' + repr(got))
+
+# 22) COMMAND combined with --pty -> refused with exit code 2
+pid17, m17 = pty.fork()
+if pid17 == 0:
+    os.execv(BIN, ['pty-bridge', '--pty', '/dev/pts/1', 'cat'])
+out = read_avail(m17, 0.8)
+status = wait_pid_exit(pid17)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
+check('--pty with COMMAND refused', ok, repr(status) + ' out=' + repr(out))
+
+# 23) without a sentinel there is no prompt boundary to wait for: a
+#     window resize is pushed into the pty via TIOCSWINSZ (SIGWINCH to
+#     the session behind it), no stty typing involved
+tm8, ts8 = pty.openpty()
+pid18, m18 = pty.fork()
+if pid18 == 0:
+    os.execv(BIN, ['pty-bridge', '--pty', os.ttyname(ts8)])
+time.sleep(0.3)
+read_avail(m18, 0.3)
+read_avail(tm8, 0.3)    # drain the simulated startup Enter
+set_winsize(m18, 33, 77)
+got = read_avail(tm8, 0.5)
+check('no sentinel: resize types nothing', got == b'', repr(got))
+rows, cols, _, _ = struct.unpack(
+    'HHHH', fcntl.ioctl(tm8, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
+check('no sentinel: pty size synced via ioctl', (rows, cols) == (33, 77),
+      'got %dx%d' % (rows, cols))
+os.write(m18, b'\x1d')
+status = wait_pid_exit(pid18)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('no sentinel: escape still exits', ok, repr(status))
 
 print('---')
 print('FAILURES:', failures)

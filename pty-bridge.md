@@ -1,16 +1,21 @@
 # pty-bridge -- implementation notes
 
-`pty-bridge` attaches the local terminal to an existing pty (typically
-`/dev/pts/N`): what you type is written into the pty, and everything the pty
-produces is printed on your screen. It is a small C program with no
-dependencies beyond libc, built with:
+`pty-bridge` attaches the local terminal to a pty -- local or remote.
+What you type is written into the pty, and everything the pty produces
+is printed on your screen. The pty to attach is either an existing
+local one (`--pty /dev/pts/N`) or a *remote* one reached through a
+channel command (`ssh -tt host`, `virsh console vm`, ...): such a
+remote pty cannot be opened directly, it is only reachable through the
+command that connects to it. It is a small C program with no
+dependencies beyond libc (+ libutil for `openpty`), built with:
 
 ```sh
-gcc -Wall -Wextra -O2 -o pty-bridge pty-bridge.c
+gcc -Wall -Wextra -O2 -o pty-bridge pty-bridge.c -lutil
 ```
 
 ```sh
-pty-bridge [-e CHAR|--escape CHAR] [-p "<prompt> <reply>"]... /dev/pts/3
+pty-bridge [-e CHAR|--escape CHAR] [-p "<match> <reply>"]... \
+           [--pty /dev/pts/3] [command [arg ...]]
 ```
 
 ## Overview
@@ -18,22 +23,43 @@ pty-bridge [-e CHAR|--escape CHAR] [-p "<prompt> <reply>"]... /dev/pts/3
 ```
                        local terminal (tty, raw)
   keyboard --> stdin --------------------+
-                                         |  poll() + ppoll() loop
+                                         |  ppoll() loop
   screen   <-- stdout <------------------+
                        |                 |
                        v                 v
-                write(pts_fd)      read(pts_fd)
+                 write(pty_fd)      read(pty_fd)
                        |                 ^
-                       +-> /dev/pts/N <--+
-                     (slave side, raw)
+                       +->  the pty  <---+
 ```
 
-`pty-bridge` opens the *slave* side of an existing pty and shuttles bytes
-both ways. It never touches the master side; whoever holds the master (an
-mssh session daemon, `screen`, a test harness, ...) keeps working
-unchanged -- bytes we write into the slave appear on the master as if
-typed on the session's keyboard, and bytes the session writes come back
-to us.
+Two ways to obtain "the pty":
+
+- **`--pty PATH`** -- an existing local pty. `pty-bridge` opens the
+  *slave* side (`/dev/pts/N`) and shuttles bytes both ways. It never
+  touches the master side; whoever holds the master (an mssh session
+  daemon, `screen`, a test harness, ...) keeps working unchanged --
+  bytes we write into the slave appear on the master as if typed on
+  the session's keyboard, and bytes the session writes come back to
+  us.
+- **COMMAND mode** (no `--pty`) -- the pty to attach is remote, so a
+  fresh pty is created with `openpty()` and a child process is forked
+  with the slave as its stdin/stdout/stderr and controlling terminal;
+  the child then `execvp()`s the command. The command -- e.g.
+  `ssh -tt host` or `virsh console vm` -- is the *channel* that
+  carries the remote pty: it draws the remote pty through our pty,
+  and `pty-bridge` (holding the master end) bridges the local
+  terminal onto it. Before any output, `pty-bridge` prints
+  `Running: <command>` and its own escape hint (`Escape character is
+  ^] (exits pty-bridge)`), so the escape hint the command itself may
+  print later (virsh console prints one for the virtual machine
+  console) is not mistaken for ours. When the child exits (remote
+  side closed, ssh dropped, ...), the slave is gone, the master read
+  fails with `EIO` and `pty-bridge` exits by itself. On the escape
+  key the master is closed, the child is given `SIGHUP` and reaped,
+  so no stray channel process survives the detach.
+
+The rest of the machinery (raw mode, escape, patterns, window size)
+works identically on both modes: it only sees the one bridge fd.
 
 ## Startup checks
 
@@ -41,26 +67,85 @@ to us.
 2. `tcgetsid(0) == getsid(0)` -- stdin must be the *controlling terminal*
    of the process. Running under a pipe or a background job is refused;
    the tool is an interactive attach console.
-3. The pty argument is opened with `O_RDWR | O_NOCTTY` and checked with
-   `isatty()`. `O_NOCTTY` matters: opening a slave pty must never steal
-   the controlling-terminal role from the session that owns it.
+3. The pty is acquired (see above): `--pty` opens the path with
+   `O_RDWR | O_NOCTTY` and checks it with `isatty()` (`O_NOCTTY`
+   matters: opening a slave pty must never steal the
+   controlling-terminal role from the session that owns it); COMMAND
+   mode creates the pty and forks the child in `open_command_pty()`.
+
+## The channel command (`open_command_pty()`)
+
+`openpty()` creates the pty pair, seeded with the local terminal's own
+`termios` and window size -- both read from stdin, which is still in
+its original state at this point. The new pty therefore looks exactly
+like the terminal the user is sitting at, so `ssh -tt` relays the
+right size and line settings to the remote pty from the very start.
+Then:
+
+- **child**: closes the master, `setsid()` (new session, no
+  controlling terminal yet), `ioctl(slave, TIOCSCTTY)` to make the
+  slave its controlling terminal, `dup2()`s the slave onto
+  stdin/stdout/stderr, and `execvp()`s the command. An exec failure
+  is reported on stderr and exits 127.
+- **parent**: closes the slave (it must not keep the slave side alive,
+  or the child's `EIO`-on-exit detection would never fire) and
+  remembers the child pid.
+
+`getopt_long()` is called with a leading `+` in the optstring so
+option parsing stops at the first non-option argument: the command's
+own options (`ssh -tt`, `virsh console vm`) belong to the command,
+not to `pty-bridge`. Use `--` to separate them explicitly. COMMAND
+together with `--pty` is refused.
+
+### Waiting for the command's raw mode (`wait_pty_raw()`)
+
+The channel command usually puts the pty into raw mode itself, but it
+may print -- a banner, an error message -- before doing so. Output
+produced while the pty is still canonical goes through the line
+discipline (`\n` -> `\r\n`), which is exactly what a still-cooked
+local terminal needs for display; output produced after the switch is
+raw-relayed and needs a raw local terminal. So the startup sequence
+is:
+
+1. the command is forked (`open_command_pty()`),
+2. `wait_pty_raw()` polls the master, printing whatever arrives while
+   the local terminal is still cooked, until the pty turns raw -- the
+   termios settings are shared between master and slave, so the
+   check is simply `!(c_lflag & ICANON)` from the master side,
+3. then the local terminal is switched to raw and the normal
+   forwarding loop starts.
+
+The wait gives up (and proceeds with the main loop) when the command
+exits (`EIO`), or after `STARTUP_TIMEOUT_SEC` (3s) of *silence* --
+every output restarts that timeout -- so a command that never goes
+raw cannot wedge the tool, while a live, still-printing command is
+waited for as long as it keeps talking. The phase runs before any
+terminal change and before the signal handlers are installed, which
+is safe: the local tty has not been touched yet (nothing to restore
+on a kill), and SIGWINCH needs no handling (the first sentinel firing
+always pushes the window size).
 
 ## Raw mode on both ends
 
-Both the local tty and the slave pty are put into raw mode with
-`cfmakeraw()` (`VMIN=1, VTIME=0`), and the original local settings are
-saved and restored on every exit path -- including `SIGINT`, `SIGTERM`
-and `SIGHUP`, whose handler restores the tty and then re-raises the
-signal so the process dies with its true status.
+The local tty is put into raw mode with `cfmakeraw()` (`VMIN=1,
+VTIME=0`) -- in COMMAND mode only after `wait_pty_raw()` saw the
+command switch the pty, see above. The original local settings are
+saved and restored on every exit path -- including `SIGINT`,
+`SIGTERM` and `SIGHUP`, whose handler restores the tty and then
+re-raises the signal so the process dies with its true status.
 
 - **Local tty raw**: every keystroke (including `^C`, `^D`, arrows,
   escape sequences) is forwarded byte-by-byte; the line discipline does
   no editing, no signals, no echo. The remote session already provides
   line editing and echo, so doing it twice would double every character.
-- **Slave pty raw**: bytes we write into the slave are not mangled or
-  echoed back by the line discipline. Without this, the master would see
-  every byte twice (once as our input, once as the echo), and `^C` would
-  never reach the remote shell as a byte.
+- **Pty raw**: bytes written into the pty are not mangled or echoed
+  back by the line discipline. Without this, every byte would come
+  back twice (once as our input, once as the echo), and `^C` would
+  never reach the remote shell as a byte. In COMMAND mode the pty is
+  *not* set raw by `pty-bridge`: the channel command owns the pty
+  settings and switches it itself (`wait_pty_raw()` waits for that),
+  and the relayed remote output already carries its own `\r\n`. In
+  `--pty` mode the existing pty is switched to raw by `pty-bridge`.
 
 ## The forwarding loop
 
@@ -73,7 +158,9 @@ The main loop `ppoll()`s on stdin and the pty:
   newline). Otherwise the chunk is written to the pty.
 - **pty readable**: read a chunk, write it to stdout, then hand it to
   `record_and_check()` (patterns, below). `EIO`/`EAGAIN`/`POLLHUP` on
-  the pty means the master is gone and the loop ends.
+  the pty means the peer is gone -- the master holder closed the
+  slave (`--pty` mode) or the channel command exited (COMMAND mode) --
+  and the loop ends.
 
 ## Escape character
 
@@ -85,10 +172,12 @@ parsed byte is also announced before raw mode starts
 
 ## Pattern auto-reply (`-p`)
 
-`-p "<prompt> <reply>"` automates prompted logins. The value is split at
-the **last** space; the space stays with the prompt, so in
-`-p "login: root"` the full prompt text `login: ` (colon *and* trailing
-space) is matched, and `root` is typed.
+`-p "<match> <reply>"` automates prompted logins. The value is split at
+the **first** space; the separating space stays with the match, the
+reply keeps every space it has. Examples: `-p "login: root"` types the
+username at the `login: ` prompt (colon *and* trailing space included),
+`-p "Password: secret"` types the password, `-p "]# cd /tmp/"` runs
+the command once the `]# ` shell prompt shows up.
 
 Matching rules:
 
@@ -144,6 +233,12 @@ typed in the open -- wrapping it in `stty -echo` / `stty echo` would
 leave a visible `stty -echo` string on screen anyway, so the resize is
 simply shown to the user.
 
+Without a sentinel there is no prompt boundary to wait for, so the
+size is pushed straight into the pty with `TIOCSWINSZ`
+(`push_winsize()`): the kernel delivers SIGWINCH to the foreground
+process group behind the pty, which is what a real terminal does on a
+resize. No stty typing is involved.
+
 The trigger logic:
 
 1. `SIGWINCH` is installed with a handler that only sets
@@ -156,13 +251,15 @@ The trigger logic:
    inside the wait -- it always interrupts `ppoll()` with `EINTR` --
    and can never slip in between the flag check and the wait. This is
    the classic race-free signal/wait pattern (no self-pipe needed).
-4. At the top of every loop iteration:
-   - **sitting at the prompt** (`sentinel_seen == 1`) and the window
-     changed: push the size immediately.
-   - **output streaming** (`sentinel_seen == 0`, a command is running):
-     do *not* inject `stty` into whatever is running; `winch_pending`
-     survives, and the next sentinel firing (the next prompt) pushes
-     the size instead.
+4. At the top of every loop iteration, if the window changed:
+   - **no sentinel configured**: push the size into the pty via
+     `TIOCSWINSZ` immediately.
+   - **sentinel configured, sitting at the prompt**
+     (`sentinel_seen == 1`): push the size immediately.
+   - **sentinel configured, output streaming** (`sentinel_seen == 0`,
+     a command is running): do *not* inject `stty` into whatever is
+     running; `winch_pending` survives, and the next sentinel firing
+     (the next prompt) pushes the size instead.
 5. `winch_pending` starts **set** (it is set at parse time when a
    sentinel is configured), so the very first prompt triggers the
    initial size push -- the "attach and fix the window" case.
@@ -179,12 +276,16 @@ The trigger logic:
 Covered: bidirectional forwarding, raw passthrough of `^C`/`^D`, escape
 exit (default and custom, exit status 0), bytes before the escape still
 forwarded, the detach newline, refusals (stdin not a tty, non-tty
-argument, malformed pattern, two sentinels), pattern auto-reply
-including one-shot semantics and exact-tail matching, sentinel behavior
-(retiring stale patterns, typing nothing), and the full window-size
-state machine (initial push, immediate push at the prompt, deferred
-push after streaming output). The test compiles the binary itself if it
-is missing and exits non-zero on any failure:
+`--pty` path, `--pty` combined with COMMAND, malformed pattern, two
+sentinels), pattern auto-reply including one-shot semantics and
+exact-tail matching, sentinel behavior (retiring stale patterns,
+typing nothing), the full window-size state machine (initial push,
+immediate push at the prompt, deferred push after streaming output),
+and COMMAND mode (bytes relayed to the child, early output forwarded
+while the pty is still canonical, local window size inherited by the
+new pty, child exit closing the bridge, exec failure, the silent-timeout
+fallback, escape detaching without strays). The test compiles the
+binary itself if it is missing and exits non-zero on any failure:
 
 ```sh
 python3 tests/test_pty_bridge.py
