@@ -55,11 +55,12 @@ static struct termios saved_tio; /* original terminal settings */
 static int tio_saved = 0;
 
 /*
- * Auto-reply pattern, from -p "<prompt> <reply>", split at the LAST
- * space: the space stays with the prompt, so "login: root" compares
- * the full prompt "login: " (colon and trailing space included)
- * against the exact tail of the pty output, and types "root" plus
- * Enter on a match. Each pattern is used at most once.
+ * Auto-reply pattern, from -p "<match> <reply>", split at the FIRST
+ * space; the separating space stays with the match. The reply is
+ * everything after it, verbatim, so it may itself contain spaces:
+ * "login: root" types the username at the "login: " prompt,
+ * "Password: secret" the password, "]# cd /tmp/" runs the command
+ * once the "]# " prompt shows up. Each pattern is used at most once.
  */
 #define MAX_PATTERNS 16
 struct pattern {
@@ -173,10 +174,13 @@ static void usage(FILE *out)
         "Options:\n"
         "  -e, --escape CHAR   exit character, default ^] (Ctrl-])\n"
         "                      CHAR is a single character or ^X form\n"
-        "  -p, --pattern SPEC  auto-reply. SPEC is \"<prompt> <reply>\", split at\n"
-        "                      the last space: when the pty output ends exactly\n"
-        "                      with <prompt> (e.g. \"login: \" with its trailing\n"
-        "                      space), type <reply> plus Enter. Repeatable;\n"
+        "  -p, --pattern SPEC  auto-reply. SPEC is \"<match> <reply>\", split at\n"
+        "                      the first space: when the pty output ends exactly\n"
+        "                      with <match> (trailing space included), type\n"
+        "                      <reply> plus Enter; <reply> may contain spaces.\n"
+        "                      E.g. \"login: root\" types the username,\n"
+        "                      \"Password: secret\" the password, \"]# cd /tmp/\"\n"
+        "                      runs a command. Repeatable;\n"
         "                      each pattern fires at most once. An empty reply\n"
         "                      (e.g. \"]# \") is a sentinel for the command\n"
         "                      prompt: nothing is typed, and all still-unused\n"
@@ -510,14 +514,15 @@ int main(int argc, char **argv)
         case 'p': {
             struct pattern *p;
             /*
-             * Split at the last space; the space belongs to the prompt,
-             * so the full prompt text (e.g. "login: ") is compared.
-             * An empty reply makes the pattern a sentinel (see below).
+             * Split at the first space; the separating space stays with
+             * the match, the reply keeps every space it has (a command
+             * to run, e.g. "cd /tmp/"). An empty reply makes the
+             * pattern a sentinel (see below).
              */
-            char *sep = strrchr(optarg, ' ');
+            char *sep = strchr(optarg, ' ');
             if (!sep || sep == optarg) {
                 fprintf(stderr,
-                        "%s: invalid pattern '%s' (expected \"<prompt> <reply>\")\n",
+                        "%s: invalid pattern '%s' (expected \"<match> <reply>\")\n",
                         prog, optarg);
                 return 2;
             }
