@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import termios
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -265,25 +266,27 @@ status = wait_pid_exit(pid12)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
 check('second sentinel refused', ok, repr(status))
 
-# 15) sentinel (empty reply) fires on the command prompt: types nothing,
-#     retires every still-unused pattern, and pushes the window size via
-#     stty commands written into the pty
+# 15) --term serial + sentinel (empty reply): the sentinel fires on the
+#     command prompt, types nothing by itself, retires every still-unused
+#     pattern, and the first window-size push carries the one-time TERM
+#     export together with the stty command
 tm6, ts6 = pty.openpty()
 pid10, m10 = pty.fork()
 if pid10 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', 'login: root', '-p', ']# ',
-                   '--pty', os.ttyname(ts6)])
+    os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', 'login: root',
+                    '-p', ']# ', '--pty', os.ttyname(ts6)],
+              dict(os.environ, TERM='xterm-test'))
 set_winsize(m10, 40, 100)
 time.sleep(0.3)
 read_avail(m10, 0.3)
 read_avail(tm6, 0.3)    # drain the simulated startup Enter
 # shell prompt arrives first (session was already logged in):
-# sentinel fires, types nothing but the stty sequence, and the login
-# prompt is retired
+# sentinel fires, types nothing but the TERM export + stty sequence, and
+# the login prompt is retired
 os.write(tm6, b'Last login: ...\n[root@28 ~]# ')
 got = read_avail(tm6, 0.5)
-check('sentinel pushes winsize init',
-      got == b'stty rows 40 columns 100\r', repr(got))
+check('sentinel pushes TERM+winsize init',
+      got == b'export TERM=xterm-test; stty rows 40 columns 100\r', repr(got))
 
 # 16) sitting at the prompt: a window resize is pushed immediately
 set_winsize(m10, 50, 120)   # SIGWINCH -> immediate sync
@@ -314,12 +317,13 @@ ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('escape exits after sentinel', ok, repr(status))
 
 # 17) normal flow: login prompt fires first, then the sentinel stops
-#     auto-replying and initializes the window size
+#     auto-replying and initializes TERM plus the window size
 tm7, ts7 = pty.openpty()
 pid11, m11 = pty.fork()
 if pid11 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', 'login: root', '-p', ']# ',
-                   '--pty', os.ttyname(ts7)])
+    os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', 'login: root',
+                    '-p', ']# ', '--pty', os.ttyname(ts7)],
+              dict(os.environ, TERM='xterm-test'))
 set_winsize(m11, 30, 90)
 time.sleep(0.3)
 read_avail(m11, 0.3)
@@ -329,8 +333,8 @@ got = read_avail(tm7)
 check('login fires before sentinel', got == b'root\r', repr(got))
 os.write(tm7, b'\nmotd\n]# ')
 got = read_avail(tm7, 0.5)
-check('sentinel pushes winsize after login',
-      got == b'stty rows 30 columns 90\r', repr(got))
+check('sentinel pushes TERM+winsize after login',
+      got == b'export TERM=xterm-test; stty rows 30 columns 90\r', repr(got))
 os.write(m11, b'\x1d')
 status = wait_pid_exit(pid11)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
@@ -454,6 +458,160 @@ os.write(m18, b'\x1d')
 status = wait_pid_exit(pid18)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('no sentinel: escape still exits', ok, repr(status))
+
+# 24) --term serial without a sentinel: no prompt boundary to type at,
+#     so it warns and falls back to the pty method (TIOCSWINSZ, nothing
+#     typed)
+tm10, ts10 = pty.openpty()
+pid20, m20 = pty.fork()
+if pid20 == 0:
+    os.execv(BIN, ['pty-bridge', '--term', 'serial', '--pty', os.ttyname(ts10)])
+time.sleep(0.3)
+early = read_avail(m20, 0.3)
+check('serial without sentinel warns', b'needs a sentinel pattern' in early,
+      repr(early))
+read_avail(tm10, 0.3)    # drain the simulated startup Enter
+set_winsize(m20, 44, 88)
+got = read_avail(tm10, 0.5)
+check('serial without sentinel types nothing', got == b'', repr(got))
+rows, cols, _, _ = struct.unpack(
+    'HHHH', fcntl.ioctl(tm10, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
+check('serial without sentinel: size synced via ioctl', (rows, cols) == (44, 88),
+      'got %dx%d' % (rows, cols))
+os.write(m20, b'\x1d')
+wait_pid_exit(pid20)
+
+# 25) auto: a "virsh console" COMMAND is recognized as a serial console
+#     channel -- with a sentinel, the first prompt carries the one-time
+#     TERM export and the stty push (a fake virsh plays the channel)
+with tempfile.TemporaryDirectory() as tmpdir:
+    fake_virsh = os.path.join(tmpdir, 'virsh')
+    with open(fake_virsh, 'w') as f:
+        f.write('#!/bin/sh\n'
+                'stty raw -echo\n'
+                'printf \'Connected to domain vm7\\n\'\n'
+                'printf \']# \'\n'
+                'cat\n')
+    os.chmod(fake_virsh, 0o755)
+    pid21, m21 = pty.fork()
+    if pid21 == 0:
+        os.execve(BIN, ['pty-bridge', '-p', ']# ', '--',
+                        fake_virsh, 'console', 'vm7'],
+                  dict(os.environ, TERM='xterm-test'))
+    set_winsize(m21, 25, 75)
+    got = read_avail(m21, 2.0)
+    check('auto: virsh console uses the serial method',
+          b'export TERM=xterm-test; stty rows 25 columns 75\r' in got, repr(got))
+    os.write(m21, b'\x1d')
+    wait_pid_exit(pid21)
+
+# 26) auto: any other COMMAND stays on the pty method -- the sentinel
+#     types nothing, the size goes through TIOCSWINSZ
+pid22, m22 = pty.fork()
+if pid22 == 0:
+    os.execv(BIN, ['pty-bridge', '-p', 'ready> ', '--',
+                   'sh', '-c', 'stty raw -echo; printf "ready> "; cat'])
+time.sleep(0.5)
+got = read_avail(m22, 0.5)
+check('auto: non-virsh command types nothing',
+      b'stty rows' not in got and b'export TERM' not in got, repr(got))
+os.write(m22, b'\x1d')
+wait_pid_exit(pid22)
+
+# 27) --term pty with a sentinel: the sentinel still retires patterns
+#     and types nothing, but resizes go through TIOCSWINSZ, not stty
+tm11, ts11 = pty.openpty()
+pid23, m23 = pty.fork()
+if pid23 == 0:
+    os.execv(BIN, ['pty-bridge', '--term', 'pty', '-p', ']# ',
+                   '--pty', os.ttyname(ts11)])
+time.sleep(0.3)
+read_avail(m23, 0.3)
+read_avail(tm11, 0.3)    # drain the simulated startup Enter
+os.write(tm11, b']# ')   # sentinel fires: nothing typed
+got = read_avail(tm11, 0.5)
+check('pty mode: sentinel types nothing', got == b'', repr(got))
+set_winsize(m23, 55, 66)
+got = read_avail(tm11, 0.5)
+check('pty mode: resize types nothing', got == b'', repr(got))
+rows, cols, _, _ = struct.unpack(
+    'HHHH', fcntl.ioctl(tm11, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
+check('pty mode: size synced via ioctl', (rows, cols) == (55, 66),
+      'got %dx%d' % (rows, cols))
+os.write(m23, b'\x1d')
+wait_pid_exit(pid23)
+
+# 28) invalid --term mode -> exit 2
+pid24 = os.fork()
+if pid24 == 0:
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.execv(BIN, ['pty-bridge', '--term', 'bogus', '--pty', '/dev/pts/1'])
+status = wait_pid_exit(pid24)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
+check('invalid --term refused', ok, repr(status))
+
+# 29) --term serial with no TERM in the environment: nothing to export,
+#     the first push is a plain stty line
+tm12, ts12 = pty.openpty()
+pid25, m25 = pty.fork()
+if pid25 == 0:
+    env = {k: v for k, v in os.environ.items() if k != 'TERM'}
+    os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ',
+                    '--pty', os.ttyname(ts12)], env)
+set_winsize(m25, 41, 111)
+time.sleep(0.3)
+read_avail(m25, 0.3)
+read_avail(tm12, 0.3)    # drain the simulated startup Enter
+os.write(tm12, b']# ')
+got = read_avail(tm12, 0.5)
+check('no TERM in env: plain stty only',
+      got == b'stty rows 41 columns 111\r', repr(got))
+os.write(m25, b'\x1d')
+wait_pid_exit(pid25)
+
+# 30) --pty + sentinel (auto -> pty method): the local size is pushed
+#     once at attach, so a pty left at a stale size by the previous
+#     session is fixed without any local resize; nothing is typed
+tm13, ts13 = pty.openpty()
+set_winsize(tm13, 24, 80)   # stale size left behind by the last session
+pid26, m26 = pty.fork()
+if pid26 == 0:
+    os.execv(BIN, ['pty-bridge', '-p', ']# ', '--pty', os.ttyname(ts13)])
+set_winsize(m26, 40, 100)   # local size, set before the bridge looks at it
+time.sleep(0.5)
+read_avail(m26, 0.3)
+read_avail(tm13, 0.3)    # drain the simulated startup Enter
+got = read_avail(tm13, 0.3)
+check('pty mode: attach types nothing', got == b'', repr(got))
+rows, cols, _, _ = struct.unpack(
+    'HHHH', fcntl.ioctl(tm13, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))
+check('pty mode: attach fixes a stale size', (rows, cols) == (40, 100),
+      'got %dx%d' % (rows, cols))
+os.write(m26, b'\x1d')
+wait_pid_exit(pid26)
+
+# 31) --term serial with a TERM that would not survive the shell
+#     command line it is spliced into (metacharacters): the export is
+#     refused with a warning, the first push is a plain stty line
+tm14, ts14 = pty.openpty()
+pid27, m27 = pty.fork()
+if pid27 == 0:
+    os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ',
+                    '--pty', os.ttyname(ts14)],
+              dict(os.environ, TERM='x;ter>m'))
+set_winsize(m27, 33, 77)
+time.sleep(0.3)
+early = read_avail(m27, 0.3)
+check('unusable TERM refused with warning', b'unusable TERM' in early,
+      repr(early))
+read_avail(tm14, 0.3)    # drain the simulated startup Enter
+os.write(tm14, b']# ')
+got = read_avail(tm14, 0.5)
+check('unusable TERM: plain stty only',
+      got == b'stty rows 33 columns 77\r', repr(got))
+os.write(m27, b'\x1d')
+wait_pid_exit(pid27)
 
 print('---')
 print('FAILURES:', failures)

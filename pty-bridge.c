@@ -19,8 +19,8 @@
  *
  * Beyond plain forwarding it also automates the procedure that comes
  * with a remote pty: -p patterns auto-type replies to login prompts,
- * and the window size of the remote side is kept in sync with the
- * local terminal.
+ * and the remote side is kept in sync with the local terminal -- the
+ * window size on every change, TERM once on a serial console (--term).
  *
  * Requires stdin to be the controlling terminal of this process,
  * otherwise it exits immediately.
@@ -30,7 +30,8 @@
  *
  * Build: gcc -Wall -O2 -o pty-bridge pty-bridge.c -lutil
  * Usage: ./pty-bridge [-e CHAR|--escape CHAR] [-p "login: root"] \
- *                     [--pty /dev/pts/3] [command [arg ...]]
+ *                     [--term pty|serial|auto] [--pty /dev/pts/3] \
+ *                     [command [arg ...]]
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -83,12 +84,36 @@ static size_t max_mlen;   /* record size: longest pattern match text */
  * the prompt is seen again it can act again. When it fires nothing is
  * typed (no response, no Enter), and every still-unused normal pattern
  * is marked used (login prompts are stale once a shell prompt showed
- * up). winch_pending starts set (at parse time), so the first time the
- * prompt is seen the window size is pushed; afterwards it is pushed
- * only when the local window changed since (SIGWINCH).
+ * up). winch_pending starts set on a serial channel -- it is set once
+ * the terminal type resolves to serial -- so the first time the prompt
+ * is seen the window size is pushed, together with the one-time TERM
+ * export; afterwards it is pushed only when the local window changed
+ * since (SIGWINCH). On a pty channel the size travels out of band --
+ * COMMAND mode seeds it at openpty(), --pty mode pushes it once at
+ * startup -- so nothing is pending at startup.
  */
 static volatile sig_atomic_t winch_pending = 0;
 static int sentinel_seen = 0; /* currently sitting at the command prompt */
+
+/*
+ * Terminal type of the channel (--term): what the channel can carry
+ * to the remote end on its own. A "pty" channel (ssh -tt) allocates
+ * its pty out of band -- it relays window changes and exports TERM
+ * itself, so the bridge only pushes TIOCSWINSZ and types nothing. A
+ * "serial" channel (virsh console) carries a serial console with no
+ * out-of-band window-change and no environment: window size and TERM
+ * must be typed into the guest as shell commands, which is only safe
+ * at a prompt, i.e. guarded by a sentinel. "auto" picks serial for a
+ * "virsh console" command and pty for everything else; a serial
+ * setting without a sentinel falls back to the pty method.
+ */
+#define TERM_AUTO   0
+#define TERM_PTY    1
+#define TERM_SERIAL 2
+static int term_mode = TERM_AUTO;
+static int term_serial;   /* resolved: type stty/export at the prompt */
+static int term_pending;  /* one-time TERM export still pending */
+static char term_val[64]; /* TERM value to export, from the environment */
 
 /* Sliding window of recent pty output, for pattern matching */
 #define OUTBUF_SIZE 4096
@@ -165,28 +190,35 @@ static void usage(FILE *out)
     fprintf(out,
         "Usage: %s [OPTION]... [--pty PTY] [COMMAND [ARG]...]\n"
         "\n"
-        "Attach the local terminal to a pty: keyboard input is written to\n"
-        "the pty, and pty output is printed on the screen. With --pty the\n"
-        "existing pty PTY (e.g. /dev/pts/3) is attached; otherwise a new\n"
-        "pty is created and COMMAND runs as the channel to the remote pty\n"
-        "to be attached, such as \"ssh -tt host\" or \"virsh console vm\".\n"
+        "Attach the local terminal to a pty: keyboard input is written to the pty, and\n"
+        "pty output is printed on the screen. With --pty the existing pty PTY (e.g.\n"
+        "/dev/pts/3) is attached; otherwise a new pty is created and COMMAND runs as the\n"
+        "channel to the remote pty, such as \"ssh -tt host\" or \"virsh console vm\".\n"
         "\n"
         "Options:\n"
-        "  -e, --escape CHAR   exit character, default ^] (Ctrl-])\n"
-        "                      CHAR is a single character or ^X form\n"
-        "  -p, --pattern SPEC  auto-reply. SPEC is \"<match> <reply>\", split at\n"
-        "                      the first space: when the pty output ends exactly\n"
-        "                      with <match> (trailing space included), type\n"
-        "                      <reply> plus Enter; <reply> may contain spaces.\n"
-        "                      E.g. \"login: root\" types the username,\n"
-        "                      \"Password: secret\" the password, \"]# cd /tmp/\"\n"
-        "                      runs a command. Repeatable;\n"
-        "                      each pattern fires at most once. An empty reply\n"
-        "                      (e.g. \"]# \") is a sentinel for the command\n"
-        "                      prompt: nothing is typed, and all still-unused\n"
+        "  -e, --escape CHAR   exit character, default ^] (Ctrl-]); CHAR is a single\n"
+        "                      character or ^X form\n"
+        "  -p, --pattern SPEC  auto-reply. SPEC is \"<match> <reply>\", split at space:\n"
+        "                      when the pty output ends exactly with <match> (trailing\n"
+        "                      space included), type <reply> plus Enter;\n"
+        "                      <reply> may contain spaces. E.g. \"login: root\" types the\n"
+        "                      username, \"Password: secret\" the password, \"]# cd /tmp/\"\n"
+        "                      runs a command. Repeatable; each pattern fires at most\n"
+        "                      once. An empty reply (e.g. \"]# \") is a sentinel for the\n"
+        "                      command prompt: nothing is typed, and all still-unused\n"
         "                      patterns are marked used\n"
-        "      --pty PATH      attach to an existing pty (e.g. /dev/pts/3)\n"
-        "                      instead of running COMMAND on a new pty\n"
+        "      --pty PATH      attach to an existing pty (e.g. /dev/pts/3) instead of\n"
+        "                      running COMMAND on a new pty\n"
+        "  -t, --term pty|serial|auto\n"
+        "                      how the window size and TERM are synced with the remote\n"
+        "                      end. pty: the channel carries window changes itself\n"
+        "                      (ssh -tt); the size is pushed with TIOCSWINSZ, nothing\n"
+        "                      is typed. serial: the channel is a serial console\n"
+        "                      (virsh console); \"stty rows R columns C\" is typed at\n"
+        "                      the prompt -- needs a sentinel pattern, otherwise pty\n"
+        "                      applies -- and TERM is exported with the first push.\n"
+        "                      auto (default): a \"virsh console\" COMMAND means serial,\n"
+        "                      anything else pty.\n"
         "  -h, --help          show this help\n"
         "\n"
         "Options must precede COMMAND; use -- to separate them.\n"
@@ -195,7 +227,7 @@ static void usage(FILE *out)
         "  %s --pty /dev/pts/3\n"
         "  %s -e ^q --pty /dev/pts/3     # exit with Ctrl-Q\n"
         "  %s -p \"login: root\" -p \"]# \" -- ssh -tt admin@10.0.0.1\n"
-        "  %s -- virsh console vm1\n",
+        "  %s -p \"]# \" --term serial -- virsh console vm1\n",
         prog, prog, prog, prog, prog);
 }
 
@@ -254,29 +286,142 @@ static void write_all(int fd, const unsigned char *buf, size_t n)
 }
 
 /*
- * Push the local window size into the shell behind the pty. Typed in
- * the open: hiding it with "stty -echo" would leave a "stty -echo"
- * string on screen anyway, so just let the user see the resize happen.
+ * "virsh console VM" -- the channel command carries a serial console.
+ * The one command shape auto mode recognizes.
+ */
+static int is_virsh_console(char **cmd, int ncmd)
+{
+    const char *base;
+
+    if (ncmd < 2)
+        return 0;
+    base = strrchr(cmd[0], '/');
+    base = base ? base + 1 : cmd[0];
+    return strcmp(base, "virsh") == 0 && strcmp(cmd[1], "console") == 0;
+}
+
+/*
+ * Is TERM safe to splice into the "export TERM=..." line typed into
+ * the guest? Only what a terminfo name can contain passes -- letters,
+ * digits and "+-._". Anything else (a space, a quote, a metacharacter)
+ * would be mangled or executed by the remote shell, so the export is
+ * skipped instead.
+ */
+static int term_val_ok(const char *t)
+{
+    for (; *t; t++) {
+        char c = *t;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') ||
+              c == '+' || c == '-' || c == '.' || c == '_'))
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * Resolve --term into the method actually used. "auto" recognizes a
+ * single command shape -- "virsh console", a serial console channel --
+ * and picks the serial method for it, the pty method for everything
+ * else. The serial method types into the session, which is only safe
+ * at a prompt: without a sentinel pattern there is no prompt boundary
+ * to wait for, so it warns and falls back to the pty method (window
+ * size via TIOCSWINSZ only, no TERM). TERM is taken from the
+ * environment once, and only if it is a plain terminfo-style name --
+ * anything else would not survive the shell command line it is spliced
+ * into.
+ */
+static void resolve_term_mode(const char *pty_path, char **cmd, int ncmd)
+{
+    const char *t;
+
+    switch (term_mode) {
+    case TERM_SERIAL:
+        term_serial = 1;
+        break;
+    case TERM_PTY:
+        term_serial = 0;
+        break;
+    default:
+        term_serial = !pty_path && is_virsh_console(cmd, ncmd);
+        break;
+    }
+
+    if (term_serial && !has_sentinel) {
+        /*
+         * No prompt boundary: nothing to type at. The user asked for
+         * the serial method -- explicitly, or auto picked it for a
+         * virsh console command -- so say what the session loses
+         * instead of failing silently.
+         */
+        fprintf(stderr,
+                "%s: serial mode needs a sentinel pattern; "
+                "falling back to TIOCSWINSZ sync (no TERM export)\n",
+                prog);
+        term_serial = 0;
+    }
+
+    term_pending = 0;
+    t = getenv("TERM");
+    if (term_serial && t != NULL && *t != '\0') {
+        size_t tl = strlen(t);
+        if (tl < sizeof(term_val) && term_val_ok(t)) {
+            memcpy(term_val, t, tl + 1);
+            term_pending = 1;
+        } else {
+            fprintf(stderr,
+                    "%s: not exporting unusable TERM '%s' to the guest\n",
+                    prog, t);
+        }
+    }
+
+    /*
+     * The serial method can only push the window size (and the
+     * one-time TERM export) at a prompt: queue the initial push so
+     * the first prompt fires it. The pty method carries the size out
+     * of band -- COMMAND mode seeds the new pty with the local size
+     * at openpty(), and --pty mode pushes it once at startup (main) --
+     * so nothing is pending at startup; resizes are pushed as they
+     * happen.
+     */
+    winch_pending = term_serial;
+}
+
+/*
+ * Push the local window size into the session behind the pty by
+ * typing shell commands. Typed in the open: hiding it with
+ * "stty -echo" would leave a "stty -echo" string on screen anyway, so
+ * just let the user see the resize happen. The first push also
+ * exports TERM, once: a serial channel carries no environment, so the
+ * guest learns TERM the same way it learns the window size -- by
+ * being told.
  */
 static void sync_winsize(int pty_fd)
 {
     struct winsize ws;
-    char cmd[128];
+    char cmd[192];
 
     if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) < 0)
         return;
 
-    snprintf(cmd, sizeof(cmd), "stty rows %u columns %u\r",
-             (unsigned)ws.ws_row, (unsigned)ws.ws_col);
+    if (term_pending) {
+        term_pending = 0;
+        snprintf(cmd, sizeof(cmd),
+                 "export TERM=%s; stty rows %u columns %u\r",
+                 term_val, (unsigned)ws.ws_row, (unsigned)ws.ws_col);
+    } else {
+        snprintf(cmd, sizeof(cmd), "stty rows %u columns %u\r",
+                 (unsigned)ws.ws_row, (unsigned)ws.ws_col);
+    }
     write_all(pty_fd, (const unsigned char *)cmd, strlen(cmd));
 }
 
 /*
  * Push the local window size into the pty directly with TIOCSWINSZ.
- * Used when no sentinel is configured: there is no prompt boundary to
- * wait for, and the ioctl also makes the kernel deliver SIGWINCH to
- * the foreground process group behind the pty -- what a real terminal
- * does on a resize.
+ * Used for a pty channel (--term pty, or auto): the channel passes
+ * window changes through, and the ioctl makes the kernel deliver
+ * SIGWINCH to the foreground process group behind the pty -- what a
+ * real terminal does on a resize. Nothing is typed.
  */
 static void push_winsize(int pty_fd)
 {
@@ -342,9 +487,10 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
             /*
              * Sentinel fired: at the command prompt. Nothing to type;
              * every remaining normal pattern is stale now. The window
-             * size is pushed the first time (pending is set at parse);
-             * afterwards the main loop pushes it as soon as the local
-             * window changed.
+             * size is pushed the first time (pending is set when the
+             * type resolves to serial) -- together with the one-time
+             * TERM export; afterwards the main loop pushes it as soon
+             * as the local window changed.
              */
             sentinel_seen = 1;
             if (nr_unused) {
@@ -458,7 +604,8 @@ static int pty_is_raw(int fd)
  * Called before any terminal change and before the signal handlers are
  * installed -- which is fine: the local tty has not been touched yet,
  * so a kill needs no restore, and SIGWINCH needs no handling either
- * (the first sentinel firing always pushes the window size).
+ * (a serial channel pushes the size at the first prompt; a pty channel
+ * had its size seeded at openpty()).
  */
 static void wait_pty_raw(int pty_fd)
 {
@@ -496,6 +643,7 @@ int main(int argc, char **argv)
     static const struct option long_options[] = {
         { "escape",  required_argument, NULL, 'e' },
         { "pattern", required_argument, NULL, 'p' },
+        { "term",    required_argument, NULL, 't' },
         { "pty",     required_argument, NULL, 1 },
         { "help",    no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 },
@@ -506,7 +654,7 @@ int main(int argc, char **argv)
      * channel command's own options (e.g. "ssh -tt host") belong to
      * the command, not to us.
      */
-    while ((opt = getopt_long(argc, argv, "+e:p:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+e:p:t:h", long_options, NULL)) != -1) {
         switch (opt) {
         case 'e':
             escape_str = optarg;
@@ -538,7 +686,6 @@ int main(int argc, char **argv)
                 if (has_sentinel)
                     die("only one sentinel pattern is allowed");
                 has_sentinel = 1;
-                winch_pending = 1; /* push the window size at the first prompt */
             } else {
                 nr_unused++;
             }
@@ -546,6 +693,20 @@ int main(int argc, char **argv)
                 max_mlen = p->mlen;
             break;
         }
+        case 't':
+            if (!strcmp(optarg, "auto"))
+                term_mode = TERM_AUTO;
+            else if (!strcmp(optarg, "pty"))
+                term_mode = TERM_PTY;
+            else if (!strcmp(optarg, "serial"))
+                term_mode = TERM_SERIAL;
+            else {
+                fprintf(stderr,
+                        "%s: invalid --term mode '%s' (pty|serial|auto)\n",
+                        prog, optarg);
+                return 2;
+            }
+            break;
         case 1: /* --pty */
             pty_path = optarg;
             break;
@@ -567,6 +728,9 @@ int main(int argc, char **argv)
         usage(stderr);
         return 2;
     }
+
+    /* resolve the terminal type now that the command (if any) is known */
+    resolve_term_mode(pty_path, argv + optind, argc - optind);
 
     escape_char = parse_escape(escape_str);
 
@@ -661,6 +825,15 @@ int main(int argc, char **argv)
             die_errno("tcsetattr(pts)");
     }
 
+    /*
+     * --pty mode: the attached pty keeps whatever size the previous
+     * session left behind, and nothing carries the local size to it
+     * out of band -- push it once now, so attaching fixes a stale
+     * window (COMMAND mode had the size seeded at openpty() instead).
+     */
+    if (pty_path && !term_serial)
+        push_winsize(pty_fd);
+
     /* simulate pressing Enter so the shell behind the pty prints a fresh prompt */
     write_all(pty_fd, (const unsigned char *)"\r", 1);
 
@@ -674,20 +847,22 @@ int main(int argc, char **argv)
         ssize_t n;
 
         /*
-         * Window changed. With a sentinel: push the new size only while
-         * sitting at the command prompt -- output streaming (not at a
-         * prompt) clears sentinel_seen, so the stty push defers to the
-         * next prompt instead of injecting into a running program.
-         * Without a sentinel there is no prompt boundary to wait for:
-         * push the size into the pty via TIOCSWINSZ right away.
+         * Window changed. pty channel: push the new size into the pty
+         * via TIOCSWINSZ right away -- the kernel delivers SIGWINCH to
+         * the foreground process group behind it, which is what a real
+         * terminal does on a resize. Serial channel: the size must be
+         * typed in as stty, which is only safe at a prompt -- output
+         * streaming (not at a prompt) clears sentinel_seen, so the
+         * push defers to the next prompt instead of injecting into a
+         * running program.
          */
         if (winch_pending) {
-            if (sentinel_seen) {
-                winch_pending = 0;
-                sync_winsize(pty_fd);
-            } else if (!has_sentinel) {
+            if (!term_serial) {
                 winch_pending = 0;
                 push_winsize(pty_fd);
+            } else if (sentinel_seen) {
+                winch_pending = 0;
+                sync_winsize(pty_fd);
             }
         }
 

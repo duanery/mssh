@@ -15,7 +15,7 @@ gcc -Wall -Wextra -O2 -o pty-bridge pty-bridge.c -lutil
 
 ```sh
 pty-bridge [-e CHAR|--escape CHAR] [-p "<match> <reply>"]... \
-           [--pty /dev/pts/3] [command [arg ...]]
+           [--term pty|serial|auto] [--pty /dev/pts/3] [command [arg ...]]
 ```
 
 ## Overview
@@ -122,8 +122,9 @@ raw cannot wedge the tool, while a live, still-printing command is
 waited for as long as it keeps talking. The phase runs before any
 terminal change and before the signal handlers are installed, which
 is safe: the local tty has not been touched yet (nothing to restore
-on a kill), and SIGWINCH needs no handling (the first sentinel firing
-always pushes the window size).
+on a kill), and SIGWINCH needs no handling either (on a serial channel
+the first prompt pushes the window size; on a pty channel the size was
+seeded at `openpty()`).
 
 ## Raw mode on both ends
 
@@ -202,6 +203,52 @@ nothing is left to match (no `-p` at all, or every normal pattern fired
 and no sentinel exists), recording stops for good and forwarding runs
 with zero matching overhead.
 
+## Terminal type (`--term`)
+
+Channels differ in what they can carry to the remote end on their own.
+An `ssh -tt` channel allocates its pty out of band: it relays window
+changes and exports TERM itself, so the bridge only pushes the size
+into its own pty and the channel does the rest. A `virsh console`
+channel carries a *serial console*: there is no out-of-band
+window-change and no environment -- the guest learns the window size
+and TERM only by being *told*, i.e. by typing shell commands into the
+session.
+
+`--term MODE` selects how the bridge syncs, so no command name is
+special-cased:
+
+- **`pty`** -- the channel passes window changes through (ssh-like).
+  On every `SIGWINCH` the size is pushed into the pty with
+  `TIOCSWINSZ` (`push_winsize()`); the kernel delivers SIGWINCH to the
+  process group behind the pty, which is what a real terminal does.
+  In `--pty` mode the size is also pushed once at attach: the pty
+  keeps whatever size the previous session left behind, and this fixes
+  a stale window without a manual resize. TERM is the channel's own
+  business; nothing is typed.
+- **`serial`** -- the channel is a serial console (virsh-console-like).
+  On every resize the size is typed into the session as
+  `stty rows <R> columns <C>` (below); the **first** push also exports
+  TERM, once, in the same line:
+  `export TERM=<TERM>; stty rows <R> columns <C>`. The window size
+  changes constantly, TERM is set once at init and never again. TERM
+  comes from the environment at startup and is only exported when it
+  is a plain terminfo-style name (letters, digits, `+ - . _`): the
+  value is spliced into a shell command, so anything carrying spaces,
+  quotes or metacharacters is refused -- with a warning -- instead of
+  sent.
+- **`auto`** (default) -- one recognition rule only: a COMMAND of the
+  form `virsh console ...` means `serial`, everything else (`ssh -tt`,
+  `--pty`, any other command) means `pty`. The rule is deliberately
+  narrow: `sudo virsh console vm` or `virsh -c URI console vm` do not
+  match it and need an explicit `--term serial`.
+
+Typing into the session is only safe while the peer sits at a prompt,
+which is what the sentinel pattern marks. A `serial` setting without a
+sentinel has no prompt boundary to type at, so it warns on stderr and
+falls back to the `pty` method: window size via `TIOCSWINSZ`, no TERM
+export. `auto` can hit the same fallback -- a `virsh console` command
+without a sentinel -- and warns the same way.
+
 ## The sentinel pattern (empty reply)
 
 A `-p` whose reply is empty -- `-p ']# '` matches the prompt `]# ` -- is
@@ -219,25 +266,34 @@ peer sits waiting for the user to type. Sentinels behave differently:
   any other pty output arrives (a command is running, output is
   streaming).
 
+On a serial channel (`--term serial`) the sentinel doubles as the
+injection point for the window size and the one-time TERM export: both
+are typed in only while the peer sits at the prompt (see below).
+
 ### Window size synchronization
 
-The remote shell does not know about local window resizes (the master
-holder cannot forward `TIOCSWINSZ` for us), so `pty-bridge` pushes the
-size by typing shell commands into the session:
+The size is pushed every time the local window changes (`SIGWINCH`
+sets `winch_pending`), but *how* depends on the terminal type
+(`--term` above):
 
-```
-stty rows <R> columns <C>\r
-```
+- **pty**: pushed straight into the pty with `TIOCSWINSZ`
+  (`push_winsize()`); the kernel delivers SIGWINCH to the foreground
+  process group behind the pty, which is what a real terminal does on
+  a resize. In `--pty` mode the size is also pushed once at attach, so
+  a pty left at a stale size comes up correct (see the terminal-type
+  section above). No typing is involved.
+- **serial**: the guest cannot be reached by any ioctl, so the size
+  must be typed in as a shell command,
 
-typed in the open -- wrapping it in `stty -echo` / `stty echo` would
-leave a visible `stty -echo` string on screen anyway, so the resize is
-simply shown to the user.
+  ```
+  stty rows <R> columns <C>\r
+  ```
 
-Without a sentinel there is no prompt boundary to wait for, so the
-size is pushed straight into the pty with `TIOCSWINSZ`
-(`push_winsize()`): the kernel delivers SIGWINCH to the foreground
-process group behind the pty, which is what a real terminal does on a
-resize. No stty typing is involved.
+  typed in the open -- wrapping it in `stty -echo` / `stty echo` would
+  leave a visible `stty -echo` string on screen anyway, so the resize
+  is simply shown to the user. The **first** push carries the one-time
+  TERM export in the same line:
+  `export TERM=<TERM>; stty rows <R> columns <C>`.
 
 The trigger logic:
 
@@ -252,17 +308,20 @@ The trigger logic:
    and can never slip in between the flag check and the wait. This is
    the classic race-free signal/wait pattern (no self-pipe needed).
 4. At the top of every loop iteration, if the window changed:
-   - **no sentinel configured**: push the size into the pty via
-     `TIOCSWINSZ` immediately.
-   - **sentinel configured, sitting at the prompt**
-     (`sentinel_seen == 1`): push the size immediately.
-   - **sentinel configured, output streaming** (`sentinel_seen == 0`,
-     a command is running): do *not* inject `stty` into whatever is
-     running; `winch_pending` survives, and the next sentinel firing
-     (the next prompt) pushes the size instead.
-5. `winch_pending` starts **set** (it is set at parse time when a
-   sentinel is configured), so the very first prompt triggers the
-   initial size push -- the "attach and fix the window" case.
+   - **pty**: push the size via `TIOCSWINSZ` immediately.
+   - **serial, sitting at the prompt** (`sentinel_seen == 1`): push
+     immediately.
+   - **serial, output streaming** (`sentinel_seen == 0`, a command is
+     running): do *not* inject `stty` into whatever is running;
+     `winch_pending` survives, and the next sentinel firing (the next
+     prompt) pushes the size instead.
+5. `winch_pending` starts **set on a serial channel** (it is set once
+   the terminal type resolves to serial), so the very first prompt
+   triggers the initial push -- the TERM export and the window size
+   together, the "attach and fix the terminal" case. On a pty channel
+   the size travels out of band (COMMAND mode seeds it at `openpty()`;
+   `--pty` mode pushes it once at attach), so nothing is pending at
+   startup.
 
 ## Testing
 
@@ -277,15 +336,22 @@ Covered: bidirectional forwarding, raw passthrough of `^C`/`^D`, escape
 exit (default and custom, exit status 0), bytes before the escape still
 forwarded, the detach newline, refusals (stdin not a tty, non-tty
 `--pty` path, `--pty` combined with COMMAND, malformed pattern, two
-sentinels), pattern auto-reply including one-shot semantics and
-exact-tail matching, sentinel behavior (retiring stale patterns,
-typing nothing), the full window-size state machine (initial push,
-immediate push at the prompt, deferred push after streaming output),
-and COMMAND mode (bytes relayed to the child, early output forwarded
-while the pty is still canonical, local window size inherited by the
-new pty, child exit closing the bridge, exec failure, the silent-timeout
-fallback, escape detaching without strays). The test compiles the
-binary itself if it is missing and exits non-zero on any failure:
+sentinels, invalid `--term` mode), pattern auto-reply including one-shot
+semantics and exact-tail matching, sentinel behavior (retiring stale
+patterns, typing nothing), the window-size state machine for both
+terminal types (`--term serial`: TERM export + stty push at the first
+prompt, immediate push at the prompt, deferred push after streaming
+output, plain stty when TERM is unset or unusable in the environment,
+fallback to `TIOCSWINSZ` without a sentinel, with the warning; pty: an
+initial size push at attach fixing a stale pty, `TIOCSWINSZ` sync while
+a sentinel is configured), auto-detection (a `virsh console` command,
+played by a fake `virsh`, switches to the serial method; any other
+command stays pty), and COMMAND mode (bytes relayed to the child, early
+output forwarded while the pty is still canonical, local window size
+inherited by the new pty, child exit closing the bridge, exec failure,
+the silent-timeout fallback, escape detaching without strays). The test
+compiles the binary itself if it is missing and exits non-zero on any
+failure:
 
 ```sh
 python3 tests/test_pty_bridge.py
