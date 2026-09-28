@@ -30,7 +30,7 @@
  *
  * Build: gcc -Wall -O2 -o pty-bridge pty-bridge.c -lutil
  * Usage: ./pty-bridge [-e CHAR|--escape CHAR] [-p "login: root"] \
- *                     [--term pty|serial|auto] [--pty /dev/pts/3] \
+ *                     [--term pty|serial|auto] [-v] [--pty /dev/pts/3] \
  *                     [command [arg ...]]
  */
 #define _GNU_SOURCE
@@ -40,6 +40,7 @@
 #include <poll.h>
 #include <pty.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,9 @@
 #include <unistd.h>
 
 static const char *prog = "pty-bridge";
+
+/* -v: narrate what the bridge does, one line per event, on stderr */
+static int verbose;
 
 static int tty_fd = -1;          /* local terminal (stdin) */
 static struct termios saved_tio; /* original terminal settings */
@@ -185,6 +189,81 @@ static void die_errno(const char *what)
     exit(2);
 }
 
+/*
+ * Verbose log (-v), one line per event, prefixed with the program name
+ * like every other stderr message. The session runs with the local
+ * terminal in raw mode, where a bare "\n" only moves down a line: end
+ * the line with "\r\n" when stderr is that terminal, with a plain "\n"
+ * when it is a file or pipe.
+ */
+static void vlog(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!verbose)
+        return;
+    fprintf(stderr, "%s: ", prog);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputs(isatty(STDERR_FILENO) ? "\r\n" : "\n", stderr);
+}
+
+/* -v trace line: the verbose guard lives here, not at every call site */
+#define VLOG(...) do { if (verbose) vlog(__VA_ARGS__); } while (0)
+
+/*
+ * Render n bytes for a verbose log line: printable characters and
+ * UTF-8 pass through, the whitespace that would garble the line shows
+ * as \r \n \t, anything else invisible or line-breaking as \xHH.
+ * Cycles through a few static buffers so a single vlog can
+ * interpolate several of these. Long data is cut short: log lines
+ * stay readable.
+ */
+#define ESC_MAX 512
+static const char *esc_bytes(const void *data, size_t n)
+{
+    static char bufs[3][ESC_MAX * 4 + 8];
+    static unsigned rot;
+    const unsigned char *s = data;
+    char *p = bufs[rot];
+    const char *ret = bufs[rot];
+    int trunc = n > ESC_MAX;
+
+    rot = (rot + 1) % 3;
+    if (trunc)
+        n = ESC_MAX;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = s[i];
+
+        if (c == '\r') {
+            *p++ = '\\'; *p++ = 'r';
+        } else if (c == '\n') {
+            *p++ = '\\'; *p++ = 'n';
+        } else if (c == '\t') {
+            *p++ = '\\'; *p++ = 't';
+        } else if (c == '\\') {
+            *p++ = '\\'; *p++ = '\\';
+        } else if (c >= 0x20 && c != 0x7f) {
+            *p++ = (char)c;
+        } else {
+            sprintf(p, "\\x%02x", c);
+            p += 4;
+        }
+    }
+    if (trunc) {
+        *p++ = '.'; *p++ = '.'; *p++ = '.';
+    }
+    *p = '\0';
+    return ret;
+}
+
+/* esc_bytes() for a NUL-terminated string */
+static const char *esc_str(const char *s)
+{
+    return esc_bytes(s, strlen(s));
+}
+
 static void usage(FILE *out)
 {
     fprintf(out,
@@ -219,6 +298,10 @@ static void usage(FILE *out)
         "                      applies -- and TERM is exported with the first push.\n"
         "                      auto (default): a \"virsh console\" COMMAND means serial,\n"
         "                      anything else pty.\n"
+        "  -v, --verbose       trace what happens on stderr: the parsed patterns, the\n"
+        "                      output tail checked against them, which pattern matched\n"
+        "                      and what was typed, window-size pushes, and the COMMAND\n"
+        "                      startup phase before the pty goes raw\n"
         "  -h, --help          show this help\n"
         "\n"
         "Options must precede COMMAND; use -- to separate them.\n"
@@ -413,6 +496,7 @@ static void sync_winsize(int pty_fd)
         snprintf(cmd, sizeof(cmd), "stty rows %u columns %u\r",
                  (unsigned)ws.ws_row, (unsigned)ws.ws_col);
     }
+    VLOG("typing '%s'", esc_str(cmd));
     write_all(pty_fd, (const unsigned char *)cmd, strlen(cmd));
 }
 
@@ -427,8 +511,10 @@ static void push_winsize(int pty_fd)
 {
     struct winsize ws;
 
-    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
         ioctl(pty_fd, TIOCSWINSZ, &ws);
+        VLOG("window size %dx%d pushed via TIOCSWINSZ", ws.ws_row, ws.ws_col);
+    }
 }
 
 /*
@@ -448,8 +534,21 @@ static void push_winsize(int pty_fd)
  */
 static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
 {
-    if (nr_unused == 0 && !has_sentinel)
-        return; /* nothing left to match: never record again */
+    size_t chunk_len = n; /* the read size, for the log; n is trimmed below */
+
+    if (nr_unused == 0 && !has_sentinel) {
+        /*
+         * Nothing left to match: never record again. With -v say so
+         * once -- every later chunk would repeat it.
+         */
+        static int logged_done;
+
+        if (!logged_done) {
+            logged_done = 1;
+            VLOG("nothing left to match; recording stopped");
+        }
+        return;
+    }
 
     /*
      * New pty output means we are no longer sitting at the command
@@ -475,13 +574,17 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
         outlen = max_mlen;
     }
 
+    VLOG("pty: %zu bytes, tail: '%s'", chunk_len, esc_bytes(outbuf, outlen));
+
     for (int j = 0; j < nr_patterns; j++) {
         struct pattern *p = &patterns[j];
 
         if (p->used || p->mlen == 0 || p->mlen > outlen)
             continue;
-        if (memcmp(outbuf + outlen - p->mlen, p->match, p->mlen) != 0)
+        if (memcmp(outbuf + outlen - p->mlen, p->match, p->mlen) != 0) {
+            VLOG("  pattern[%d] '%s': no match", j, esc_str(p->match));
             continue;
+        }
 
         if (p->sentinel) {
             /*
@@ -493,7 +596,9 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
              * as the local window changed.
              */
             sentinel_seen = 1;
+            VLOG("  pattern[%d] sentinel '%s': matched", j, esc_str(p->match));
             if (nr_unused) {
+                VLOG("  retiring %d unused pattern(s)", nr_unused);
                 for (int k = 0; k < nr_patterns; k++)
                     if (!patterns[k].sentinel)
                         patterns[k].used = 1;
@@ -506,6 +611,8 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
         } else {
             p->used = 1;
             nr_unused--;
+            VLOG("  pattern[%d] '%s': matched, typing reply '%s' + Enter",
+                 j, esc_str(p->match), esc_str(p->response));
             write_all(pty_fd, (const unsigned char *)p->response, strlen(p->response));
             write_all(pty_fd, (const unsigned char *)"\r", 1);
         }
@@ -620,12 +727,17 @@ static void wait_pty_raw(int pty_fd)
             n = read(pty_fd, buf, sizeof(buf));
             if (n <= 0)
                 return; /* command gone: let the main loop see it too */
+            VLOG("startup: %zu bytes, pty not raw yet", (size_t)n);
             write_all(STDOUT_FILENO, buf, (size_t)n);
             deadline = time(NULL) + STARTUP_TIMEOUT_SEC;
         }
-        if (time(NULL) >= deadline)
+        if (time(NULL) >= deadline) {
+            VLOG("startup: pty not raw after %d s; proceeding",
+                 STARTUP_TIMEOUT_SEC);
             return; /* silent for a while and still not raw: proceed */
+        }
     }
+    VLOG("startup: pty is raw; pattern matching armed");
 }
 
 int main(int argc, char **argv)
@@ -644,6 +756,7 @@ int main(int argc, char **argv)
         { "escape",  required_argument, NULL, 'e' },
         { "pattern", required_argument, NULL, 'p' },
         { "term",    required_argument, NULL, 't' },
+        { "verbose", no_argument,       NULL, 'v' },
         { "pty",     required_argument, NULL, 1 },
         { "help",    no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 },
@@ -654,7 +767,7 @@ int main(int argc, char **argv)
      * channel command's own options (e.g. "ssh -tt host") belong to
      * the command, not to us.
      */
-    while ((opt = getopt_long(argc, argv, "+e:p:t:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+e:p:t:vh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'e':
             escape_str = optarg;
@@ -710,6 +823,9 @@ int main(int argc, char **argv)
         case 1: /* --pty */
             pty_path = optarg;
             break;
+        case 'v':
+            verbose = 1;
+            break;
         case 'h':
             usage(stdout);
             return 0;
@@ -727,6 +843,21 @@ int main(int argc, char **argv)
     } else if (optind >= argc) {
         usage(stderr);
         return 2;
+    }
+
+    /* -v: show the patterns as parsed, before anything runs */
+    if (verbose) {
+        for (int i = 0; i < nr_patterns; i++) {
+            struct pattern *p = &patterns[i];
+
+            if (p->sentinel)
+                VLOG("pattern[%d] sentinel: match '%s'", i, esc_str(p->match));
+            else
+                VLOG("pattern[%d] match '%s' -> reply '%s'",
+                     i, esc_str(p->match), esc_str(p->response));
+        }
+        if (nr_patterns)
+            VLOG("matching the last %zu bytes of pty output", max_mlen);
     }
 
     /* resolve the terminal type now that the command (if any) is known */

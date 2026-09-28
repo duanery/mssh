@@ -613,6 +613,34 @@ check('unusable TERM: plain stty only',
 os.write(m27, b'\x1d')
 wait_pid_exit(pid27)
 
+# 32) -v: the verbose trace on stderr -- the parsed patterns, the tail
+#     checked against them, which pattern matched and what it typed,
+#     and the sentinel firing
+tm15, ts15 = pty.openpty()
+pid28, m28 = pty.fork()
+if pid28 == 0:
+    os.execv(BIN, ['pty-bridge', '-v', '-p', 'login: root', '-p', ']# ',
+                   '--pty', os.ttyname(ts15)])
+time.sleep(0.3)
+got = read_avail(m28, 0.5)
+check('-v: patterns logged at startup',
+      b"pattern[0] match 'login: ' -> reply 'root'" in got and
+      b"pattern[1] sentinel: match ']# '" in got, repr(got))
+os.write(tm15, b'noise\nlogin: ')
+got = read_avail(m28, 1.0)
+check('-v: match and reply traced',
+      b"pattern[0] 'login: ': matched, typing reply 'root' + Enter" in got,
+      repr(got))
+os.write(tm15, b'\nfoo')
+got = read_avail(m28, 0.5)
+check('-v: no match traced', b"pattern[1] ']# ': no match" in got, repr(got))
+os.write(tm15, b']# ')
+got = read_avail(m28, 0.5)
+check('-v: sentinel traced', b"pattern[1] sentinel ']# ': matched" in got,
+      repr(got))
+os.write(m28, b'\x1d')
+wait_pid_exit(pid28)
+
 print('---')
 print('FAILURES:', failures)
 sys.exit(1 if failures else 0)
