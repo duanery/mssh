@@ -371,21 +371,29 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
  * The child becomes a session leader with the slave as its
  * controlling terminal and stdin/stdout/stderr, then execs the
  * command: the command (ssh, virsh console, ...) is the channel that
- * carries the remote pty. The new pty starts with the local window
- * size, so e.g. "ssh -tt" relays the right size to the remote pty
- * from the start.
+ * carries the remote pty.
+ *
+ * The new pty is created as a copy of the local terminal: the same
+ * termios settings and the same window size, so the command -- and
+ * the remote pty it reaches -- sees the terminal the user is sitting
+ * at from the very first byte. "ssh -tt" for instance relays that
+ * window size to the remote pty right away, and the local line
+ * settings are what the command would have seen without a bridge.
  */
 static int open_command_pty(char **cmd, pid_t *pidp)
 {
     int master, slave;
-    struct winsize ws;
+    struct termios tio, *tiop = NULL;
+    struct winsize ws, *wsp = NULL;
     pid_t pid;
 
-    if (openpty(&master, &slave, NULL, NULL, NULL) < 0)
-        die_errno("openpty");
-
+    if (tcgetattr(STDIN_FILENO, &tio) == 0)
+        tiop = &tio;
     if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
-        ioctl(master, TIOCSWINSZ, &ws);
+        wsp = &ws;
+
+    if (openpty(&master, &slave, NULL, tiop, wsp) < 0)
+        die_errno("openpty");
 
     pid = fork();
     if (pid < 0)
