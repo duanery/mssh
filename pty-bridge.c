@@ -11,7 +11,7 @@
  * pty-bridge bridges the local terminal and that pty:
  *
  *   keyboard (stdin) --> pty      (local terminal in raw mode)
- *   screen  (stdout) <-- pty      (pty in raw mode too)
+ *   screen  (stdout) <-- pty      (the pty's mode is its owner's business)
  *
  * so the user operates the remote pty as if it were local. The pty
  * is either a local one (--pty /dev/pts/N) or a remote one reached
@@ -125,11 +125,10 @@ static unsigned char outbuf[OUTBUF_SIZE];
 static size_t outlen;
 
 /*
- * How long the COMMAND-mode startup phase waits for the channel
- * command to put the pty into raw mode before giving up. The timeout
- * counts silent time: every pty output restarts it.
+ * How long the serial-console startup phase waits for the console to
+ * answer an Enter before it types another one.
  */
-#define STARTUP_TIMEOUT_SEC 3
+#define ENTER_RETRY_SEC 3
 
 /* Restore original terminal settings. Must be called before exit. */
 static void restore_tty(void)
@@ -300,8 +299,9 @@ static void usage(FILE *out)
         "                      anything else pty.\n"
         "  -v, --verbose       trace what happens on stderr: the parsed patterns, the\n"
         "                      output tail checked against them, which pattern matched\n"
-        "                      and what was typed, window-size pushes, and the COMMAND\n"
-        "                      startup phase before the pty goes raw\n"
+        "                      and what was typed, window-size pushes, and the\n"
+        "                      serial-console startup phase (Enter pokes until the\n"
+        "                      console answers)\n"
         "  -h, --help          show this help\n"
         "\n"
         "Options must precede COMMAND; use -- to separate them.\n"
@@ -693,51 +693,80 @@ static int pty_is_raw(int fd)
 }
 
 /*
- * COMMAND-mode startup phase: the channel command (ssh, virsh console,
- * ...) puts the pty into raw mode itself, but it may print -- a banner,
- * an error message -- before doing so. While the pty is still
- * canonical its line discipline converts \n to \r\n, so the local
- * terminal must stay cooked and the output is simply forwarded.
+ * Wake the serial console: wait for it to connect, then poke it into
+ * showing its prompt. Runs for a COMMAND mode channel resolved to the
+ * serial method -- a "virsh console" command picked by auto, or an
+ * explicit --term serial. A pty channel (ssh) does not run this at
+ * all: its prompts are printed immediately, unasked, and the main
+ * loop matches them wherever they appear.
  *
- * This keeps polling the pty: reading the master and printing whatever
- * arrives, until the pty turns raw or the command exits. Every output
- * restarts the timeout, so the phase only gives up (and lets the main
- * loop proceed anyway) once the command has been silent for
- * STARTUP_TIMEOUT_SEC -- a command that is alive is expected to go
- * raw, and its output keeps the wait alive with it. The caller then
- * switches the local terminal to raw and enters the normal forwarding
- * loop.
+ * A serial console is silent until spoken to: the guest behind it is
+ * already sitting waiting for input, and its prompt appears only in
+ * answer to an Enter. So:
  *
- * Called before any terminal change and before the signal handlers are
- * installed -- which is fine: the local tty has not been touched yet,
- * so a kill needs no restore, and SIGWINCH needs no handling either
- * (a serial channel pushes the size at the first prompt; a pty channel
- * had its size seeded at openpty()).
+ * 1. Before the pty is raw, the channel command may print -- a
+ *    banner, an error message -- through the still-canonical line
+ *    discipline (\n -> \r\n), which is what the still-cooked local
+ *    terminal needs for display; whatever arrives is printed and
+ *    nothing else. No matching happens here (a serial console prints
+ *    no input prompt on its own), and there is no timeout: the
+ *    command is expected to put the pty into raw mode once it has
+ *    connected (virsh console does), and if it exits instead the
+ *    phase returns and lets the main loop see the exit. The poll
+ *    wakes every 100ms to notice the switch.
+ * 2. Once the pty is raw the console is connected -- and possibly
+ *    silent at its prompt. An Enter is typed, then the pty is
+ *    polled: as soon as it answers, or the command exits, the phase
+ *    returns WITHOUT reading -- the output is the main loop's, where
+ *    the patterns match it. While the console stays silent the Enter
+ *    is repeated every ENTER_RETRY_SEC: a virtual machine may take a
+ *    while to reach its getty, and a silent console has nothing
+ *    better to offer than another Enter.
+ *
+ * Called before any terminal change and before the signal handlers
+ * are installed -- which is fine: the local tty has not been touched
+ * yet, so a kill needs no restore, and SIGWINCH needs no handling
+ * either (the size is pushed at the first prompt -- the prompt the
+ * typed Enter is there to produce).
  */
-static void wait_pty_raw(int pty_fd)
+static void wake_serial_console(int pty_fd)
 {
     struct pollfd pfd = { .fd = pty_fd, .events = POLLIN };
     struct timespec ts = { .tv_nsec = 100 * 1000 * 1000 }; /* 100ms */
-    time_t deadline = time(NULL) + STARTUP_TIMEOUT_SEC;
     unsigned char buf[4096];
     ssize_t n;
 
     while (!pty_is_raw(pty_fd)) {
-        if (ppoll(&pfd, 1, &ts, NULL) > 0 && (pfd.revents & POLLIN)) {
+        if (ppoll(&pfd, 1, &ts, NULL) > 0 &&
+            (pfd.revents & (POLLIN | POLLERR | POLLHUP))) {
             n = read(pty_fd, buf, sizeof(buf));
-            if (n <= 0)
+            if (n <= 0) {
+                VLOG("startup: command gone");
                 return; /* command gone: let the main loop see it too */
+            }
             VLOG("startup: %zu bytes, pty not raw yet", (size_t)n);
             write_all(STDOUT_FILENO, buf, (size_t)n);
-            deadline = time(NULL) + STARTUP_TIMEOUT_SEC;
-        }
-        if (time(NULL) >= deadline) {
-            VLOG("startup: pty not raw after %d s; proceeding",
-                 STARTUP_TIMEOUT_SEC);
-            return; /* silent for a while and still not raw: proceed */
         }
     }
-    VLOG("startup: pty is raw; pattern matching armed");
+
+    /* the console is connected; poke it and wait for it to answer */
+    write_all(pty_fd, (const unsigned char *)"\r", 1);
+    VLOG("startup: pty is raw; typed Enter");
+    ts.tv_sec = ENTER_RETRY_SEC;
+    ts.tv_nsec = 0;
+    for (;;) {
+        if (ppoll(&pfd, 1, &ts, NULL) > 0 &&
+            (pfd.revents & (POLLIN | POLLERR | POLLHUP))) {
+            if (pfd.revents & POLLIN)
+                VLOG("startup: console responded");
+            else
+                VLOG("startup: command gone");
+            return; /* the main loop reads the output, or sees the exit */
+        }
+        write_all(pty_fd, (const unsigned char *)"\r", 1);
+        VLOG("startup: console silent for %d s; typed Enter again",
+             ENTER_RETRY_SEC);
+    }
 }
 
 int main(int argc, char **argv)
@@ -908,11 +937,16 @@ int main(int argc, char **argv)
         pty_fd = open_command_pty(argv + optind, &child_pid);
 
         /*
-         * COMMAND mode: forward the command's early output while the
-         * local terminal is still cooked, until the command puts the
-         * pty into raw mode.
+         * Serial channel -- a "virsh console" command picked by auto,
+         * or an explicit --term serial; both carry a console that is
+         * silent until spoken to: wait for it to connect (the command
+         * puts the pty into raw mode) and poke it into showing its
+         * prompt. A pty channel (ssh) gets neither: its prompts are
+         * printed immediately, and the main loop matches them wherever
+         * they appear.
          */
-        wait_pty_raw(pty_fd);
+        if (term_serial)
+            wake_serial_console(pty_fd);
     }
 
     /* save the original local terminal settings, for restore on exit */
@@ -942,21 +976,6 @@ int main(int argc, char **argv)
         die_errno("tcsetattr");
 
     /*
-     * Set the pty to raw too -- only in --pty mode: in COMMAND mode
-     * the channel command owns the pty settings and puts it into raw
-     * mode itself (which the startup phase above waits for).
-     */
-    if (pty_path) {
-        if (tcgetattr(pty_fd, &raw) < 0)
-            die_errno("tcgetattr(pts)");
-        cfmakeraw(&raw);
-        raw.c_cc[VMIN] = 1;
-        raw.c_cc[VTIME] = 0;
-        if (tcsetattr(pty_fd, TCSANOW, &raw) < 0)
-            die_errno("tcsetattr(pts)");
-    }
-
-    /*
      * --pty mode: the attached pty keeps whatever size the previous
      * session left behind, and nothing carries the local size to it
      * out of band -- push it once now, so attaching fixes a stale
@@ -965,8 +984,19 @@ int main(int argc, char **argv)
     if (pty_path && !term_serial)
         push_winsize(pty_fd);
 
-    /* simulate pressing Enter so the shell behind the pty prints a fresh prompt */
-    write_all(pty_fd, (const unsigned char *)"\r", 1);
+    /*
+     * --pty mode: simulate pressing Enter so the session behind the
+     * pty prints a fresh prompt -- it may have sat at its prompt since
+     * long before the attach, silent, where no pattern could see it. A
+     * COMMAND channel must NOT get it here: a serial console was
+     * already poked by its startup phase (Enter, retried until it
+     * answered), and a pty channel prints its prompts immediately -- a
+     * bare "\r" would only wait in the input queue to be consumed as
+     * an empty answer by the first prompt (the ssh host-key
+     * confirmation, typically).
+     */
+    if (pty_path)
+        write_all(pty_fd, (const unsigned char *)"\r", 1);
 
     /* main loop: forward both directions */
     for (;;) {

@@ -28,6 +28,26 @@ def set_winsize(master_fd, rows, cols):
     fcntl.ioctl(master_fd, TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 
 
+def open_target():
+    """Create the target pty the way the session behind it would have
+    it: raw, configured for byte relaying. --pty attaches to a working
+    session and must not touch its settings, so the tests provide the
+    working session."""
+    m, s = pty.openpty()
+    attrs = termios.tcgetattr(s)
+    iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attrs
+    iflag &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK |
+               termios.ISTRIP | termios.IXON)
+    oflag &= ~termios.OPOST
+    lflag &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN |
+               termios.ISIG)
+    cc[termios.VMIN] = 1
+    cc[termios.VTIME] = 0
+    termios.tcsetattr(s, termios.TCSANOW,
+                      [iflag, oflag, cflag, lflag, ispeed, ospeed, cc])
+    return m, s
+
+
 def check(name, cond, detail=''):
     global failures
     print(('PASS' if cond else 'FAIL'), name, '' if cond else detail)
@@ -74,7 +94,7 @@ def build():
 build()
 
 # --- the pty given to pty_bridge as its /dev/pts/N argument ---
-target_master, target_slave = pty.openpty()
+target_master, target_slave = open_target()
 target_name = os.ttyname(target_slave)
 
 # --- spawn pty_bridge under its own pty, so stdin is a controlling terminal ---
@@ -150,7 +170,7 @@ status = wait_pid_exit(pid4)
 check('pts closed -> exit', status is not None and os.WIFEXITED(status), repr(status))
 
 # 9) alternate escape character (-e ^a = 0x01)
-tm2, ts2 = pty.openpty()
+tm2, ts2 = open_target()
 pid5, m5 = pty.fork()
 if pid5 == 0:
     os.execv(BIN, ['pty-bridge', '-e', '^a', '--pty', os.ttyname(ts2)])
@@ -162,7 +182,7 @@ ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('custom escape ^a exits', ok, repr(status))
 
 # 10) -p pattern: prefix appearing in the output auto-types the reply + Enter
-tm3, ts3 = pty.openpty()
+tm3, ts3 = open_target()
 pid6, m6 = pty.fork()
 if pid6 == 0:
     os.execv(BIN, ['pty-bridge', '-p', 'login: root', '--pty', os.ttyname(ts3)])
@@ -179,7 +199,7 @@ got = read_avail(tm3, 0.5)
 check('pattern used only once', got == b'', repr(got))
 
 # 11b) exact tail compare: prompt without its trailing space never fires
-tm5, ts5 = pty.openpty()
+tm5, ts5 = open_target()
 pid9, m9 = pty.fork()
 if pid9 == 0:
     os.execv(BIN, ['pty-bridge', '-p', 'login: root', '--pty', os.ttyname(ts5)])
@@ -209,7 +229,7 @@ ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('escape exits after pattern fire', ok, repr(status))
 
 # 13) two patterns, each used once, in either order of arrival
-tm4, ts4 = pty.openpty()
+tm4, ts4 = open_target()
 pid7, m7 = pty.fork()
 if pid7 == 0:
     os.execv(BIN, ['pty-bridge', '-p', 'login: root', '-p', 'Password: secret',
@@ -230,7 +250,7 @@ check('escape exits with patterns', ok, repr(status))
 
 # 13b) the reply keeps the spaces it has: -p ']# cd /tmp' runs "cd /tmp"
 #      (the split is at the FIRST space, so only the prompt is cut short)
-tm9, ts9 = pty.openpty()
+tm9, ts9 = open_target()
 pid19, m19 = pty.fork()
 if pid19 == 0:
     os.execv(BIN, ['pty-bridge', '-p', ']# cd /tmp', '--pty', os.ttyname(ts9)])
@@ -270,7 +290,7 @@ check('second sentinel refused', ok, repr(status))
 #     command prompt, types nothing by itself, retires every still-unused
 #     pattern, and the first window-size push carries the one-time TERM
 #     export together with the stty command
-tm6, ts6 = pty.openpty()
+tm6, ts6 = open_target()
 pid10, m10 = pty.fork()
 if pid10 == 0:
     os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', 'login: root',
@@ -279,7 +299,8 @@ if pid10 == 0:
 set_winsize(m10, 40, 100)
 time.sleep(0.3)
 read_avail(m10, 0.3)
-read_avail(tm6, 0.3)    # drain the simulated startup Enter
+got = read_avail(tm6, 0.3)    # serial keeps the simulated startup Enter
+check('serial: startup Enter typed', got == b'\r', repr(got))
 # shell prompt arrives first (session was already logged in):
 # sentinel fires, types nothing but the TERM export + stty sequence, and
 # the login prompt is retired
@@ -318,7 +339,7 @@ check('escape exits after sentinel', ok, repr(status))
 
 # 17) normal flow: login prompt fires first, then the sentinel stops
 #     auto-replying and initializes TERM plus the window size
-tm7, ts7 = pty.openpty()
+tm7, ts7 = open_target()
 pid11, m11 = pty.fork()
 if pid11 == 0:
     os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', 'login: root',
@@ -341,11 +362,11 @@ ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('escape exits after login+sentinel', ok, repr(status))
 
 # 18) command mode: without --pty a new pty is created and COMMAND runs
-#     on its slave as the channel to a (remote) pty. The command may
-#     print BEFORE it puts the pty into raw mode: that early output is
-#     forwarded while the pty (and the local terminal) are still
-#     canonical, so its \n arrives display-ready. Once the command sets
-#     the pty raw, normal raw forwarding starts.
+#     on its slave as the channel to a (remote) pty. A pty channel gets
+#     no startup phase: the main loop starts immediately, and output the
+#     command prints before it puts the pty into raw mode (its \n already
+#     expanded to \r\n by the still-canonical line discipline) is
+#     forwarded and displayed just the same.
 pid13, m13 = pty.fork()
 if pid13 == 0:
     os.execv(BIN, ['pty-bridge', '--',
@@ -362,19 +383,18 @@ status = wait_pid_exit(pid13)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('command mode escape exits 0', ok, repr(status))
 
-# 18b) a command that never sets the pty raw and never exits: the
-#      startup phase gives up after its timeout and normal forwarding
-#      (including the escape character) starts anyway
+# 18b) a command that never sets the pty raw and never exits: a pty
+#      channel has no startup phase to get stuck in, so forwarding
+#      (including the escape character) starts immediately
 pid13b, m13b = pty.fork()
 if pid13b == 0:
     os.execv(BIN, ['pty-bridge', '--', 'cat'])
-time.sleep(0.3)
+time.sleep(0.5)
 read_avail(m13b, 0.3)
-time.sleep(3.5)          # let the startup timeout expire
 os.write(m13b, b'\x1d')
-status = wait_pid_exit(pid13b, 8.0)
+status = wait_pid_exit(pid13b)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-check('startup timeout falls back to forwarding', ok, repr(status))
+check('no startup wait for a pty channel', ok, repr(status))
 
 # 19) the channel command starts with the local window size (so e.g.
 #     ssh -tt relays the right size to the remote pty from the start)
@@ -440,7 +460,7 @@ check('--pty with COMMAND refused', ok, repr(status) + ' out=' + repr(out))
 # 23) without a sentinel there is no prompt boundary to wait for: a
 #     window resize is pushed into the pty via TIOCSWINSZ (SIGWINCH to
 #     the session behind it), no stty typing involved
-tm8, ts8 = pty.openpty()
+tm8, ts8 = open_target()
 pid18, m18 = pty.fork()
 if pid18 == 0:
     os.execv(BIN, ['pty-bridge', '--pty', os.ttyname(ts8)])
@@ -462,7 +482,7 @@ check('no sentinel: escape still exits', ok, repr(status))
 # 24) --term serial without a sentinel: no prompt boundary to type at,
 #     so it warns and falls back to the pty method (TIOCSWINSZ, nothing
 #     typed)
-tm10, ts10 = pty.openpty()
+tm10, ts10 = open_target()
 pid20, m20 = pty.fork()
 if pid20 == 0:
     os.execv(BIN, ['pty-bridge', '--term', 'serial', '--pty', os.ttyname(ts10)])
@@ -483,15 +503,20 @@ wait_pid_exit(pid20)
 
 # 25) auto: a "virsh console" COMMAND is recognized as a serial console
 #     channel -- with a sentinel, the first prompt carries the one-time
-#     TERM export and the stty push (a fake virsh plays the channel)
+#     TERM export and the stty push (a fake virsh plays the channel).
+#     The fake plays the console faithfully: raw as soon as it connects,
+#     and silent -- the prompt appears only in answer to an Enter
+#     (swallowed_enters: how many Enters the console ignores first)
 with tempfile.TemporaryDirectory() as tmpdir:
+    def fake_virsh_script(swallowed_enters):
+        s = '#!/bin/sh\nstty raw -echo\n'
+        s += 'dd bs=1 count=1 >/dev/null 2>&1\n' * swallowed_enters
+        s += "printf ']# '\ncat\n"
+        return s
+
     fake_virsh = os.path.join(tmpdir, 'virsh')
     with open(fake_virsh, 'w') as f:
-        f.write('#!/bin/sh\n'
-                'stty raw -echo\n'
-                'printf \'Connected to domain vm7\\n\'\n'
-                'printf \']# \'\n'
-                'cat\n')
+        f.write(fake_virsh_script(1))
     os.chmod(fake_virsh, 0o755)
     pid21, m21 = pty.fork()
     if pid21 == 0:
@@ -504,6 +529,28 @@ with tempfile.TemporaryDirectory() as tmpdir:
           b'export TERM=xterm-test; stty rows 25 columns 75\r' in got, repr(got))
     os.write(m21, b'\x1d')
     wait_pid_exit(pid21)
+
+    # 25b) the console ignores the first Enter: the startup phase types
+    #      another one after ENTER_RETRY_SEC, and only then does the
+    #      prompt (and with it the serial method) come out. The fake
+    #      lives in a subdirectory: auto detection matches on the
+    #      command's basename, which must stay "virsh"
+    os.makedirs(os.path.join(tmpdir, 'v2'))
+    fake_virsh2 = os.path.join(tmpdir, 'v2', 'virsh')
+    with open(fake_virsh2, 'w') as f:
+        f.write(fake_virsh_script(2))
+    os.chmod(fake_virsh2, 0o755)
+    pid21b, m21b = pty.fork()
+    if pid21b == 0:
+        os.execve(BIN, ['pty-bridge', '-p', ']# ', '--',
+                        fake_virsh2, 'console', 'vm7'],
+                  dict(os.environ, TERM='xterm-test'))
+    set_winsize(m21b, 25, 75)
+    got = read_avail(m21b, 5.0)
+    check('serial: silent console poked again after the retry',
+          b'export TERM=xterm-test; stty rows 25 columns 75\r' in got, repr(got))
+    os.write(m21b, b'\x1d')
+    wait_pid_exit(pid21b)
 
 # 26) auto: any other COMMAND stays on the pty method -- the sentinel
 #     types nothing, the size goes through TIOCSWINSZ
@@ -520,7 +567,7 @@ wait_pid_exit(pid22)
 
 # 27) --term pty with a sentinel: the sentinel still retires patterns
 #     and types nothing, but resizes go through TIOCSWINSZ, not stty
-tm11, ts11 = pty.openpty()
+tm11, ts11 = open_target()
 pid23, m23 = pty.fork()
 if pid23 == 0:
     os.execv(BIN, ['pty-bridge', '--term', 'pty', '-p', ']# ',
@@ -553,7 +600,7 @@ check('invalid --term refused', ok, repr(status))
 
 # 29) --term serial with no TERM in the environment: nothing to export,
 #     the first push is a plain stty line
-tm12, ts12 = pty.openpty()
+tm12, ts12 = open_target()
 pid25, m25 = pty.fork()
 if pid25 == 0:
     env = {k: v for k, v in os.environ.items() if k != 'TERM'}
@@ -573,7 +620,7 @@ wait_pid_exit(pid25)
 # 30) --pty + sentinel (auto -> pty method): the local size is pushed
 #     once at attach, so a pty left at a stale size by the previous
 #     session is fixed without any local resize; nothing is typed
-tm13, ts13 = pty.openpty()
+tm13, ts13 = open_target()
 set_winsize(tm13, 24, 80)   # stale size left behind by the last session
 pid26, m26 = pty.fork()
 if pid26 == 0:
@@ -594,7 +641,7 @@ wait_pid_exit(pid26)
 # 31) --term serial with a TERM that would not survive the shell
 #     command line it is spliced into (metacharacters): the export is
 #     refused with a warning, the first push is a plain stty line
-tm14, ts14 = pty.openpty()
+tm14, ts14 = open_target()
 pid27, m27 = pty.fork()
 if pid27 == 0:
     os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ',
@@ -616,7 +663,7 @@ wait_pid_exit(pid27)
 # 32) -v: the verbose trace on stderr -- the parsed patterns, the tail
 #     checked against them, which pattern matched and what it typed,
 #     and the sentinel firing
-tm15, ts15 = pty.openpty()
+tm15, ts15 = open_target()
 pid28, m28 = pty.fork()
 if pid28 == 0:
     os.execv(BIN, ['pty-bridge', '-v', '-p', 'login: root', '-p', ']# ',
@@ -640,6 +687,53 @@ check('-v: sentinel traced', b"pattern[1] sentinel ']# ': matched" in got,
       repr(got))
 os.write(m28, b'\x1d')
 wait_pid_exit(pid28)
+
+# 33) a pty channel gets no startup phase and no Enter: a prompt the
+#     channel command prints before it puts the pty into raw mode (an
+#     ssh host-key confirmation, say) is matched by the main loop as
+#     soon as it arrives, and the reply is the first line the prompt
+#     sees
+pid29, m29 = pty.fork()
+if pid29 == 0:
+    os.execv(BIN, ['pty-bridge', '-p', '(yes/no/[fingerprint])? yes', '--',
+                   'sh', '-c',
+                   'printf "Are you sure you want to continue connecting '
+                   '(yes/no/[fingerprint])? "; read ans; '
+                   'printf "[%s]" "$ans"; stty raw -echo; cat'])
+got = read_avail(m29, 2.0)
+check('pre-raw prompt matched and reply typed', b'[yes]' in got,
+      repr(got))
+os.write(m29, b'ok\n')
+got = read_avail(m29, 1.0)
+check('session continues after the match', b'ok' in got, repr(got))
+os.write(m29, b'\x1d')
+status = wait_pid_exit(pid29)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('escape exits after the match', ok, repr(status))
+
+# 34) --pty attaches to a working session and must leave the pty's
+#     settings alone: the session behind it owns them (a shell there
+#     would lose its echo and editing if the bridge forced raw mode
+#     onto the pty). Attach to a cooked pty and verify the settings
+#     survive the attach unchanged
+tma, tsa = pty.openpty()
+attrs = termios.tcgetattr(tsa)
+attrs[3] |= termios.ICANON | termios.ECHO   # cooked: the session's choice
+termios.tcsetattr(tsa, termios.TCSANOW, attrs)
+before = termios.tcgetattr(tma)
+pid30, m30 = pty.fork()
+if pid30 == 0:
+    os.execv(BIN, ['pty-bridge', '--pty', os.ttyname(tsa)])
+time.sleep(0.5)
+read_avail(m30, 0.3)
+read_avail(tma, 0.3)    # the simulated Enter
+after = termios.tcgetattr(tma)
+check('--pty leaves the pty settings alone', after == before,
+      'before=%r after=%r' % (before, after))
+os.write(m30, b'\x1d')
+status = wait_pid_exit(pid30)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('--pty: escape still exits', ok, repr(status))
 
 print('---')
 print('FAILURES:', failures)

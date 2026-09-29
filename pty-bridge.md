@@ -97,41 +97,73 @@ own options (`ssh -tt`, `virsh console vm`) belong to the command,
 not to `pty-bridge`. Use `--` to separate them explicitly. COMMAND
 together with `--pty` is refused.
 
-### Waiting for the command's raw mode (`wait_pty_raw()`)
+### Waking the serial console (`wake_serial_console()`)
 
-The channel command usually puts the pty into raw mode itself, but it
-may print -- a banner, an error message -- before doing so. Output
-produced while the pty is still canonical goes through the line
-discipline (`\n` -> `\r\n`), which is exactly what a still-cooked
-local terminal needs for display; output produced after the switch is
-raw-relayed and needs a raw local terminal. So the startup sequence
-is:
+`wake_serial_console()` runs for one case only: a COMMAND mode channel
+resolved to the serial method -- a `virsh console` command picked by
+auto, or an explicit `--term serial`. The two channel kinds differ in
+who speaks first:
 
-1. the command is forked (`open_command_pty()`),
-2. `wait_pty_raw()` polls the master, printing whatever arrives while
-   the local terminal is still cooked, until the pty turns raw -- the
-   termios settings are shared between master and slave, so the
-   check is simply `!(c_lflag & ICANON)` from the master side,
-3. then the local terminal is switched to raw and the normal
-   forwarding loop starts.
+- a **pty channel** (ssh) prints its prompts immediately, unasked --
+  there is nothing to wait for, so it gets no startup phase at all and
+  the main loop starts right away, matching the prompts wherever they
+  appear (including before the channel puts the pty into raw mode),
+- a **serial console** is silent until spoken to: the guest behind it
+  is already sitting waiting for input, and its prompt appears only in
+  answer to an Enter.
 
-The wait gives up (and proceeds with the main loop) when the command
-exits (`EIO`), or after `STARTUP_TIMEOUT_SEC` (3s) of *silence* --
-every output restarts that timeout -- so a command that never goes
-raw cannot wedge the tool, while a live, still-printing command is
-waited for as long as it keeps talking. The phase runs before any
-terminal change and before the signal handlers are installed, which
-is safe: the local tty has not been touched yet (nothing to restore
-on a kill), and SIGWINCH needs no handling either (on a serial channel
-the first prompt pushes the window size; on a pty channel the size was
-seeded at `openpty()`).
+For the serial console the phase has two parts:
+
+1. **Before the pty is raw** the channel command may print -- a
+   banner, an error message -- through the still-canonical line
+   discipline (`\n` -> `\r\n`), which is exactly what the still-cooked
+   local terminal needs for display. Whatever arrives is printed, and
+   nothing else: no pattern matching happens here, because a serial
+   console prints no input prompt on its own. There is no timeout: the
+   command is expected to put the pty into raw mode once it has
+   connected (`virsh console` does), and if it exits instead the phase
+   returns and lets the main loop see the exit. The poll wakes every
+   100ms to notice the switch -- the termios settings are shared
+   between master and slave, so the check is simply
+   `!(c_lflag & ICANON)` from the master side.
+2. **Once the pty is raw** the console is connected -- and possibly
+   silent at its prompt. An Enter is typed to make the prompt appear,
+   then the pty is polled: as soon as it answers (or the command
+   exits) the phase returns *without reading* -- the output is the
+   main loop's, where the patterns match it. While the console stays
+   silent the Enter is repeated every `ENTER_RETRY_SEC` (3s): a
+   virtual machine may take a while to reach its getty, and a silent
+   console has nothing better to offer than another Enter.
+
+The phase runs before any terminal change and before the signal
+handlers are installed, which is safe: the local tty has not been
+touched yet (nothing to restore on a kill), and SIGWINCH needs no
+handling either (the size is pushed at the first prompt -- the prompt
+the typed Enter is there to produce).
+
+### The simulated Enter
+
+Which end gets an unsolicited Enter typed into it, and when:
+
+- **`--pty`**: one Enter right before the main loop. A session may
+  have sat at its prompt since long before the attach -- the Enter
+  makes the prompt (re)appear where the patterns can see it.
+- **Serial channel COMMAND**: typed inside the startup phase, right
+  after the console is connected (the pty turns raw), and repeated
+  while it stays silent -- see the section above.
+- **Pty-channel COMMAND**: never. Its prompts are printed immediately
+  and matched by the main loop as they come; a bare `\r` would only
+  wait in the input queue to be consumed as an empty answer by the
+  first prompt the command prints -- the ssh host-key confirmation,
+  typically, which then fails with "Host key verification failed."
+  before anyone can answer.
 
 ## Raw mode on both ends
 
 The local tty is put into raw mode with `cfmakeraw()` (`VMIN=1,
-VTIME=0`) -- in COMMAND mode only after `wait_pty_raw()` saw the
-command switch the pty, see above. The original local settings are
-saved and restored on every exit path -- including `SIGINT`,
+VTIME=0`) -- in COMMAND mode after the serial-console startup phase,
+if any (above). The original local settings are saved and restored on
+every exit path -- including `SIGINT`,
 `SIGTERM` and `SIGHUP`, whose handler restores the tty and then
 re-raises the signal so the process dies with its true status.
 
@@ -139,14 +171,13 @@ re-raises the signal so the process dies with its true status.
   escape sequences) is forwarded byte-by-byte; the line discipline does
   no editing, no signals, no echo. The remote session already provides
   line editing and echo, so doing it twice would double every character.
-- **Pty raw**: bytes written into the pty are not mangled or echoed
-  back by the line discipline. Without this, every byte would come
-  back twice (once as our input, once as the echo), and `^C` would
-  never reach the remote shell as a byte. In COMMAND mode the pty is
-  *not* set raw by `pty-bridge`: the channel command owns the pty
-  settings and switches it itself (`wait_pty_raw()` waits for that),
-  and the relayed remote output already carries its own `\r\n`. In
-  `--pty` mode the existing pty is switched to raw by `pty-bridge`.
+- **Pty untouched**: `pty-bridge` never changes the pty's termios.
+  In COMMAND mode the channel command owns the settings and puts the
+  pty into raw mode itself (`wake_serial_console()` waits for that); in
+  `--pty` mode the session behind the pty owns them -- the pty was
+  already configured for its own use, and forcing raw mode under a
+  running shell would break its echo and line editing. Whatever
+  settings the owner chose are what the bridge works with.
 
 ## The forwarding loop
 
@@ -328,7 +359,8 @@ The trigger logic:
 `tests/test_pty_bridge.py` drives the real binary through real ptys
 (no mocking of the terminal layer):
 
-- a target pty plays the remote session (`pty.openpty()`),
+- a target pty plays the remote session (`open_target()`: a pty
+  pre-configured raw, the way the session behind it would have it),
 - `pty.fork()` gives the tool its own controlling terminal,
 - the test writes on one master and asserts on the other.
 
@@ -346,10 +378,16 @@ fallback to `TIOCSWINSZ` without a sentinel, with the warning; pty: an
 initial size push at attach fixing a stale pty, `TIOCSWINSZ` sync while
 a sentinel is configured), auto-detection (a `virsh console` command,
 played by a fake `virsh`, switches to the serial method; any other
-command stays pty), and COMMAND mode (bytes relayed to the child, early
-output forwarded while the pty is still canonical, local window size
-inherited by the new pty, child exit closing the bridge, exec failure,
-the silent-timeout fallback, escape detaching without strays). The test
+command stays pty), the serial-console startup phase (a fake `virsh`
+that answers the first Enter, and one that stays silent through it and
+answers the retried Enter), and COMMAND mode (bytes relayed to the
+child, a prompt printed before the channel goes raw matched by the
+main loop, with the simulated Enter typed for `--pty` only and
+withheld from pty channels, the attached pty's settings left untouched
+in `--pty` mode, local window size inherited by the new pty, child
+exit closing the bridge, exec failure, escape detaching without
+strays), and the verbose trace (`-v`: parsed patterns, matching tail,
+matches and replies on stderr). The test
 compiles the binary itself if it is missing and exits non-zero on any
 failure:
 
