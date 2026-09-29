@@ -79,7 +79,7 @@ static struct pattern patterns[MAX_PATTERNS];
 static int nr_patterns;
 static int nr_unused;     /* non-sentinel patterns still waiting to fire */
 static int has_sentinel;  /* a sentinel pattern is configured */
-static size_t max_mlen;   /* record size: longest pattern match text */
+static size_t max_mlen;   /* record window size, see record_and_check() */
 
 /*
  * Sentinel pattern: a pattern with an EMPTY response (e.g. -p "]# ").
@@ -528,9 +528,10 @@ static void push_winsize(int pty_fd)
  *
  * Recording continues while any pattern can still match: without -p it
  * never starts, after every normal pattern has fired only a sentinel
- * keeps it alive. The record size is fixed at parse time: only the
- * last max_mlen bytes (the longest pattern) are ever kept -- enough to
- * see any prompt as the output tail.
+ * keeps it alive. The record size starts at the longest pattern text;
+ * once the sentinel fires -- every normal pattern retired or used by
+ * then -- it shrinks to the sentinel's own length, the only pattern
+ * still able to match.
  */
 static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
 {
@@ -603,6 +604,14 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
                     if (!patterns[k].sentinel)
                         patterns[k].used = 1;
                 nr_unused = 0;
+            }
+            /*
+             * Only the sentinel can still match: shrink the record
+             * window to its own length.
+             */
+            if (max_mlen > p->mlen) {
+                max_mlen = p->mlen;
+                VLOG("  recording trimmed to the last %zu bytes", max_mlen);
             }
             if (winch_pending) {
                 winch_pending = 0;

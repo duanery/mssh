@@ -685,6 +685,14 @@ os.write(tm15, b']# ')
 got = read_avail(m28, 0.5)
 check('-v: sentinel traced', b"pattern[1] sentinel ']# ': matched" in got,
       repr(got))
+check('-v: record window trimmed at the sentinel',
+      b'recording trimmed to the last 3 bytes' in got, repr(got))
+# the sentinel still fires with the trimmed window: a longer chunk
+# contributes only its tail
+os.write(tm15, b'\nfoo]# ')
+got = read_avail(m28, 0.5)
+check('-v: sentinel still fires with the trimmed window',
+      b"pattern[1] sentinel ']# ': matched" in got, repr(got))
 os.write(m28, b'\x1d')
 wait_pid_exit(pid28)
 

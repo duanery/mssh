@@ -229,10 +229,12 @@ Matching rules:
 `record_and_check()` keeps only the last `max_mlen` bytes of pty output,
 where `max_mlen` is the longest pattern text, computed once at parse
 time. Since matching is tail-only, this window is all that can ever be
-needed; chunks longer than the window contribute only their tail. When
-nothing is left to match (no `-p` at all, or every normal pattern fired
-and no sentinel exists), recording stops for good and forwarding runs
-with zero matching overhead.
+needed; chunks longer than the window contribute only their tail. Once
+the sentinel fires, the window shrinks to the sentinel's own length:
+every normal pattern is retired or used by then, so only it can still
+match. When nothing is left to match (no `-p` at all, or every normal
+pattern fired and no sentinel exists), recording stops for good and
+forwarding runs with zero matching overhead.
 
 ## Terminal type (`--term`)
 
