@@ -714,21 +714,34 @@ static int pty_is_raw(int fd)
  * answer to an Enter. So:
  *
  * 1. Before the pty is raw, the channel command may print -- a
- *    banner, an error message -- through the still-canonical line
- *    discipline (\n -> \r\n), which is what the still-cooked local
- *    terminal needs for display; whatever arrives is printed and
- *    nothing else. No matching happens here (a serial console prints
- *    no input prompt on its own), and there is no timeout: the
- *    command is expected to put the pty into raw mode once it has
- *    connected (virsh console does), and if it exits instead the
- *    phase returns and lets the main loop see the exit. The poll
- *    wakes every 100ms to notice the switch.
+ *    banner, an error message, a question it asks on the way up --
+ *    through the still-canonical line discipline (\n -> \r\n), which
+ *    is what the still-cooked local terminal needs for display.
+ *    Whatever arrives is printed and recorded: record_and_check()
+ *    runs here too, so a prompt printed before the switch is matched
+ *    and answered during the wait, exactly as the main loop would
+ *    match it. There is no timeout: the command is expected to put
+ *    the pty into raw mode once it has connected (virsh console
+ *    does), and if it exits instead the phase returns and lets the
+ *    main loop see the exit. The poll wakes every 100ms to notice
+ *    the switch.
  * 2. Once the pty is raw the console is connected -- and possibly
- *    silent at its prompt. An Enter is typed, then the pty is
- *    polled: as soon as it answers, or the command exits, the phase
- *    returns WITHOUT reading -- the output is the main loop's, where
- *    the patterns match it. While the console stays silent the Enter
- *    is repeated every ENTER_RETRY_SEC: a virtual machine may take a
+ *    silent at its prompt. An Enter is typed, but only after the
+ *    poll has seen raw mode, never before: the command may make its
+ *    switch with tcsetattr(slave, TCSAFLUSH, &raw) -- not every
+ *    command uses the flushing variant, but nothing promises one
+ *    that doesn't -- and TCSAFLUSH discards input that is still
+ *    pending unread, so a \r typed into the still-canonical pty
+ *    would be dropped by the very switch that was supposed to
+ *    deliver it to the console. (A pattern reply typed in 1 runs
+ *    no such risk: it answers a prompt the command is reading
+ *    right then, so it is consumed before the switch happens;
+ *    the Enter has no reader until the console is connected, and
+ *    must wait.) After the Enter the pty is polled: as soon as
+ *    it answers, or the command exits, the phase returns WITHOUT
+ *    reading -- the output is the main loop's, where the patterns
+ *    match it. While the console stays silent the Enter is
+ *    repeated every ENTER_RETRY_SEC: a virtual machine may take a
  *    while to reach its getty, and a silent console has nothing
  *    better to offer than another Enter.
  *
@@ -755,6 +768,7 @@ static void wake_serial_console(int pty_fd)
             }
             VLOG("startup: %zu bytes, pty not raw yet", (size_t)n);
             write_all(STDOUT_FILENO, buf, (size_t)n);
+            record_and_check(pty_fd, buf, (size_t)n);
         }
     }
 

@@ -552,6 +552,65 @@ with tempfile.TemporaryDirectory() as tmpdir:
     os.write(m21b, b'\x1d')
     wait_pid_exit(pid21b)
 
+    # 25c) the Enter waits for the raw switch: a command MAY make the
+    #      switch with tcsetattr(TCSAFLUSH) -- the flushing variant,
+    #      which discards input still pending unread -- and nothing
+    #      promises it doesn't, so an Enter typed before the switch
+    #      could be dropped by the very switch meant to deliver it.
+    #      This fake console plays exactly that variant: it inspects
+    #      its input queue right before switching (after a grace
+    #      period, so an overeager bridge has every chance to type),
+    #      and nothing may be sitting there. The byte it reads right
+    #      after the switch is the poke Enter, and the prompt it
+    #      prints in answer completes the serial flow (sentinel fires
+    #      -> TERM export + stty push, relayed back)
+    fake_console = os.path.join(tmpdir, 'console.py')
+    with open(fake_console, 'w') as f:
+        f.write(r'''
+import fcntl, os, struct, sys, termios, time
+
+time.sleep(0.5)              # the grace period before the switch
+n = struct.unpack('i', fcntl.ioctl(0, termios.TIOCINQ,
+                                   struct.pack('i', 0)))[0]
+print('pre-raw input: %d byte(s)' % n)   # still canonical: \n -> \r\n
+sys.stdout.flush()
+a = termios.tcgetattr(0)
+a[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK |
+          termios.ISTRIP | termios.IXON)
+a[1] &= ~termios.OPOST
+a[2] &= ~(termios.CSIZE | termios.PARENB)
+a[2] |= termios.CS8
+a[3] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG)
+a[6][termios.VMIN] = 1
+a[6][termios.VTIME] = 0
+termios.tcsetattr(0, termios.TCSAFLUSH, a)   # the switch: flushes input
+os.read(0, 1)                # the poke Enter -- typed after the switch
+sys.stdout.write(']# ')      # the prompt, in answer to the Enter
+sys.stdout.flush()
+while True:                  # relay, the way a console would
+    b = os.read(0, 4096)
+    if not b:
+        break
+    os.write(1, b)
+''')
+    pid21c, m21c = pty.fork()
+    if pid21c == 0:
+        os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ', '--',
+                        sys.executable, fake_console],
+                  dict(os.environ, TERM='xterm-test'))
+    set_winsize(m21c, 26, 76)
+    got = read_avail(m21c, 3.0)
+    check('serial: nothing typed before the raw switch',
+          b'pre-raw input: 0 byte' in got, repr(got))
+    check('serial: Enter after the switch, prompt answered',
+          b'export TERM=xterm-test; stty rows 26 columns 76\r' in got,
+          repr(got))
+    os.write(m21c, b'\x1d')
+    status = wait_pid_exit(pid21c)
+    ok = status is not None and os.WIFEXITED(status) and \
+        os.WEXITSTATUS(status) == 0
+    check('serial: escape exits after the TCSAFLUSH switch', ok, repr(status))
+
 # 26) auto: any other COMMAND stays on the pty method -- the sentinel
 #     types nothing, the size goes through TIOCSWINSZ
 pid22, m22 = pty.fork()
@@ -718,6 +777,34 @@ os.write(m29, b'\x1d')
 status = wait_pid_exit(pid29)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('escape exits after the match', ok, repr(status))
+
+# 33b) the serial counterpart of 33: the startup phase waits for the
+#      pty to go raw, and the output of that wait runs through
+#      record_and_check too -- a prompt the channel command prints
+#      before the switch (a login it wants handled before connecting)
+#      is matched during the wait, and the reply is typed into the
+#      still-canonical pty. The reply is safe where an early Enter
+#      would not be, even against a TCSAFLUSH-style switch: the
+#      command is reading the reply right then, so it is consumed
+#      before the switch happens
+pid29b, m29b = pty.fork()
+if pid29b == 0:
+    os.execve(BIN, ['pty-bridge', '--term', 'serial',
+                    '-p', 'login: root', '-p', ']# ', '--',
+                    'sh', '-c',
+                    'printf "login: "; read ans; printf "[%s]" "$ans"; '
+                    'stty raw -echo; printf "]# "; cat'],
+              dict(os.environ, TERM='xterm-test'))
+set_winsize(m29b, 27, 77)
+got = read_avail(m29b, 3.0)
+check('serial: pre-raw prompt matched during the wait',
+      b'[root]' in got, repr(got))
+check('serial: TERM+winsize pushed after the switch',
+      b'export TERM=xterm-test; stty rows 27 columns 77\r' in got, repr(got))
+os.write(m29b, b'\x1d')
+status = wait_pid_exit(pid29b)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('serial: escape exits after pre-raw match', ok, repr(status))
 
 # 34) --pty attaches to a working session and must leave the pty's
 #     settings alone: the session behind it owns them (a shell there

@@ -115,25 +115,38 @@ who speaks first:
 For the serial console the phase has two parts:
 
 1. **Before the pty is raw** the channel command may print -- a
-   banner, an error message -- through the still-canonical line
-   discipline (`\n` -> `\r\n`), which is exactly what the still-cooked
-   local terminal needs for display. Whatever arrives is printed, and
-   nothing else: no pattern matching happens here, because a serial
-   console prints no input prompt on its own. There is no timeout: the
-   command is expected to put the pty into raw mode once it has
-   connected (`virsh console` does), and if it exits instead the phase
-   returns and lets the main loop see the exit. The poll wakes every
-   100ms to notice the switch -- the termios settings are shared
-   between master and slave, so the check is simply
-   `!(c_lflag & ICANON)` from the master side.
+   banner, an error message, a question it asks on the way up --
+   through the still-canonical line discipline (`\n` -> `\r\n`), which
+   is exactly what the still-cooked local terminal needs for display.
+   Whatever arrives is printed and recorded: `record_and_check()`
+   runs here too, so a prompt the command prints before the switch
+   (a confirmation it wants before connecting) is matched and its
+   reply typed during the wait, exactly as the main loop would match
+   it. There is no timeout: the command is expected to put the pty
+   into raw mode once it has connected (`virsh console` does), and if
+   it exits instead the phase returns and lets the main loop see the
+   exit. The poll wakes every 100ms to notice the switch -- the
+   termios settings are shared between master and slave, so the check
+   is simply `!(c_lflag & ICANON)` from the master side.
 2. **Once the pty is raw** the console is connected -- and possibly
    silent at its prompt. An Enter is typed to make the prompt appear,
-   then the pty is polled: as soon as it answers (or the command
-   exits) the phase returns *without reading* -- the output is the
-   main loop's, where the patterns match it. While the console stays
-   silent the Enter is repeated every `ENTER_RETRY_SEC` (3s): a
-   virtual machine may take a while to reach its getty, and a silent
-   console has nothing better to offer than another Enter.
+   but only after the switch is seen, never before: the command *may*
+   put the pty into raw mode with `tcsetattr(slave, TCSAFLUSH,
+   &raw)` -- not every command uses the flushing variant, but nothing
+   promises one that doesn't -- and `TCSAFLUSH` discards input that
+   is still pending unread, so a `\r` typed into the still-canonical
+   pty would be dropped by the very switch that was supposed to
+   deliver it to the console. (A pattern reply typed during the wait
+   is safe: it answers a prompt the command is reading right then, so
+   it is consumed before the switch; the Enter has no reader until
+   the console connects, so it must wait for the poll to see raw
+   mode.) Then the pty is polled:
+   as soon as it answers (or the command exits) the phase returns
+   *without reading* -- the output is the main loop's, where the
+   patterns match it. While the console stays silent the Enter is
+   repeated every `ENTER_RETRY_SEC` (3s): a virtual machine may take
+   a while to reach its getty, and a silent console has nothing
+   better to offer than another Enter.
 
 The phase runs before any terminal change and before the signal
 handlers are installed, which is safe: the local tty has not been
@@ -149,8 +162,10 @@ Which end gets an unsolicited Enter typed into it, and when:
   have sat at its prompt since long before the attach -- the Enter
   makes the prompt (re)appear where the patterns can see it.
 - **Serial channel COMMAND**: typed inside the startup phase, right
-  after the console is connected (the pty turns raw), and repeated
-  while it stays silent -- see the section above.
+  after the console is connected (the pty turns raw -- and not a
+  moment earlier: the switch may be a `TCSAFLUSH`, which would drop
+  an Enter typed before it; see above), and repeated while it stays
+  silent -- see the section above.
 - **Pty-channel COMMAND**: never. Its prompts are printed immediately
   and matched by the main loop as they come; a bare `\r` would only
   wait in the input queue to be consumed as an empty answer by the
@@ -382,7 +397,10 @@ a sentinel is configured), auto-detection (a `virsh console` command,
 played by a fake `virsh`, switches to the serial method; any other
 command stays pty), the serial-console startup phase (a fake `virsh`
 that answers the first Enter, and one that stays silent through it and
-answers the retried Enter), and COMMAND mode (bytes relayed to the
+answers the retried Enter; a prompt printed before the pty goes raw
+matched during the wait; a channel that switches with `TCSAFLUSH`
+receiving the Enter only after the switch), and COMMAND mode (bytes
+relayed to the
 child, a prompt printed before the channel goes raw matched by the
 main loop, with the simulated Enter typed for `--pty` only and
 withheld from pty channels, the attached pty's settings left untouched
