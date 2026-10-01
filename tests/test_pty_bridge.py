@@ -806,6 +806,141 @@ status = wait_pid_exit(pid29b)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('serial: escape exits after pre-raw match', ok, repr(status))
 
+# 33c) the command queue: a pattern with the sentinel's own match (its
+#      -p argument starts with the sentinel's, so the split at the
+#      first space yields the same match) is a COMMAND. The sentinel
+#      runs one per prompt and the first prompt with none left exits
+#      the bridge -- here the user's own flow: log in, run ls at the
+#      first prompt, and leave without touching the keyboard
+pid29c, m29c = pty.fork()
+if pid29c == 0:
+    os.execv(BIN, ['pty-bridge', '-p', 'login: root', '-p', 'Password: xx',
+                   '-p', ']# ', '-p', ']# ls', '--',
+                   'sh', '-c',
+                   'printf "login: "; read u; printf "Password: "; read pw; '
+                   'printf "welcome %s/%s\\n" "$u" "$pw"; '
+                   'printf "]# "; while IFS= read -r line; do '
+                   'printf "ran:%s\\n" "$line"; printf "]# "; done'])
+got = read_avail(m29c, 3.0)
+check('command queue: login answered, command ran',
+      b'welcome root/xx' in got and b'ran:ls' in got, repr(got))
+status = wait_pid_exit(pid29c)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('command queue: exits by itself once the command ran', ok, repr(status))
+
+# 33d) commands queue in -p order, one per prompt, and the prompt after
+#      the last one exits -- two prompts seen before any output of the
+#      second command would mean both were typed into one prompt
+pid29d, m29d = pty.fork()
+if pid29d == 0:
+    os.execv(BIN, ['pty-bridge', '-p', ']# ', '-p', ']# echo one',
+                   '-p', ']# echo two', '--',
+                   'sh', '-c',
+                   'printf "]# "; while IFS= read -r line; do '
+                   'printf "ran:%s\\n" "$line"; printf "]# "; done'])
+got = read_avail(m29d, 3.0)
+i1, i2 = got.find(b'ran:echo one'), got.find(b'ran:echo two')
+check('command queue: commands run in order',
+      i1 != -1 and i2 != -1 and i1 < i2, repr(got))
+status = wait_pid_exit(pid29d)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('command queue: two commands, self-exit', ok, repr(status))
+
+# 33e) the order of the -p arguments does not matter: a command listed
+#      before the sentinel is still a command (never fired on its own),
+#      as the -v trace of the parsed patterns shows
+pid29e, m29e = pty.fork()
+if pid29e == 0:
+    os.execv(BIN, ['pty-bridge', '-v', '-p', ']# echo one', '-p', ']# ', '--',
+                   'sh', '-c',
+                   'printf "]# "; while IFS= read -r line; do '
+                   'printf "ran:%s\\n" "$line"; printf "]# "; done'])
+got = read_avail(m29e, 3.0)
+check('command listed before the sentinel still queued',
+      b"pattern[0] match ']# ' -> command 'echo one'" in got and
+      b"typing command 'echo one' + Enter" in got and
+      b'ran:echo one' in got, repr(got))
+status = wait_pid_exit(pid29e)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('command before sentinel: self-exit', ok, repr(status))
+
+# 33f) the serial counterpart: a prompt gets at most one typed line, so
+#      the first prompt's turn goes to the window-size push (with the
+#      one-time TERM export), the commands follow one per prompt, and
+#      the prompt after the last command exits. The fake is a faithful
+#      console: silent until spoken to (the startup Enter makes it
+#      print), then it answers every line with ran:<line> and a prompt
+pid29f, m29f = pty.fork()
+if pid29f == 0:
+    os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ',
+                    '-p', ']# echo one', '--',
+                    'sh', '-c',
+                    'stty -icanon -echo min 1 time 0; '
+                    'while IFS= read -r line; do '
+                    'printf "ran:%s\\n" "$line"; printf "]# "; done'],
+              dict(os.environ, TERM='xterm-test'))
+set_winsize(m29f, 28, 78)
+got = read_avail(m29f, 5.0)
+ipush, icmd = got.find(b'ran:export TERM='), got.find(b'ran:echo one')
+check('serial: push takes the first prompt, the command the next',
+      ipush != -1 and icmd != -1 and ipush < icmd and
+      b'ran:export TERM=xterm-test; stty rows 28 columns 78\r' in got,
+      repr(got))
+status = wait_pid_exit(pid29f)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('serial: command queue exits by itself', ok, repr(status))
+
+# 33g) --pty mode command queue: the startup Enter makes the prompt
+#      appear, the sentinel fires and types the command, and the prompt
+#      after the command exits the bridge
+tm16, ts16 = open_target()
+pid31, m31 = pty.fork()
+if pid31 == 0:
+    os.execv(BIN, ['pty-bridge', '-p', ']# ', '-p', ']# ls',
+                   '--pty', os.ttyname(ts16)])
+time.sleep(0.3)
+read_avail(m31, 0.3)
+got = read_avail(tm16, 0.3)     # the simulated startup Enter
+check('--pty: startup Enter', got == b'\r', repr(got))
+os.write(tm16, b']# ')          # the prompt in answer to it
+got = read_avail(tm16)
+check('--pty: command typed at the prompt', got == b'ls\r', repr(got))
+os.write(tm16, b'ran:ls\r\n]# ')   # the command ran, the prompt is back
+status = wait_pid_exit(pid31)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('--pty: command queue exits by itself', ok, repr(status))
+
+# 33h) -s/--send is the explicit spelling: no match of its own, queued
+#      for the sentinel prompt in the order given, and the bridge exits
+#      once they all ran (the -v trace shows the parsed entries)
+pid32, m32 = pty.fork()
+if pid32 == 0:
+    os.execv(BIN, ['pty-bridge', '-v', '-p', ']# ', '-s', 'echo one',
+                   '-s', 'echo two', '--',
+                   'sh', '-c',
+                   'printf "]# "; while IFS= read -r line; do '
+                   'printf "ran:%s\\n" "$line"; printf "]# "; done'])
+got = read_avail(m32, 3.0)
+i1, i2 = got.find(b'ran:echo one'), got.find(b'ran:echo two')
+check('--send: commands run in order',
+      i1 != -1 and i2 != -1 and i1 < i2 and
+      b"pattern[1] -> command 'echo one'" in got, repr(got))
+status = wait_pid_exit(pid32)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('--send: exits by itself once they all ran', ok, repr(status))
+
+# 33i) --send without a sentinel: no prompt boundary to type at, so it
+#      is refused with exit code 2 and a message saying what is missing
+pid33, m33 = pty.fork()
+if pid33 == 0:
+    os.execv(BIN, ['pty-bridge', '-s', 'ls', '--pty', '/dev/pts/1'])
+out = read_avail(m33, 0.8)
+status = wait_pid_exit(pid33)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
+check('--send without a sentinel refused', ok, repr(status) + ' out=' + repr(out))
+check('--send without a sentinel message',
+      b'needs a sentinel pattern' in out, repr(out))
+
 # 34) --pty attaches to a working session and must leave the pty's
 #     settings alone: the session behind it owns them (a shell there
 #     would lose its echo and editing if the bridge forced raw mode

@@ -15,7 +15,8 @@ gcc -Wall -Wextra -O2 -o pty-bridge pty-bridge.c -lutil
 
 ```sh
 pty-bridge [-e CHAR|--escape CHAR] [-p "<match> <reply>"]... \
-           [--term pty|serial|auto] [--pty /dev/pts/3] [command [arg ...]]
+           [-s "<command>"]... [--term pty|serial|auto] \
+           [--pty /dev/pts/3] [command [arg ...]]
 ```
 
 ## Overview
@@ -56,7 +57,8 @@ Two ways to obtain "the pty":
   side closed, ssh dropped, ...), the slave is gone, the master read
   fails with `EIO` and `pty-bridge` exits by itself. On the escape
   key the master is closed, the child is given `SIGHUP` and reaped,
-  so no stray channel process survives the detach.
+  so no stray channel process survives the detach. The self-exit of
+  the command queue (patterns below) leaves the same way.
 
 The rest of the machinery (raw mode, escape, patterns, window size)
 works identically on both modes: it only sees the one bridge fd.
@@ -224,7 +226,10 @@ the **first** space; the separating space stays with the match, the
 reply keeps every space it has. Examples: `-p "login: root"` types the
 username at the `login: ` prompt (colon *and* trailing space included),
 `-p "Password: secret"` types the password, `-p "]# cd /tmp/"` runs
-the command once the `]# ` shell prompt shows up.
+the command once the `]# ` shell prompt shows up. A pattern whose
+match equals the sentinel's (below) is a *command*: the sentinel types
+it at the prompt -- the pattern never fires on its own. `-s/--send`
+says the same thing explicitly, with just the command.
 
 Matching rules:
 
@@ -246,8 +251,9 @@ where `max_mlen` is the longest pattern text, computed once at parse
 time. Since matching is tail-only, this window is all that can ever be
 needed; chunks longer than the window contribute only their tail. Once
 the sentinel fires, the window shrinks to the sentinel's own length:
-every normal pattern is retired or used by then, so only it can still
-match. When nothing is left to match (no `-p` at all, or every normal
+every normal pattern is retired or used by then, and commands share
+the sentinel's match, so that is the only match text still able to
+fire. When nothing is left to match (no `-p` at all, or every normal
 pattern fired and no sentinel exists), recording stops for good and
 forwarding runs with zero matching overhead.
 
@@ -306,7 +312,9 @@ peer sits waiting for the user to type. Sentinels behave differently:
 - At most **one** sentinel is allowed; a second one is refused.
 - When it fires, **nothing is typed** (no reply, no Enter).
 - Every still-unused normal pattern is marked used: once a shell prompt
-  showed up, `login:`/`Password:` prompts are stale and must never fire.
+  showed up, `login:`/`Password:` prompts are stale and must never
+  fire. Command patterns (below) are the exception -- they are *for*
+  the prompt, not stale because of it.
 - The sentinel itself **stays armed** -- the shell returns to its prompt
   after every command, so the sentinel can fire again and again.
 - `sentinel_seen` tracks whether we are *currently* at the prompt: set
@@ -317,6 +325,47 @@ peer sits waiting for the user to type. Sentinels behave differently:
 On a serial channel (`--term serial`) the sentinel doubles as the
 injection point for the window size and the one-time TERM export: both
 are typed in only while the peer sits at the prompt (see below).
+
+### Commands at the prompt, and the self-exit
+
+A non-sentinel pattern whose **match equals the sentinel's** is a
+*command*. Its `-p` argument starts with the sentinel's (`"]# ls"`
+beside `"]# "`), so the split at the first space leaves both with the
+same match -- the prompt -- and the reply is what to run there.
+`-s/--send CMD` says it explicitly: it queues CMD for the sentinel
+prompt with no match of its own -- no prompt prefix to repeat, and
+nothing implicit to remember. The two spellings share one queue, in
+command-line order; commands never fire on their own -- the sentinel
+types them:
+
+- one command per prompt, in `-p` order (a queue), and at most **one
+  line per prompt, the pending window-size push first**: a line typed
+  at a prompt comes back as exactly one prompt (the peer ran the line
+  and waits again), so two lines typed into one prompt would return
+  two prompts -- and the second would read as the completion of a
+  command that never ran. The same rule closes the main loop's
+  at-prompt push: with commands queued, a resize waits for the
+  sentinel's own firing instead of typing `stty` right after the
+  sentinel typed a command into the same prompt.
+- when the sentinel fires with the queue empty, every command has run
+  to completion -- that prompt is the last command's completion -- and
+  the bridge **exits by itself** (`quit_pending`), with the same
+  cleanup as the escape key: `\r\n` printed, the terminal restored, the
+  master closed, the channel child hung up and reaped.
+
+So `-p "login: root" -p "Password: xx" -p "]# " -s "ls" -- ssh -tt
+host` answers the login prompts, runs `ls` at the first shell prompt,
+and detaches when the prompt returns (`-p "]# ls"` queues the same
+command implicitly). `--send` without a sentinel is refused with exit
+code 2: there is no prompt boundary to type at, and the command would
+go in blind.
+
+The accounting rests on the sentinel's own premise: a prompt is the
+peer waiting for input, and input is what gets typed -- every prompt
+after a typed line is that line's completion. The startup Enter is
+deliberately not accounted: a serial console may swallow it (the
+startup phase retries it), and its answer is the first prompt the main
+loop sees either way.
 
 ### Window size synchronization
 
@@ -358,7 +407,8 @@ The trigger logic:
 4. At the top of every loop iteration, if the window changed:
    - **pty**: push the size via `TIOCSWINSZ` immediately.
    - **serial, sitting at the prompt** (`sentinel_seen == 1`): push
-     immediately.
+     immediately -- unless commands are queued, where the push waits
+     for the sentinel's own firing (one line per prompt, above).
    - **serial, output streaming** (`sentinel_seen == 0`, a command is
      running): do *not* inject `stty` into whatever is running;
      `winch_pending` survives, and the next sentinel firing (the next
@@ -406,8 +456,14 @@ main loop, with the simulated Enter typed for `--pty` only and
 withheld from pty channels, the attached pty's settings left untouched
 in `--pty` mode, local window size inherited by the new pty, child
 exit closing the bridge, exec failure, escape detaching without
-strays), and the verbose trace (`-v`: parsed patterns, matching tail,
-matches and replies on stderr). The test
+strays), the command queue (a login flow ended by a command run at the
+prompt with the bridge exiting by itself, commands running in `-p`
+order one per prompt, a command listed before the sentinel still
+queued -- traced by `-v` --, the serial ordering with the TERM+stty
+push taking the first prompt before any command, the `--pty`
+counterpart, and the explicit `-s/--send` spelling with its
+sentinel-less refusal), and the verbose trace (`-v`: parsed patterns,
+matching tail, matches and replies on stderr). The test
 compiles the binary itself if it is missing and exits non-zero on any
 failure:
 

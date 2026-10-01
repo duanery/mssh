@@ -19,19 +19,23 @@
  *
  * Beyond plain forwarding it also automates the procedure that comes
  * with a remote pty: -p patterns auto-type replies to login prompts,
- * and the remote side is kept in sync with the local terminal -- the
- * window size on every change, TERM once on a serial console (--term).
+ * commands -- queued with -s, or a -p pattern sharing the sentinel's
+ * match -- run at the prompt, one per prompt, until the queue is empty
+ * and the bridge exits by itself, and the remote side is kept in sync
+ * with the local terminal -- the window size on every change, TERM
+ * once on a serial console (--term).
  *
  * Requires stdin to be the controlling terminal of this process,
  * otherwise it exits immediately.
  *
- * Exit by pressing the escape character (default ^] = Ctrl-]),
- * or when the pty peer closes.
+ * Exit by pressing the escape character (default ^] = Ctrl-]), when
+ * the pty peer closes, or by itself once every queued command has
+ * run.
  *
  * Build: gcc -Wall -O2 -o pty-bridge pty-bridge.c -lutil
  * Usage: ./pty-bridge [-e CHAR|--escape CHAR] [-p "login: root"] \
- *                     [--term pty|serial|auto] [-v] [--pty /dev/pts/3] \
- *                     [command [arg ...]]
+ *                     [-s "uptime"] [--term pty|serial|auto] [-v] \
+ *                     [--pty /dev/pts/3] [command [arg ...]]
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -64,8 +68,12 @@ static int tio_saved = 0;
  * space; the separating space stays with the match. The reply is
  * everything after it, verbatim, so it may itself contain spaces:
  * "login: root" types the username at the "login: " prompt,
- * "Password: secret" the password, "]# cd /tmp/" runs the command
- * once the "]# " prompt shows up. Each pattern is used at most once.
+ * "Password: secret" the password, "]# ls" runs the command once the
+ * "]# " prompt shows up. Each pattern is used at most once. A pattern
+ * whose match equals the sentinel's is a COMMAND (see the sentinel
+ * comment below): not a stale login prompt to retire when the shell
+ * prompt shows up, but a line for the sentinel to type at that prompt.
+ * A --send option stores the same thing with no match of its own.
  */
 #define MAX_PATTERNS 16
 struct pattern {
@@ -73,12 +81,14 @@ struct pattern {
     size_t mlen;          /* strlen(match), computed once at parse time */
     const char *response; /* string auto-typed after a match */
     int sentinel;         /* empty response: the command prompt marker */
+    int command;          /* match equals the sentinel's: run at the prompt */
     int used;
 };
 static struct pattern patterns[MAX_PATTERNS];
 static int nr_patterns;
 static int nr_unused;     /* non-sentinel patterns still waiting to fire */
 static int has_sentinel;  /* a sentinel pattern is configured */
+static int has_commands;  /* commands are queued: exit once they all ran */
 static size_t max_mlen;   /* record window size, see record_and_check() */
 
 /*
@@ -86,9 +96,35 @@ static size_t max_mlen;   /* record window size, see record_and_check() */
  * It recognizes the shell command prompt -- the boundary where the
  * peer sits waiting for the user to type. It stays armed: every time
  * the prompt is seen again it can act again. When it fires nothing is
- * typed (no response, no Enter), and every still-unused normal pattern
- * is marked used (login prompts are stale once a shell prompt showed
- * up). winch_pending starts set on a serial channel -- it is set once
+ * typed for the sentinel itself, and every still-unused normal
+ * pattern is marked used (login prompts are stale once a shell prompt
+ * showed up) -- except COMMAND patterns, which the prompt is exactly
+ * for.
+ *
+ * A command pattern's match equals the sentinel's: its -p argument
+ * starts with the sentinel's ("]# ls" after "]# "), so the split at
+ * the first space leaves both with the same match. The -s/--send
+ * option queues commands the same way with no match of its own; both
+ * spellings share one queue, in command-line order. Each firing of
+ * the sentinel types at most one line
+ * -- the pending window-size push takes the turn first, else the next
+ * command. One line per prompt, never two: a line typed at a prompt
+ * comes back as exactly one prompt (the peer ran it and waits again),
+ * so two lines typed at one prompt would return two prompts, and the
+ * sentinel could not tell the second from the completion of a command
+ * that never ran. A firing with nothing left to type therefore means
+ * every queued command has run to completion: the session is over,
+ * and quit_pending has the bridge leave by itself, the same way the
+ * escape key leaves.
+ *
+ * The accounting rests on the sentinel's own premise: a prompt is the
+ * peer waiting for input, and input is what gets typed -- every
+ * prompt after a typed line is that line's completion. (The startup
+ * Enter is deliberately not accounted: a serial console may swallow
+ * it -- the startup phase retries it -- and its answer is the first
+ * prompt the main loop sees either way.)
+ *
+ * winch_pending starts set on a serial channel -- it is set once
  * the terminal type resolves to serial -- so the first time the prompt
  * is seen the window size is pushed, together with the one-time TERM
  * export; afterwards it is pushed only when the local window changed
@@ -98,6 +134,14 @@ static size_t max_mlen;   /* record window size, see record_and_check() */
  */
 static volatile sig_atomic_t winch_pending = 0;
 static int sentinel_seen = 0; /* currently sitting at the command prompt */
+
+/*
+ * The sentinel fired at a prompt with the command queue empty: every
+ * queued command has run to completion, the session is over. Set deep
+ * inside record_and_check(); the main loop -- and the serial startup
+ * phase -- honor it by leaving the way the escape key leaves.
+ */
+static int quit_pending;
 
 /*
  * Terminal type of the channel (--term): what the channel can carry
@@ -284,7 +328,13 @@ static void usage(FILE *out)
         "                      runs a command. Repeatable; each pattern fires at most\n"
         "                      once. An empty reply (e.g. \"]# \") is a sentinel for the\n"
         "                      command prompt: nothing is typed, and all still-unused\n"
-        "                      patterns are marked used\n"
+        "                      patterns are marked used. A pattern with the sentinel's\n"
+        "                      own match (e.g. \"]# ls\" beside \"]# \") queues a command\n"
+        "                      too -- see --send\n"
+        "  -s, --send CMD      queue CMD to be typed at the sentinel prompt, one per\n"
+        "                      prompt, in the order given; repeatable. The bridge exits\n"
+        "                      by itself once every queued command has run.\n"
+        "                      Needs a sentinel pattern (a -p with an empty reply)\n"
         "      --pty PATH      attach to an existing pty (e.g. /dev/pts/3) instead of\n"
         "                      running COMMAND on a new pty\n"
         "  -t, --term pty|serial|auto\n"
@@ -310,8 +360,10 @@ static void usage(FILE *out)
         "  %s --pty /dev/pts/3\n"
         "  %s -e ^q --pty /dev/pts/3     # exit with Ctrl-Q\n"
         "  %s -p \"login: root\" -p \"]# \" -- ssh -tt admin@10.0.0.1\n"
+        "  %s -p \"]# \" -s \"ls\" -- ssh -tt host   # run ls at the prompt,\n"
+        "                                                # exit when it returns\n"
         "  %s -p \"]# \" --term serial -- virsh console vm1\n",
-        prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog);
 }
 
 /*
@@ -529,9 +581,9 @@ static void push_winsize(int pty_fd)
  * Recording continues while any pattern can still match: without -p it
  * never starts, after every normal pattern has fired only a sentinel
  * keeps it alive. The record size starts at the longest pattern text;
- * once the sentinel fires -- every normal pattern retired or used by
- * then -- it shrinks to the sentinel's own length, the only pattern
- * still able to match.
+ * once the sentinel fires -- every normal pattern is retired or used
+ * by then, and commands share the sentinel's own match -- it shrinks
+ * to that length, the only match text still able to fire.
  */
 static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
 {
@@ -580,7 +632,12 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
     for (int j = 0; j < nr_patterns; j++) {
         struct pattern *p = &patterns[j];
 
-        if (p->used || p->mlen == 0 || p->mlen > outlen)
+        /*
+         * Commands never fire here: they share the sentinel's match,
+         * so it is the sentinel's firing below that types them, one
+         * per prompt, in order.
+         */
+        if (p->used || p->command || p->mlen == 0 || p->mlen > outlen)
             continue;
         if (memcmp(outbuf + outlen - p->mlen, p->match, p->mlen) != 0) {
             VLOG("  pattern[%d] '%s': no match", j, esc_str(p->match));
@@ -589,25 +646,38 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
 
         if (p->sentinel) {
             /*
-             * Sentinel fired: at the command prompt. Nothing to type;
-             * every remaining normal pattern is stale now. The window
-             * size is pushed the first time (pending is set when the
-             * type resolves to serial) -- together with the one-time
-             * TERM export; afterwards the main loop pushes it as soon
-             * as the local window changed.
+             * Sentinel fired: at the command prompt. Nothing is typed
+             * for the sentinel itself, and every still-unused normal
+             * pattern is stale now -- except commands, which the
+             * prompt is exactly for. What happens at the prompt
+             * happens here, one line at most (see the sentinel
+             * comment above): the pending window-size push takes the
+             * turn first, else the next queued command. A firing with
+             * neither left means every command ran to completion:
+             * the session is over.
              */
+            struct pattern *cmd = NULL;
+            int retired = 0;
+
             sentinel_seen = 1;
             VLOG("  pattern[%d] sentinel '%s': matched", j, esc_str(p->match));
-            if (nr_unused) {
-                VLOG("  retiring %d unused pattern(s)", nr_unused);
-                for (int k = 0; k < nr_patterns; k++)
-                    if (!patterns[k].sentinel)
-                        patterns[k].used = 1;
-                nr_unused = 0;
+            for (int k = 0; k < nr_patterns; k++) {
+                struct pattern *q = &patterns[k];
+
+                if (!q->sentinel && !q->command && !q->used) {
+                    q->used = 1;
+                    retired++;
+                }
+                if (q->command && !q->used && !cmd)
+                    cmd = q;
+            }
+            if (retired) {
+                nr_unused -= retired;
+                VLOG("  retiring %d stale pattern(s)", retired);
             }
             /*
-             * Only the sentinel can still match: shrink the record
-             * window to its own length.
+             * Only the sentinel can still match (commands share its
+             * match): shrink the record window to its own length.
              */
             if (max_mlen > p->mlen) {
                 max_mlen = p->mlen;
@@ -616,6 +686,16 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
             if (winch_pending) {
                 winch_pending = 0;
                 sync_winsize(pty_fd);
+            } else if (cmd) {
+                cmd->used = 1;
+                nr_unused--;
+                VLOG("  typing command '%s' + Enter", esc_str(cmd->response));
+                write_all(pty_fd, (const unsigned char *)cmd->response,
+                          strlen(cmd->response));
+                write_all(pty_fd, (const unsigned char *)"\r", 1);
+            } else if (has_commands) {
+                VLOG("  every command ran; exiting");
+                quit_pending = 1;
             }
         } else {
             p->used = 1;
@@ -734,11 +814,11 @@ static int pty_is_raw(int fd)
  *    pending unread, so a \r typed into the still-canonical pty
  *    would be dropped by the very switch that was supposed to
  *    deliver it to the console. (A pattern reply typed in 1 runs
- *    no such risk: it answers a prompt the command is reading
- *    right then, so it is consumed before the switch happens;
- *    the Enter has no reader until the console is connected, and
- *    must wait.) After the Enter the pty is polled: as soon as
- *    it answers, or the command exits, the phase returns WITHOUT
+ *    no such risk, a queued command included: it answers a prompt
+ *    that is being read right then, so it is consumed before the
+ *    switch happens; the Enter has no reader until the console is
+ *    connected, and must wait.) After the Enter the pty is polled:
+ *    as soon as it answers, or the command exits, the phase returns WITHOUT
  *    reading -- the output is the main loop's, where the patterns
  *    match it. While the console stays silent the Enter is
  *    repeated every ENTER_RETRY_SEC: a virtual machine may take a
@@ -769,6 +849,8 @@ static void wake_serial_console(int pty_fd)
             VLOG("startup: %zu bytes, pty not raw yet", (size_t)n);
             write_all(STDOUT_FILENO, buf, (size_t)n);
             record_and_check(pty_fd, buf, (size_t)n);
+            if (quit_pending)
+                return; /* every command ran before the pty went raw */
         }
     }
 
@@ -802,11 +884,13 @@ int main(int argc, char **argv)
     struct termios raw;
     sigset_t winch_set, orig_set;
     int opt;
+    int nr_sends = 0;
     char name[4];
 
     static const struct option long_options[] = {
         { "escape",  required_argument, NULL, 'e' },
         { "pattern", required_argument, NULL, 'p' },
+        { "send",    required_argument, NULL, 's' },
         { "term",    required_argument, NULL, 't' },
         { "verbose", no_argument,       NULL, 'v' },
         { "pty",     required_argument, NULL, 1 },
@@ -819,7 +903,7 @@ int main(int argc, char **argv)
      * channel command's own options (e.g. "ssh -tt host") belong to
      * the command, not to us.
      */
-    while ((opt = getopt_long(argc, argv, "+e:p:t:vh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+e:p:s:t:vh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'e':
             escape_str = optarg;
@@ -856,6 +940,34 @@ int main(int argc, char **argv)
             }
             if (p->mlen > max_mlen)
                 max_mlen = p->mlen;
+            break;
+        }
+        case 's': {
+            struct pattern *p;
+
+            if (!*optarg) {
+                fprintf(stderr, "%s: empty --send command\n", prog);
+                return 2;
+            }
+            if (nr_patterns >= MAX_PATTERNS)
+                die("too many patterns");
+            p = &patterns[nr_patterns++];
+            /*
+             * No match of its own: a --send command is typed at the
+             * sentinel's prompt, whenever that shows up. command is
+             * set here rather than by the classification pass below,
+             * so the entry joins the queue in command-line order with
+             * the -p commands around it.
+             */
+            p->match = NULL;
+            p->mlen = 0;
+            p->response = strdup(optarg);
+            p->sentinel = 0;
+            p->command = 1;
+            p->used = 0;
+            nr_unused++;
+            has_commands = 1;
+            nr_sends++;
             break;
         }
         case 't':
@@ -897,6 +1009,44 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    /*
+     * --send types at the sentinel's prompt: without a sentinel there
+     * is no prompt boundary to wait for, and the command would be
+     * typed blind. (The serial method refuses the same way, for the
+     * same reason.)
+     */
+    if (nr_sends && !has_sentinel) {
+        fprintf(stderr,
+                "%s: --send needs a sentinel pattern (e.g. -p \"]# \")\n",
+                prog);
+        return 2;
+    }
+
+    /*
+     * Classify the commands: a non-sentinel pattern whose match equals
+     * the sentinel's. Its -p argument starts with the sentinel's
+     * ("ls" after "]# "), so the split at the first space leaves both
+     * with the same match -- the prompt -- and the reply is what to
+     * run there. The sentinel types them one per prompt, in -p order,
+     * and exits the bridge once they all ran (see the sentinel comment
+     * above record_and_check()). A --send entry is already a command
+     * and carries no match, so it takes no part in this.
+     */
+    if (has_sentinel) {
+        const char *smatch = NULL;
+
+        for (int i = 0; i < nr_patterns; i++)
+            if (patterns[i].sentinel)
+                smatch = patterns[i].match;
+        for (int i = 0; i < nr_patterns; i++) {
+            if (!patterns[i].sentinel && !patterns[i].command &&
+                strcmp(patterns[i].match, smatch) == 0) {
+                patterns[i].command = 1;
+                has_commands = 1;
+            }
+        }
+    }
+
     /* -v: show the patterns as parsed, before anything runs */
     if (verbose) {
         for (int i = 0; i < nr_patterns; i++) {
@@ -904,7 +1054,14 @@ int main(int argc, char **argv)
 
             if (p->sentinel)
                 VLOG("pattern[%d] sentinel: match '%s'", i, esc_str(p->match));
-            else
+            else if (p->command) {
+                if (p->match)
+                    VLOG("pattern[%d] match '%s' -> command '%s'",
+                         i, esc_str(p->match), esc_str(p->response));
+                else
+                    VLOG("pattern[%d] -> command '%s'",
+                         i, esc_str(p->response));
+            } else
                 VLOG("pattern[%d] match '%s' -> reply '%s'",
                      i, esc_str(p->match), esc_str(p->response));
         }
@@ -968,8 +1125,11 @@ int main(int argc, char **argv)
          * printed immediately, and the main loop matches them wherever
          * they appear.
          */
-        if (term_serial)
+        if (term_serial) {
             wake_serial_console(pty_fd);
+            if (quit_pending)
+                goto out; /* every command ran during the startup wait */
+        }
     }
 
     /* save the original local terminal settings, for restore on exit */
@@ -1038,13 +1198,18 @@ int main(int argc, char **argv)
          * typed in as stty, which is only safe at a prompt -- output
          * streaming (not at a prompt) clears sentinel_seen, so the
          * push defers to the next prompt instead of injecting into a
-         * running program.
+         * running program. With commands queued even the at-prompt
+         * push waits for the sentinel's own firing: a prompt gets at
+         * most one typed line (see record_and_check), and a push
+         * typed here -- right after the sentinel typed a command into
+         * the same prompt -- would come back as an extra prompt the
+         * queue's accounting never asked for.
          */
         if (winch_pending) {
             if (!term_serial) {
                 winch_pending = 0;
                 push_winsize(pty_fd);
-            } else if (sentinel_seen) {
+            } else if (sentinel_seen && !has_commands) {
                 winch_pending = 0;
                 sync_winsize(pty_fd);
             }
@@ -1095,6 +1260,8 @@ int main(int argc, char **argv)
                 break;
             write_all(STDOUT_FILENO, buf, (size_t)n);
             record_and_check(pty_fd, buf, (size_t)n);
+            if (quit_pending)
+                goto out; /* every command ran: leave like the escape key */
         }
     }
 
