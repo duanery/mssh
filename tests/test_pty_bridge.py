@@ -965,6 +965,128 @@ status = wait_pid_exit(pid30)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('--pty: escape still exits', ok, repr(status))
 
+# 35) the local terminal goes raw on input only: its output flags stay
+#     exactly as the user had them. The channel pty is created with
+#     OPOST off instead (open_command_pty), so the relayed bytes are
+#     already display-ready and the user's own tty does the newline
+#     rendering -- and a piped od downstream, or the shell after us,
+#     keeps working \n line ends. Checked both piped and interactive
+pr, pw = os.pipe()
+pid34, m34 = pty.fork()
+if pid34 == 0:
+    os.dup2(pw, 1)
+    os.close(pw)
+    os.close(pr)
+    os.execv(BIN, ['pty-bridge', '--', 'sleep', '5'])
+os.close(pw)
+attrs = termios.tcgetattr(m34)
+end = time.time() + 3.0
+while time.time() < end and attrs[3] & termios.ICANON:
+    time.sleep(0.02)
+    attrs = termios.tcgetattr(m34)
+check('piped stdout: local terminal goes raw', not attrs[3] & termios.ICANON,
+      repr(attrs))
+check('piped stdout: OPOST kept on the local terminal',
+      attrs[1] & termios.OPOST, repr(attrs[1]))
+piped_out = read_avail(pr, 0.3)
+check('piped stdout: the banner went to the pipe',
+      b'Escape character is' in piped_out, repr(piped_out))
+os.write(m34, b'\x1d')
+status = wait_pid_exit(pid34)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('piped stdout: escape still exits', ok, repr(status))
+os.close(pr)
+
+# 35b) interactive: same invariant -- the output flags of the local
+#      terminal are the user's business, the bridge never touches them
+pid35, m35 = pty.fork()
+if pid35 == 0:
+    os.execv(BIN, ['pty-bridge', '--', 'sleep', '5'])
+attrs = termios.tcgetattr(m35)
+end = time.time() + 3.0
+while time.time() < end and attrs[3] & termios.ICANON:
+    time.sleep(0.02)
+    attrs = termios.tcgetattr(m35)
+check('interactive: local terminal goes raw', not attrs[3] & termios.ICANON,
+      repr(attrs))
+check('interactive: output flags kept on the local terminal',
+      attrs[1] & termios.OPOST, repr(attrs[1]))
+os.write(m35, b'\x1d')
+status = wait_pid_exit(pid35)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('interactive: escape still exits', ok, repr(status))
+
+# 36) a piped stdout gets "\r\n" translated to "\n" (write_stdout): no
+#     line discipline out there to keep the \r for, and line-oriented
+#     tools downstream would see it poison their line ends. A "\r" the
+#     channel means literally survives, a "\r" at the end of a chunk is
+#     held until the next byte decides, and one still held when the
+#     stream ends is flushed. The fake forces every case: an inline
+#     pair, a lone "\r" before X, a "\r"/"\n" split across chunks (the
+#     sleep), and a trailing "\r"
+pr2, pw2 = os.pipe()
+pid36, m36 = pty.fork()
+if pid36 == 0:
+    os.dup2(pw2, 1)
+    os.close(pw2)
+    os.close(pr2)
+    os.execv(BIN, ['pty-bridge', '--', 'sh', '-c',
+                   'printf "a\\rX\\r\\n"; printf "b\\r"; sleep 0.4; '
+                   'printf "\\nc\\r"'])
+os.close(pw2)
+time.sleep(1.2)
+out36 = b''
+end = time.time() + 3.0
+while time.time() < end:
+    r, _, _ = select.select([pr2], [], [], 0.1)
+    if r:
+        d = os.read(pr2, 4096)
+        if not d:
+            break
+        out36 += d
+    elif out36:
+        break
+status = wait_pid_exit(pid36)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('piped: child exit closes the bridge', ok, repr(status))
+check('piped: \\r\\n translated, lone \\r kept, held \\r flushed',
+      out36.endswith(b'a\rX\nb\nc\r\n'), repr(out36))
+os.close(pr2)
+
+# 36b) the translation must not disturb the machinery: patterns match
+#      the raw stream, the sentinel types, the self-exit fires -- and
+#      the whole pipe, the echoed command included, carries no \r
+pr3, pw3 = os.pipe()
+pid37, m37 = pty.fork()
+if pid37 == 0:
+    os.dup2(pw3, 1)
+    os.close(pw3)
+    os.close(pr3)
+    os.execv(BIN, ['pty-bridge', '-p', ']# ', '-s', 'echo hi', '--',
+                   'sh', '-c',
+                   'printf "]# "; while IFS= read -r line; do '
+                   'printf "ran:%s\\r\\n" "$line"; printf "]# "; done'])
+os.close(pw3)
+out37 = b''
+end = time.time() + 5.0
+while time.time() < end:
+    r, _, _ = select.select([pr3], [], [], 0.2)
+    if r:
+        d = os.read(pr3, 4096)
+        if not d:
+            break
+        out37 += d
+    elif out37:
+        break
+status = wait_pid_exit(pid37)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('piped: commands still run at the prompt', b'ran:echo hi\n' in out37,
+      repr(out37))
+check('piped: the self-exit still fires', ok, repr(status))
+check('piped: not a single \\r in the whole stream', b'\r' not in out37,
+      repr(out37))
+os.close(pr3)
+
 print('---')
 print('FAILURES:', failures)
 sys.exit(1 if failures else 0)

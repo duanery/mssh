@@ -22,7 +22,7 @@ pty-bridge [-e CHAR|--escape CHAR] [-p "<match> <reply>"]... \
 ## Overview
 
 ```
-                       local terminal (tty, raw)
+                       local terminal (tty, raw input)
   keyboard --> stdin --------------------+
                                          |  ppoll() loop
   screen   <-- stdout <------------------+
@@ -184,17 +184,44 @@ every exit path -- including `SIGINT`,
 `SIGTERM` and `SIGHUP`, whose handler restores the tty and then
 re-raises the signal so the process dies with its true status.
 
+One `cfmakeraw()` side effect is undone: it clears `OPOST`, and the
+output flags of the local terminal are restored verbatim
+(`raw.c_oflag = saved_tio.c_oflag`). Raw applies to the input side
+only. The bytes the bridge relays are already display-ready -- a
+serial console sends `\r\n` by itself, and the channel pty is created
+with `OPOST` off (`open_command_pty()`), so a cooked command's `\n`
+is not completed twice. The one line discipline that renders newlines
+is the user's own terminal: its `ONLCR` turns a relayed `\r\n` into
+`\r\r\n`, where the second `\r` repeats a return the line already
+made. And with the output flags untouched, every other writer on that
+terminal -- `od` at the end of a pipe, the shell after us -- keeps
+the line ends the user configured.
+
+A piped or redirected stdout has no line discipline to hand a `\r\n`
+to: `write_stdout()` translates `\r\n` into `\n` there, so
+line-oriented tools downstream (`grep`'s `$` anchor, `awk`'s last
+field) see clean line ends. A `\r` at the end of a chunk is held
+back until the next byte decides whether it was the first half of a
+`\r\n`; one still held when the stream ends is flushed. Pattern
+matching is unaffected -- it runs on the raw bytes, before any
+translation. `--pty` mode's pty belongs to the session behind it and
+is not touched; whatever line endings it emits go through the same
+`write_stdout()`.
+
 - **Local tty raw**: every keystroke (including `^C`, `^D`, arrows,
   escape sequences) is forwarded byte-by-byte; the line discipline does
   no editing, no signals, no echo. The remote session already provides
   line editing and echo, so doing it twice would double every character.
-- **Pty untouched**: `pty-bridge` never changes the pty's termios.
-  In COMMAND mode the channel command owns the settings and puts the
-  pty into raw mode itself (`wake_serial_console()` waits for that); in
-  `--pty` mode the session behind the pty owns them -- the pty was
-  already configured for its own use, and forcing raw mode under a
-  running shell would break its echo and line editing. Whatever
-  settings the owner chose are what the bridge works with.
+- **Pty settings**: in COMMAND mode the channel pty starts as a copy
+  of the local terminal -- the same window size and termios, except
+  `OPOST`, cleared so the channel does not post-process output a
+  second time (the user's own terminal owns newline rendering). From
+  there the command owns the settings and may switch them
+  (`wake_serial_console()` waits for that). In `--pty` mode the
+  session behind the pty owns them entirely -- the pty was already
+  configured for its own use, and forcing raw mode under a running
+  shell would break its echo and line editing. Whatever settings the
+  owner chose are what the bridge works with.
 
 ## The forwarding loop
 
@@ -462,7 +489,14 @@ order one per prompt, a command listed before the sentinel still
 queued -- traced by `-v` --, the serial ordering with the TERM+stty
 push taking the first prompt before any command, the `--pty`
 counterpart, and the explicit `-s/--send` spelling with its
-sentinel-less refusal), and the verbose trace (`-v`: parsed patterns,
+sentinel-less refusal), the raw-mode output flags (the local terminal
+keeps them, piped and interactive alike -- the channel pty is the one
+created with `OPOST` off), the piped CRLF translation (an inline
+`\r\n` pair dropped, a lone `\r` kept, a `\r`/`\n` split across
+chunks merged, a trailing `\r` flushed at exit, and the whole piped
+stream -- the echoed command included -- free of `\r` while patterns
+and the self-exit still work), and the
+verbose trace (`-v`: parsed patterns,
 matching tail, matches and replies on stderr). The test
 compiles the binary itself if it is missing and exits non-zero on any
 failure:

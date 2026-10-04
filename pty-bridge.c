@@ -10,8 +10,8 @@
  *
  * pty-bridge bridges the local terminal and that pty:
  *
- *   keyboard (stdin) --> pty      (local terminal in raw mode)
- *   screen  (stdout) <-- pty      (the pty's mode is its owner's business)
+ *   keyboard (stdin) --> pty      (local terminal: raw input,
+ *   screen  (stdout) <-- pty       output flags untouched)
  *
  * so the user operates the remote pty as if it were local. The pty
  * is either a local one (--pty /dev/pts/N) or a remote one reached
@@ -421,6 +421,71 @@ static void write_all(int fd, const unsigned char *buf, size_t n)
 }
 
 /*
+ * Relay output for stdout. On the terminal the bytes go out verbatim:
+ * the tty's own output flags -- which the bridge never touches -- do
+ * the display processing, and a relayed "\r\n" merely gains a second,
+ * invisible "\r" through ONLCR. A pipe or a file has no line
+ * discipline out there to hand the carriage returns to: downstream
+ * tools split on "\n" and a "\r" left at the end of the line poisons
+ * their line ends (grep's $ anchor, awk's last field). Translate
+ * "\r\n" into "\n" there.
+ *
+ * A "\r" is only recognized as the first half of a "\r\n" once the
+ * byte after it is known, and a chunk read from the pty may end right
+ * after one: hold such a trailing "\r" back and decide on the next
+ * write; flush_held_cr() emits it at the end of the stream if no
+ * "\n" ever follows.
+ */
+static int stdout_lf;  /* stdout is not a terminal: "\r\n" leaves as "\n" */
+static int cr_held;    /* a "\r" is held back, waiting for the next byte */
+
+static void write_stdout(const unsigned char *buf, size_t len)
+{
+    size_t i, start;
+
+    if (!stdout_lf) {
+        write_all(STDOUT_FILENO, buf, len);
+        return;
+    }
+    if (cr_held && (len == 0 || buf[0] != '\n')) {
+        /* the held "\r" was an ordinary carriage return after all */
+        write_all(STDOUT_FILENO, (const unsigned char *)"\r", 1);
+    }
+    cr_held = 0;
+    start = 0;
+    for (i = 0; i < len; i++) {
+        if (buf[i] != '\r')
+            continue;
+        if (i + 1 == len) {
+            /* the chunk ends on the "\r": hold it for the next write */
+            write_all(STDOUT_FILENO, buf + start, i - start);
+            cr_held = 1;
+            return;
+        }
+        if (buf[i + 1] == '\n') {
+            /* the "\r" of a "\r\n": emit what precedes it, skip it */
+            write_all(STDOUT_FILENO, buf + start, i - start);
+            start = i + 1;
+        }
+        /* else: a "\r" the channel means literally -- keep it */
+    }
+    write_all(STDOUT_FILENO, buf + start, len - start);
+}
+
+/*
+ * The stream is over while a "\r" is still held: nothing will follow
+ * that could make it the first half of a "\r\n", so it was a literal
+ * carriage return -- write it, or the byte would be lost.
+ */
+static void flush_held_cr(void)
+{
+    if (!cr_held)
+        return;
+    cr_held = 0;
+    write_all(STDOUT_FILENO, (const unsigned char *)"\r", 1);
+}
+
+/*
  * "virsh console VM" -- the channel command carries a serial console.
  * The one command shape auto mode recognizes.
  */
@@ -720,11 +785,12 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
  * carries the remote pty.
  *
  * The new pty is created as a copy of the local terminal: the same
- * termios settings and the same window size, so the command -- and
- * the remote pty it reaches -- sees the terminal the user is sitting
- * at from the very first byte. "ssh -tt" for instance relays that
- * window size to the remote pty right away, and the local line
- * settings are what the command would have seen without a bridge.
+ * window size and the same termios settings -- except OPOST, cleared
+ * on the output side (see below) -- so the command -- and the remote
+ * pty it reaches -- sees the terminal the user is sitting at from the
+ * very first byte. "ssh -tt" for instance relays that window size to
+ * the remote pty right away, and the local line settings are what the
+ * command would have seen without a bridge.
  */
 static int open_command_pty(char **cmd, pid_t *pidp)
 {
@@ -733,8 +799,21 @@ static int open_command_pty(char **cmd, pid_t *pidp)
     struct winsize ws, *wsp = NULL;
     pid_t pid;
 
-    if (tcgetattr(STDIN_FILENO, &tio) == 0)
+    if (tcgetattr(STDIN_FILENO, &tio) == 0) {
         tiop = &tio;
+        /*
+         * The copy keeps the input side: the line settings of the
+         * terminal the user types on, so a cooked command gets line
+         * editing and echo like on a real terminal. The output side
+         * loses OPOST: the channel carries bytes that are already
+         * display-ready (a serial console sends "\r\n"; a cooked
+         * command's "\n" is completed by the user's own terminal
+         * below), and the one line discipline that should touch them
+         * is that terminal -- not this in-between pty, which would
+         * only add a second "\r" to every newline.
+         */
+        tio.c_oflag &= ~OPOST;
+    }
     if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
         wsp = &ws;
 
@@ -847,7 +926,7 @@ static void wake_serial_console(int pty_fd)
                 return; /* command gone: let the main loop see it too */
             }
             VLOG("startup: %zu bytes, pty not raw yet", (size_t)n);
-            write_all(STDOUT_FILENO, buf, (size_t)n);
+            write_stdout(buf, (size_t)n);
             record_and_check(pty_fd, buf, (size_t)n);
             if (quit_pending)
                 return; /* every command ran before the pty went raw */
@@ -1081,6 +1160,15 @@ int main(int argc, char **argv)
         die("stdin is not the controlling terminal of this process");
 
     /*
+     * A piped or redirected stdout has no line discipline to hand a
+     * "\r\n" to: translate it to "\n" on the way out (write_stdout),
+     * so line-oriented tools downstream get clean line ends. On the
+     * terminal itself the bytes go out verbatim -- its own output
+     * flags, which the bridge never touches, render them.
+     */
+    stdout_lf = !isatty(STDOUT_FILENO);
+
+    /*
      * Our own message first -- the command output follows below. In
      * COMMAND mode announce the command being run, so the escape hint
      * the command itself may print later (e.g. virsh console prints
@@ -1150,9 +1238,20 @@ int main(int argc, char **argv)
     /* restore the terminal when killed by a signal */
     setup_signals();
 
-    /* now switch the local terminal to raw */
+    /*
+     * now switch the local terminal to raw -- on the input side only:
+     * cfmakeraw would clear OPOST too, and the output flags stay
+     * exactly as the user had them. The relayed bytes are already
+     * display-ready (the channel pty is created with OPOST off, and a
+     * serial console sends "\r\n" by itself), so ONLCR can only add a
+     * "\r" that repeats a return the line already made. And with the
+     * flags untouched, every other writer on this terminal -- od at
+     * the end of a pipe, the shell after us -- keeps rendering its
+     * own "\n" the way the user configured it.
+     */
     raw = saved_tio;
     cfmakeraw(&raw);
+    raw.c_oflag = saved_tio.c_oflag;
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
     if (tcsetattr(tty_fd, TCSANOW, &raw) < 0)
@@ -1258,7 +1357,7 @@ int main(int argc, char **argv)
             }
             if (n == 0)
                 break;
-            write_all(STDOUT_FILENO, buf, (size_t)n);
+            write_stdout(buf, (size_t)n);
             record_and_check(pty_fd, buf, (size_t)n);
             if (quit_pending)
                 goto out; /* every command ran: leave like the escape key */
@@ -1266,8 +1365,13 @@ int main(int argc, char **argv)
     }
 
 out:
-    /* move to a fresh line: the remote prompt we were sitting on has no \n */
-    write_all(STDOUT_FILENO, (const unsigned char *)"\r\n", 2);
+    /*
+     * A "\r" the stream ended on is still held: write it, then move to
+     * a fresh line -- the remote prompt we were sitting on has no \n.
+     * Piped, the detach newline is translated with everything else.
+     */
+    flush_held_cr();
+    write_stdout((const unsigned char *)"\n", 1);
     restore_tty();
     close(pty_fd);
 
