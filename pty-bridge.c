@@ -234,10 +234,10 @@ static void die_errno(const char *what)
 
 /*
  * Verbose log (-v), one line per event, prefixed with the program name
- * like every other stderr message. The session runs with the local
- * terminal in raw mode, where a bare "\n" only moves down a line: end
- * the line with "\r\n" when stderr is that terminal, with a plain "\n"
- * when it is a file or pipe.
+ * like every other stderr message. A bare "\n" is correct wherever
+ * stderr points: raw applies to the local terminal's input side only,
+ * so the tty's own output flags render the newline, and a file or
+ * pipe takes the "\n" as it is.
  */
 static void vlog(const char *fmt, ...)
 {
@@ -249,7 +249,7 @@ static void vlog(const char *fmt, ...)
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
-    fputs(isatty(STDERR_FILENO) ? "\r\n" : "\n", stderr);
+    fputc('\n', stderr);
 }
 
 /* -v trace line: the verbose guard lives here, not at every call site */
