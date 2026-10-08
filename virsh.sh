@@ -1,5 +1,5 @@
 # virsh() -- source this file from an interactive bash (e.g. bashrc);
-# pty-bridge must be in PATH.
+# if pty-bridge is not in PATH, console runs as the plain command too.
 #
 # Wrap "virsh ... console ..." in pty-bridge: the serial console gets the
 # startup wake, the TERM/window-size sync at the prompt, and clean line
@@ -52,7 +52,7 @@ virsh() {
         i=$((i + 1))
     done
 
-    if [ "$cmd" = console ]; then
+    if [ "$cmd" = console ] && command -v pty-bridge >/dev/null 2>&1; then
         pty-bridge -p ']# ' --term serial -- command virsh "$@"
     else
         command virsh "$@"
