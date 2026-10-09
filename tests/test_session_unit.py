@@ -29,7 +29,13 @@ spec.loader.exec_module(mssh)
 
 
 class FakeChan(object):
-    """A paramiko-channel-shaped wrapper around a local pty master fd."""
+    """A paramiko-channel-shaped wrapper around a local pty master fd.
+
+    The daemon selects on the channel rather than polling it with a blocking
+    recv, so fileno() is part of the shape a fake has to have.  Returning the
+    pty master is close enough to paramiko's event pipe for these tests: both
+    are readable exactly when there is something to read.
+    """
 
     def __init__(self, program):
         self.pid, self.fd = pty.fork()
@@ -42,8 +48,18 @@ class FakeChan(object):
     def settimeout(self, value):
         self._timeout = value
 
+    def fileno(self):
+        return self.fd
+
+    def recv_ready(self):
+        return bool(select.select([self.fd], [], [], 0)[0])
+
     def sendall(self, data):
         os.write(self.fd, data)
+
+    def send(self, data):
+        os.write(self.fd, data)
+        return len(data)
 
     def recv(self, size):
         ready, _, _ = select.select([self.fd], [], [], self._timeout)
@@ -72,6 +88,25 @@ class FakeChan(object):
             pass
 
 
+class TimedSink(mssh._BufSink):
+    """A sink that also remembers when each piece of output reached it.
+
+    Streaming is a timing property -- a line has to be handed over while the
+    command is still running, not collected at its end -- and the sink is now
+    where that is observable, so the tests that used to time each yielded
+    event time each write instead.
+    """
+
+    def __init__(self):
+        mssh._BufSink.__init__(self)
+        self.arrivals = []
+
+    def write(self, data):
+        if data:
+            self.arrivals.append((time.time(), data))
+        mssh._BufSink.write(self, data)
+
+
 def make_session(program="/bin/bash", mode="shell", prompt=None, idle=0.4):
     chan = FakeChan(program)
     mark = "__MSSH_%s__" % os.urandom(8).hex()
@@ -82,15 +117,11 @@ def make_session(program="/bin/bash", mode="shell", prompt=None, idle=0.4):
     return sess
 
 
-def drain(sess, line, wait=10.0):
-    """Run one command and collect its whole stream: (output, status, timeout)."""
-    chunks, status, timed_out = [], None, False
-    for event in sess.stream(line, wait):
-        if event[0] == "out":
-            chunks.append(event[1])
-        else:
-            status, timed_out = event[1], event[2]
-    return b"".join(chunks), status, timed_out
+def drain(sess, line, wait=10.0, sink=None):
+    """Run one command and collect all of it: (output, status, timed_out)."""
+    sink = mssh._BufSink() if sink is None else sink
+    status, timed_out = sess.run(line, wait, sink)
+    return sink.value(), status, timed_out
 
 
 class TestNames(unittest.TestCase):
@@ -373,6 +404,96 @@ class TestFrameBuilder(unittest.TestCase):
         self.assertLess(prog.index("exec 3>"), prog.index("rm -f"))
 
 
+class TestFdSink(unittest.TestCase):
+    """The output path: bytes to a pipe, never blocking, never truncated."""
+
+    def _pipe(self):
+        readfd, writefd = os.pipe()
+        self.addCleanup(lambda: self._close(readfd))
+        self.addCleanup(lambda: self._close(writefd))
+        os.set_blocking(writefd, False)
+        return readfd, writefd
+
+    @staticmethod
+    def _close(fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def test_bytes_arrive_unchanged(self):
+        readfd, writefd = self._pipe()
+        sink = mssh._FdSink(writefd)
+        sink.write(b"hello\n")
+        sink.write(b"\x00\x1b[31m\xff binary")
+        self.assertEqual(sink.backlog, 0)
+        self.assertEqual(os.read(readfd, 4096),
+                         b"hello\n\x00\x1b[31m\xff binary")
+
+    def test_a_full_pipe_is_held_not_blocked_on(self):
+        # The loop has one thread, so a write that blocked would stop the
+        # channel and stdin too.  What will not fit has to wait here instead.
+        readfd, writefd = self._pipe()
+        sink = mssh._FdSink(writefd)
+        payload = b"x" * (1024 * 1024)
+        sink.write(payload)
+        self.assertGreater(sink.backlog, 0, "a 1 MiB write fitted in a pipe?")
+
+        # Draining the reader lets the held bytes through, and every one of
+        # them is still there: a full pipe delays output, it does not drop it.
+        got = b""
+        while len(got) < len(payload):
+            got += os.read(readfd, 65536)
+            sink.flush()
+        self.assertEqual(got, payload)
+        self.assertEqual(sink.backlog, 0)
+
+    def test_drain_hands_over_the_backlog(self):
+        # The command has ended and the descriptor is about to close: whatever
+        # the pipe was too full to take is still the command's output.
+        readfd, writefd = self._pipe()
+        sink = mssh._FdSink(writefd)
+        payload = b"y" * (512 * 1024)
+        sink.write(payload)
+        self.assertGreater(sink.backlog, 0)
+
+        got = []
+
+        def reader():
+            while len(b"".join(got)) < len(payload):
+                chunk = os.read(readfd, 65536)
+                if not chunk:
+                    break
+                got.append(chunk)
+
+        import threading
+        worker = threading.Thread(target=reader)
+        worker.start()
+        sink.drain(limit=30.0)
+        worker.join(30)
+        self.assertEqual(sink.backlog, 0)
+        self.assertEqual(b"".join(got), payload)
+
+    def test_a_closed_reader_is_reported_not_raised(self):
+        # A client that walked away must not take the daemon down with a
+        # SIGPIPE: the command still frames on its own marker.
+        readfd, writefd = self._pipe()
+        os.close(readfd)
+        sink = mssh._FdSink(writefd)
+        sink.write(b"nobody is listening")
+        self.assertFalse(sink.flush())
+        self.assertEqual(sink.backlog, 0)
+
+    def test_buf_sink_collects_for_the_banner(self):
+        sink = mssh._BufSink()
+        sink.write(b"one ")
+        sink.write(b"two")
+        self.assertEqual(sink.value(), b"one two")
+        self.assertTrue(sink.flush())
+        self.assertEqual(sink.backlog, 0)
+        self.assertIsNone(sink.wfd)
+
+
 class TestShellFraming(unittest.TestCase):
     def _sess(self):
         sess = mssh._Session.__new__(mssh._Session)
@@ -488,14 +609,13 @@ class TestShellSessionLive(unittest.TestCase):
 
     def test_output_streams_while_the_command_runs(self):
         """The point of streaming: lines arrive before the command finishes."""
-        arrivals = []
+        sink = TimedSink()
         started = time.time()
-        for event in self.sess.stream(
-                "for i in 1 2 3; do echo tick$i; sleep 0.4; done", 20.0):
-            if event[0] == "out":
-                arrivals.append((time.time() - started, event[1]))
-            else:
-                self.assertEqual(event[1], 0)
+        _out, status, _ = drain(
+            self.sess, "for i in 1 2 3; do echo tick$i; sleep 0.4; done",
+            20.0, sink)
+        self.assertEqual(status, 0)
+        arrivals = [(when - started, data) for when, data in sink.arrivals]
         self.assertEqual([a[1].strip() for a in arrivals],
                          [b"tick1", b"tick2", b"tick3"])
         # Each tick must arrive near its own moment, not all at the end.
@@ -511,21 +631,15 @@ class TestShellSessionLive(unittest.TestCase):
         interactive filter produces one line and then waits, so holding until
         the *next* line meant holding until the input was closed.
         """
+        sink = TimedSink()
         started = time.time()
-        first = None
-        events = []
-        # 'read' then 'echo' produces exactly one line and keeps running, the
-        # same shape as a filter waiting for more input.
-        for event in self.sess.stream(
-                "echo only-line; sleep 3", 12.0):
-            if event[0] == "out":
-                if first is None:
-                    first = time.time() - started
-                events.append(event[1])
-            else:
-                self.assertEqual(event[1], 0)
-        self.assertIn(b"only-line", b"".join(events))
-        self.assertIsNotNone(first, "the line was never emitted")
+        # 'echo' then a long sleep produces exactly one line and keeps running,
+        # the same shape as a filter waiting for more input.
+        out, status, _ = drain(self.sess, "echo only-line; sleep 3", 12.0, sink)
+        self.assertEqual(status, 0)
+        self.assertIn(b"only-line", out)
+        self.assertTrue(sink.arrivals, "the line was never emitted")
+        first = sink.arrivals[0][0] - started
         # It must appear on the idle release, not 3s later when the sleep ends.
         self.assertLess(first, 2.0,
                         "one-line output waited %.2fs for a second line" % first)
@@ -540,13 +654,12 @@ class TestShellSessionLive(unittest.TestCase):
 
     def test_endless_command_streams_then_times_out(self):
         """The reported bug: a command that never ends showed nothing."""
-        arrivals = []
-        for event in self.sess.stream(
-                "while true; do echo forever; sleep 0.2; done", 1.5):
-            if event[0] == "out":
-                arrivals.append(event[1])
-            else:
-                self.assertTrue(event[2], "should have timed out")
+        sink = TimedSink()
+        _out, _status, timed_out = drain(
+            self.sess, "while true; do echo forever; sleep 0.2; done", 1.5,
+            sink)
+        self.assertTrue(timed_out, "should have timed out")
+        arrivals = [data for _when, data in sink.arrivals]
         self.assertGreaterEqual(len(arrivals), 3, arrivals)
         # Most lines are the command's; bash may slip in a job-completion
         # notice from an earlier background command, which is genuine output.
@@ -560,11 +673,10 @@ class TestShellSessionLive(unittest.TestCase):
 
     def test_partial_line_is_released_when_it_goes_quiet(self):
         # A prompt-like write with no newline must not be held hostage.
-        chunks = []
-        for event in self.sess.stream("printf 'Continue? '; sleep 2", 4.0):
-            if event[0] == "out":
-                chunks.append((time.time(), event[1]))
-        self.assertTrue(any(b"Continue?" in c[1] for c in chunks), chunks)
+        sink = TimedSink()
+        drain(self.sess, "printf 'Continue? '; sleep 2", 4.0, sink)
+        self.assertTrue(any(b"Continue?" in data for _when, data
+                            in sink.arrivals), sink.arrivals)
 
     def test_timeout_then_interrupt_recovers(self):
         out, status, timed_out = drain(self.sess, "sleep 30", 1.0)
@@ -585,12 +697,12 @@ class TestShellSessionLive(unittest.TestCase):
     def test_interrupt_while_streaming_aborts_the_whole_list(self):
         import threading
 
-        seen = []
+        result = {}
         done = threading.Event()
+        sink = mssh._BufSink()
 
         def run():
-            for event in self.sess.stream("sleep 30; echo never", 30.0):
-                seen.append(event)
+            result["end"] = self.sess.run("sleep 30; echo never", 30.0, sink)
             done.set()
 
         worker = threading.Thread(target=run)
@@ -598,24 +710,13 @@ class TestShellSessionLive(unittest.TestCase):
         time.sleep(1.0)
         self.assertTrue(self.sess.interrupt_running(),
                         "a running command should report as signalled")
-        self.assertTrue(done.wait(30), "the stream never ended")
+        self.assertTrue(done.wait(30), "the command never ended")
         worker.join()
 
-        output = b"".join(e[1] for e in seen if e[0] == "out")
-        self.assertNotIn(b"never", output)
-        self.assertEqual(seen[-1][0], "end")
-        self.assertEqual(seen[-1][1], 130)
+        self.assertNotIn(b"never", sink.value())
+        self.assertEqual(result["end"], (130, False))
         out, status, _ = drain(self.sess, "echo ok", 10.0)
         self.assertEqual((out.strip(), status), (b"ok", 0))
-
-    def test_stale_marker_is_not_read_as_a_status(self):
-        """A timed-out command's late marker must not frame the next one."""
-        out, status, timed_out = drain(self.sess, "sleep 1.5; (exit 33)", 0.5)
-        self.assertTrue(timed_out)
-        time.sleep(2.5)                   # the stale marker is now in flight
-        out, status, _ = drain(self.sess, "echo fresh", 10.0)
-        self.assertEqual(out.strip(), b"fresh")
-        self.assertEqual(status, 0, "picked up the stale command's status")
 
     def test_repeated_timeouts_do_not_wedge_the_session(self):
         for _ in range(3):

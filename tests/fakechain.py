@@ -79,11 +79,30 @@ class _PtyChan(FakeChan):
 
     # -- the pipe-backed half, used by the stdin writer channel -----------
 
+    def fileno(self):
+        """The fd to select on, which is where the program's output comes out.
+
+        The daemon watches the channel together with the client's stdin, the
+        output pipe and the request socket, so a fake has to be selectable the
+        way a real one is.
+        """
+        if self.proc is None:
+            return self.fd
+        return self.proc.stdout.fileno()
+
+    def recv_ready(self):
+        return bool(select.select([self.fileno()], [], [], 0)[0])
+
     def sendall(self, data):
         if self.proc is None:
             return FakeChan.sendall(self, data)
         self.proc.stdin.write(data)
         self.proc.stdin.flush()
+
+    def send(self, data):
+        """Partial sends are the real thing's behaviour; a pipe takes it all."""
+        self.sendall(data)
+        return len(data)
 
     def recv(self, size):
         if self.proc is None:

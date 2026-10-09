@@ -327,8 +327,8 @@ order.
 ## Tests
 
 ```bash
-python3 tests/test_session_unit.py     # framing, endpoints, flags     (56)
-python3 tests/test_session_daemon.py   # daemon, protocol, client      (53)
+python3 tests/test_session_unit.py     # framing, endpoints, flags     (61)
+python3 tests/test_session_daemon.py   # daemon, protocol, client      (62)
 python3 tests/test_copy_mode.py        # copy permissions vs real scp (51)
 ```
 

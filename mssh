@@ -1744,6 +1744,23 @@ SESSION_SETUP = "unset PS1 PS2 PROMPT_COMMAND; __M='%s'\n"
 # and scanning megabytes of output on every poll would be quadratic.
 SESSION_TAIL = 4096
 
+# How long the daemon's loop sleeps when no descriptor is ready.  It only
+# bounds how soon --idle, --wait and an interrupt from another thread are
+# noticed; data wakes the select immediately.
+SESSION_TICK = 0.05
+
+# How much output may be held for a client that is not reading, and how much
+# of its stdin may be held for a remote window that is full, before the
+# producing side is dropped from the select.  One pipe's worth: enough that a
+# brief pause costs nothing, small enough that the pressure reaches the remote
+# program rather than growing here.
+SESSION_BACKLOG = 65536
+
+# Descriptors a request may carry: the output pipe, then stdin.  The cap is
+# the protocol, not a buffer size -- a peer that sends more is not speaking it,
+# and the extras are closed rather than kept.
+SESSION_MAX_FDS = 2
+
 # Terminal escapes, stripped in interactive mode before --prompt is matched.
 # TERM=dumb stops most of them, but not all: a coloured prompt would put
 # '\x1b[0m' after the text the user's regex anchors on, and shell-integration
@@ -1892,6 +1909,255 @@ def _peer_uid(conn):
     return uid
 
 
+class _ClientGone(Exception):
+    """The client that asked for this command is no longer listening."""
+
+
+class _BufSink(object):
+    """Collects output in memory, for the setup banner and for drains.
+
+    The same sink interface as _FdSink, so one loop serves both: the only
+    difference is where the bytes end up.
+    """
+
+    wfd = None
+    backlog = 0
+
+    def __init__(self):
+        self.chunks = []
+
+    def write(self, data):
+        if data:
+            self.chunks.append(data)
+
+    def flush(self):
+        return True
+
+    def drain(self):
+        pass
+
+    def value(self):
+        return b"".join(self.chunks)
+
+
+class _FdSink(object):
+    """Output bytes to the client's pipe, buffering whatever will not fit.
+
+    The descriptor is the write end of a pipe the client created and handed
+    over with its request, so the command's output never passes through JSON:
+    it is copied from the channel to this fd and read straight off the other
+    end.  Nothing frames it, so nothing has to encode it.
+
+    The fd is non-blocking because this is the only thread: a write that
+    blocked -- a client paused in a pager, a terminal that stopped scrolling --
+    would stop the loop reading the channel, the client's stdin and the request
+    socket alike.  What will not fit is held here instead, and the loop stops
+    reading the channel once too much has piled up, so the backpressure reaches
+    the remote program through the SSH window rather than growing in the
+    daemon.
+    """
+
+    def __init__(self, fd):
+        self.wfd = fd
+        self.buf = b""
+        self.gone = False
+
+    @property
+    def backlog(self):
+        return len(self.buf)
+
+    def write(self, data):
+        if data and not self.gone:
+            self.buf += data
+            self.flush()
+
+    def flush(self):
+        """Push what the pipe will take.  False once the reader is gone."""
+        while self.buf and not self.gone:
+            try:
+                sent = os.write(self.wfd, self.buf)
+            except BlockingIOError:
+                break                     # the pipe is full; select on it
+            except OSError:
+                # The client died or closed its end.  Drop what is left: there
+                # is nobody to hand it to, and the command still frames on its
+                # own marker.
+                self.gone = True
+                self.buf = b""
+                break
+            self.buf = self.buf[sent:]
+        return not self.gone
+
+    def drain(self, limit=30.0):
+        """Block until the last of the output is in the pipe.
+
+        Called once, after the command has ended and before the descriptor is
+        closed: whatever the pipe was too full to take is still the command's
+        output, and closing on it would truncate the tail of a command whose
+        client reads slowly.  Blocking is safe here only because nothing else
+        is left to watch -- the frame is closed and the lock is about to go.
+        """
+        deadline = time.time() + limit
+        while self.buf and not self.gone and self.flush():
+            if not self.buf:
+                break
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break                     # a client that never reads again
+            try:
+                if not select.select([], [self.wfd], [], remaining)[1]:
+                    break
+            except (select.error, InterruptedError):
+                continue
+
+
+class _ShellFramer(object):
+    """Shell mode: everything up to our frame marker is the command's output.
+
+    One line is held back, because the framing printf writes a newline of its
+    own that is not part of the command's output: when the marker comes
+    straight after a line, that line was the command's last and its newline was
+    the frame's, so emitting it earlier would append a newline the command
+    never printed.
+
+    The hold is released after --idle of quiet, which is what lets an
+    interactive filter work.  Without that release the holdback was unbounded:
+    'mssh --session s --stdin cat' showed nothing at all until Ctrl-D, because
+    each typed line sat here waiting for the next one.  A held line is safe to
+    release once the output goes quiet, since a real frame marker follows its
+    line immediately -- far inside --idle -- so anything still held after a
+    pause had a newline of its own.
+    """
+
+    def __init__(self, session):
+        self.session = session
+        self.tail = b""
+        self.held = None
+        self.last_data = time.time()
+
+    def feed(self, data, sink):
+        """Hand this chunk to the sink.  (status, False) at the marker."""
+        session = self.session
+        self.last_data = time.time()
+        self.tail += data
+        lines = self.tail.split(b"\n")
+        self.tail = lines.pop()
+        for raw in lines:
+            line = session._clean(raw)
+            status = session._marker_status(line)
+            if status is None:
+                if self.held is not None:
+                    sink.write(self.held + b"\n")
+                self.held = line
+                continue
+            if self.held:
+                # A last line that had no newline of its own.
+                sink.write(self.held)
+            self.held = None
+            return (status, False)
+        return None
+
+    def idle(self, sink, now):
+        """Release what a pause proves was complete.  Never ends the frame."""
+        if now - self.last_data < self.session.idle:
+            return None
+        if self.held is not None:
+            # Nothing followed it, so its newline was real: hand it over
+            # rather than waiting for a line that may never come.
+            sink.write(self.held + b"\n")
+            self.held = None
+        if self.tail and not self.session.mark.startswith(
+                self.tail.rstrip(b"\r")):
+            # A partial line that has gone quiet: a prompt, a progress bar, a
+            # status line.  Release it once it cannot be the start of the
+            # marker, so a command that asks a question is not held back.
+            sink.write(self.session._clean(self.tail))
+            self.tail = b""
+        return None
+
+    def flush(self, sink, newline=True):
+        """Hand over the leftovers when no marker is going to come."""
+        if self.held is not None:
+            sink.write(self.held + b"\n" if newline else self.held)
+            self.held = None
+        if self.tail:
+            sink.write(self.session._clean(self.tail))
+            self.tail = b""
+
+    def on_abort(self, sink):
+        # Ctrl-C destroyed the whole command list, the framing printf
+        # included, so no marker is coming; resynchronise instead.  The held
+        # line keeps its own newline here, since the frame never printed one.
+        self.flush(sink, newline=False)
+        self.session._resync()
+        return (130, False)
+
+
+class _InteractiveFramer(object):
+    """Interactive mode: a reply ends at --prompt, or at a pause without one.
+
+    --prompt is matched against one line at a time -- the trailing partial line
+    first, since that is where an interactive program leaves its prompt, then
+    whole lines, for the rarer program that ends its prompt with a newline.
+    Matching the whole buffer instead would frame early on output that merely
+    quoted something prompt-shaped.
+    """
+
+    def __init__(self, session):
+        self.session = session
+        self.tail = b""
+        self.last_data = time.time()
+
+    def feed(self, data, sink):
+        session = self.session
+        self.last_data = time.time()
+        self.tail += data
+        lines = self.tail.split(b"\n")
+        self.tail = lines.pop()
+        for raw in lines:
+            line = session._clean(raw)
+            if session.prompt_re is not None:
+                match = session._prompt_at_end(line)
+                if match is not None:
+                    if match:
+                        sink.write(match)
+                    return (None, False)
+            sink.write(line + b"\n")
+        if session.prompt_re is not None:
+            match = session._prompt_at_end(session._clean(self.tail))
+            if match is not None:
+                if match:
+                    sink.write(match)
+                return (None, False)
+        return None
+
+    def idle(self, sink, now):
+        session = self.session
+        if session.prompt_re is not None:
+            return None
+        if now - self.last_data < session.idle:
+            return None
+        # No --prompt: fall back to "nothing new for a while".  This is a
+        # heuristic, which is why --prompt exists.
+        if self.tail:
+            sink.write(session._clean(self.tail))
+            self.tail = b""
+            return None
+        return (None, False)
+
+    def flush(self, sink, newline=True):
+        if self.tail:
+            sink.write(self.session._clean(self.tail))
+            self.tail = b""
+
+    def on_abort(self, sink):
+        self.flush(sink)
+        # The program itself handled the Ctrl-C and will print its own prompt
+        # again; drain that so the next command frames cleanly.
+        self.session._drain_interactive()
+        return (130, False)
+
+
 class _Session(object):
     """One live remote program behind a pty, framed into request/response.
 
@@ -1899,6 +2165,16 @@ class _Session(object):
     prints as it goes (a poller, a tail, a build) must show its lines while it
     runs, not all at once when --wait expires.  So framing works a line at a
     time and every completed line is handed straight to the client.
+
+    One command is one trip round a single select loop (_pump), in the thread
+    that asked for it.  The channel, the client's stdin descriptor, the output
+    pipe and the request socket are all watched together there, because each
+    of them can block and none of them may stop the others: a full output pipe
+    must not stop stdin arriving, and a slow producer on stdin must not stop
+    output being handed over.  An earlier design ran stdin in a thread of its
+    own and polled the channel with a 50 ms blocking recv; this does the same
+    work in one place, and wakes the moment anything is ready rather than at
+    the next tick.
     """
 
     def __init__(self, chan, mark, mode, prompt_re, idle, target, command,
@@ -1981,84 +2257,121 @@ class _Session(object):
             return None
         return int(payload) if payload.isdigit() else -1
 
-    def _stream_shell(self, deadline):
-        """Yield output as it arrives, ending at our frame marker.
+    # -- the loop ---------------------------------------------------------
 
-        One line is held back, because the framing printf writes a newline of
-        its own that is not part of the command's output: when the marker comes
-        straight after a line, that line was the command's last and its newline
-        was the frame's, so emitting it earlier would append a newline the
-        command never printed.
+    def _pump(self, framer, sink, deadline, in_fd=None, in_chan=None,
+              conn=None):
+        """Drive one command to its end.  Returns (status, timed_out).
 
-        The hold is released after --idle of quiet, which is what lets an
-        interactive filter work.  Without that release the holdback was
-        unbounded: 'mssh --session s --stdin cat' showed nothing at all until
-        Ctrl-D, because each typed line sat here waiting for the next one.  A
-        held line is safe to release once the output goes quiet, since a real
-        frame marker follows its line immediately -- far inside --idle -- so
-        anything still held after a pause had a newline of its own.
+        Everything that can block is watched here together, in one thread:
+
+          chan     the remote program's output, framed into the sink
+          in_fd    the client's stdin, copied to the writer channel
+          sink.wfd the client's output pipe, when it is full and we have more
+          conn     the request socket, which says nothing but tells us by
+                   going readable that the client has gone
+
+        The channel is dropped from the read set while the sink has a backlog,
+        and stdin is dropped while the writer channel has one, so neither side
+        is read faster than it can be handed on -- the pressure travels back to
+        the remote program through the SSH window instead of piling up here.
+
+        select() is given a tick rather than the whole remaining time because
+        --idle, --wait and an interrupt from another thread are all deadlines
+        no descriptor will wake us for.
         """
-        tail = b""
-        held = None
-        last_data = time.time()
-        self.chan.settimeout(0.05)
+        self.chan.settimeout(0.0)
+        if in_chan is not None:
+            in_chan.settimeout(0.0)
+        pending_in = b""                  # read from stdin, not yet sent on
+        in_done = in_fd is None           # no more stdin will come
 
         while True:
-            data = self._recv()
-            if data:
-                last_data = time.time()
-                tail += data
-                lines = tail.split(b"\n")
-                tail = lines.pop()
-                for raw in lines:
-                    line = self._clean(raw)
-                    status = self._marker_status(line)
-                    if status is None:
-                        if held is not None:
-                            yield ("out", held + b"\n")
-                        held = line
-                        continue
-                    if held:
-                        # A last line that had no newline of its own.
-                        yield ("out", held)
-                    self.outstanding = 0
-                    yield ("end", status, False)
-                    return
+            if not sink.flush():
+                raise _ClientGone("the client stopped reading")
 
-            now = time.time()
+            # Push whatever stdin we are holding; a timeout means the remote
+            # window is full, so the rest waits for the next turn.
+            while pending_in and in_chan is not None:
+                try:
+                    sent = in_chan.send(pending_in)
+                except socket.timeout:
+                    break
+                except Exception:
+                    # The remote reader is gone -- the command ignored its
+                    # stdin, or ended early.  Drop the rest, as a pipe does.
+                    pending_in, in_fd, in_done = b"", None, True
+                    break
+                if sent == 0:
+                    pending_in, in_fd, in_done = b"", None, True
+                    break
+                pending_in = pending_in[sent:]
+            if in_done and not pending_in and in_chan is not None:
+                # End of input -- a real EOF, or the client going away.  The
+                # channel's EOF is what the remote command's read() sees as 0.
+                try:
+                    in_chan.shutdown_write()
+                except Exception:
+                    pass
+                in_chan = None
+
+            rset = [] if sink.backlog >= SESSION_BACKLOG else [self.chan]
+            if in_fd is not None and len(pending_in) < SESSION_BACKLOG:
+                rset.append(in_fd)
+            if conn is not None:
+                rset.append(conn)
+            wset = [sink.wfd] if sink.backlog and sink.wfd is not None else []
+
+            timeout = SESSION_TICK
+            if deadline != float("inf"):
+                timeout = max(0.0, min(timeout, deadline - time.time()))
+            try:
+                ready, _w, _x = select.select(rset, wset, [], timeout)
+            except (select.error, InterruptedError):
+                ready = []
+
+            if conn is not None and conn in ready:
+                # Nothing follows the request on this socket, so the only
+                # thing readable can be the end of it: the client is gone.
+                # Without this watch a killed client would leave the command
+                # waiting on a descriptor that stays readable forever.
+                try:
+                    alive = bool(conn.recv(65536))
+                except (socket.error, OSError):
+                    alive = False
+                if not alive:
+                    raise _ClientGone("the client hung up")
+
+            if in_fd is not None and in_fd in ready:
+                try:
+                    data = os.read(in_fd, 65536)
+                except OSError:
+                    data = b""
+                if data:
+                    pending_in += data
+                else:
+                    in_fd, in_done = None, True   # the producer is done
+
+            if self.chan in ready:
+                data = self._recv()
+                if data:
+                    done = framer.feed(data, sink)
+                    if done is not None:
+                        self.outstanding = 0
+                        sink.flush()
+                        return done
+
             if self.abort.is_set():
                 self.abort.clear()
-                # Ctrl-C destroyed the whole command list, the framing printf
-                # included, so no marker is coming; resynchronise instead.
-                if held:
-                    yield ("out", held)
-                    held = None
-                if tail:
-                    yield ("out", self._clean(tail))
-                    tail = b""
-                self._resync()
-                yield ("end", 130, False)
-                return
-            quiet = now - last_data >= self.idle
-            if held is not None and quiet:
-                # Nothing followed it, so its newline was real: hand it over
-                # rather than waiting for a line that may never come.
-                yield ("out", held + b"\n")
-                held = None
-            if (tail and quiet
-                    and not self.mark.startswith(tail.rstrip(b"\r"))):
-                # A partial line that has gone quiet: a prompt, a progress bar,
-                # a status line.  Release it once it cannot be the start of the
-                # marker, so a command that asks a question is not held back.
-                yield ("out", self._clean(tail))
-                tail = b""
+                return framer.on_abort(sink)
+
+            now = time.time()
+            done = framer.idle(sink, now)
+            if done is not None:
+                return done
             if now >= deadline:
-                if held is not None:
-                    yield ("out", held + b"\n")
-                if tail:
-                    yield ("out", self._clean(tail))
-                yield ("end", None, True)
-                return
+                framer.flush(sink)
+                return (None, True)
 
     def _resync(self):
         """Stop whatever is running and get the shell back to a known state.
@@ -2111,69 +2424,6 @@ class _Session(object):
                 if self._marker_payload(self._clean(raw)) == token:
                     return True
         return False
-
-    def _stream_interactive(self, deadline):
-        """Yield output as it arrives, ending at --prompt or at an idle pause.
-
-        --prompt is matched against one line at a time -- the trailing partial
-        line first, since that is where an interactive program leaves its
-        prompt, then whole lines, for the rarer program that ends its prompt
-        with a newline.  Matching the whole buffer instead would frame early
-        on output that merely quoted something prompt-shaped.
-        """
-        tail = b""
-        last_data = time.time()
-        self.chan.settimeout(0.05)
-
-        while True:
-            data = self._recv()
-            if data:
-                last_data = time.time()
-                tail += data
-                lines = tail.split(b"\n")
-                tail = lines.pop()
-                for raw in lines:
-                    line = self._clean(raw)
-                    if self.prompt_re is not None:
-                        match = self._prompt_at_end(line)
-                        if match is not None:
-                            if match:
-                                yield ("out", match)
-                            yield ("end", None, False)
-                            return
-                    yield ("out", line + b"\n")
-                if self.prompt_re is not None:
-                    match = self._prompt_at_end(self._clean(tail))
-                    if match is not None:
-                        if match:
-                            yield ("out", match)
-                        yield ("end", None, False)
-                        return
-
-            now = time.time()
-            if self.abort.is_set():
-                self.abort.clear()
-                if tail:
-                    yield ("out", self._clean(tail))
-                # The program itself handled the Ctrl-C and will print its own
-                # prompt again; drain that so the next command frames cleanly.
-                self._drain_interactive()
-                yield ("end", 130, False)
-                return
-            if self.prompt_re is None and now - last_data >= self.idle:
-                # No --prompt: fall back to "nothing new for a while".  This
-                # is a heuristic, which is why --prompt exists.
-                if tail:
-                    yield ("out", self._clean(tail))
-                    tail = b""
-                    continue
-                yield ("end", None, False)
-                return
-            if now >= deadline:
-                if tail:
-                    yield ("out", self._clean(tail))
-                yield ("end", None, True)
-                return
 
     def _prompt_at_end(self, line):
         """Text before the prompt if this line ends with one, else None."""
@@ -2247,17 +2497,24 @@ class _Session(object):
 
     # -- operations -------------------------------------------------------
 
-    def stream(self, line, wait, in_path=None):
-        """Run one command, yielding ('out', bytes) then ('end', status, bool).
+    def run(self, line, wait, sink, in_path=None, in_fd=None, in_chan=None,
+            conn=None):
+        """Run one command to its end.  Returns (status, timed_out).
 
-        in_path is the remote fifo a stdin writer channel has already created,
-        or None to leave the command reading /dev/null.  It only applies in
-        shell mode -- an interactive program owns the pty, so its input is the
+        Output goes to the sink as it is produced, which for a client command
+        is the pipe it handed over with its request.
+
+        in_path is the remote fifo the writer channel has already created, and
+        in_fd/in_chan are the two ends this loop copies between; all three are
+        None to leave the command reading /dev/null.  They only apply in shell
+        mode -- an interactive program owns the pty, so its input is the
         command line itself.
 
-        The caller must exhaust the generator: the pty lock is held for its
-        whole life, since two commands interleaved on one pty would each read
-        the other's output.
+        conn is the request socket, watched only so a client that goes away
+        does not leave the command running with nobody to hand its output to.
+
+        The pty lock is held for the command's whole life, since two commands
+        interleaved on one pty would each read the other's output.
         """
         with self.lock:
             self.abort.clear()
@@ -2268,26 +2525,22 @@ class _Session(object):
                 self._resync()
             if self.mode == "shell":
                 self._write(session_frame(line, in_path))
-                self.outstanding = 1
-                producer = self._stream_shell(time.time() + wait)
+                framer = _ShellFramer(self)
             else:
                 self._write(line.rstrip("\r\n") + "\n")
-                self.outstanding = 1
-                producer = self._stream_interactive(time.time() + wait)
-
+                framer = _InteractiveFramer(self)
+            self.outstanding = 1
             self.served += 1
+
             try:
-                for event in producer:
-                    if event[0] == "end":
-                        if not event[2]:
-                            self.outstanding = 0
-                        self.last = time.time()
-                        yield event
-                        return
-                    self.last = time.time()
-                    yield event
+                status, timed_out = self._pump(
+                    framer, sink, time.time() + wait,
+                    in_fd=in_fd, in_chan=in_chan, conn=conn)
             finally:
-                producer.close()
+                self.last = time.time()
+            if not timed_out:
+                self.outstanding = 0
+            return status, timed_out
 
     def interrupt_running(self):
         """Ctrl-C.  Returns True if a command was in flight and was signalled.
@@ -2336,27 +2589,24 @@ class _Session(object):
         self.outstanding = 0
 
     def setup(self, wait):
-        """Bring the program to a known state; return its banner."""
+        """Bring the program to a known state; return its banner.
+
+        The same loop as a real command, with the output collected here rather
+        than written to a client: nobody is connected yet.
+        """
+        sink = _BufSink()
         if self.mode == "interactive":
             limit = wait if self.prompt_re is not None else max(self.idle * 4, 1.0)
-            chunks = []
-            for event in self._stream_interactive(time.time() + limit):
-                if event[0] == "end":
-                    break
-                chunks.append(event[1])
-            return b"".join(chunks)
+            self._pump(_InteractiveFramer(self), sink, time.time() + limit)
+            return sink.value()
 
         self._write(SESSION_SETUP % self.mark.decode("ascii"))
         blob = base64.b64encode(b"echo ready").decode("ascii")
         self._write(SESSION_FRAME % blob)
         self.outstanding = 1
-        chunks, status, timed_out = [], None, False
-        for event in self._stream_shell(time.time() + wait):
-            if event[0] == "end":
-                status, timed_out = event[1], event[2]
-                break
-            chunks.append(event[1])
-        out = b"".join(chunks)
+        status, timed_out = self._pump(_ShellFramer(self), sink,
+                                       time.time() + wait)
+        out = sink.value()
         if timed_out or status is None:
             raise SystemExit(
                 "mssh: the remote shell never answered; it may not be a "
@@ -2374,28 +2624,47 @@ class _Session(object):
 # -- wire protocol ---------------------------------------------------------
 #
 # One request per connection, so a wedged request cannot block the socket for
-# everyone else.  The request is one line of JSON.  The reply is a stream of
-# newline-terminated JSON messages -- any number of {"out": <base64>} as the
-# command produces output, then exactly one final message carrying the status.
-# It has to be a stream rather than a single reply: a command that prints for
-# minutes must show its lines while it runs, and buffering the whole response
-# would show nothing until it finished.
+# everyone else.  The socket carries JSON and nothing else, in both directions:
+# the request is one line of it, and the reply is exactly one more line.
 #
-# A request that says "stdin": true is followed by the client's stdin as raw
-# bytes on the same connection, terminated by a half-close.  Raw, not framed:
-# the data is a byte stream of unknown length that must reach the remote command
-# as it arrives ('tail -f | mssh --session s cat' has to work), so there is
-# nothing to count and nothing to buffer.  The JSON line is already delimited by
-# its newline, so everything after that newline is data.
-
-
-def _send_json(conn, payload):
-    conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+# The command's output does not travel on the socket at all.  It goes over a
+# pipe the *client* creates and whose write end it hands over with the request
+# (SCM_RIGHTS), so the daemon copies the remote program's bytes straight into
+# it and the client reads them straight out.  Nothing is framed, so nothing has
+# to be encoded: the earlier design wrapped every line in {"out": <base64>},
+# which cost a JSON encode and decode and a base64 round trip per line of a
+# build's output.  A pipe also streams for free -- the bytes are readable the
+# moment they are written -- which is what the stream of messages existed to
+# provide.
+#
+# Descriptors ride with an "op": "send" request, in this order:
+#
+#     fds[0]   the write end of the client's output pipe   (always)
+#     fds[1]   the client's own stdin, for "stdin": true   (optional)
+#
+# stdin is passed the same way rather than being written down the socket: the
+# data is a byte stream of unknown length that must reach the remote command as
+# it arrives ('tail -f | mssh --session s cat' has to work), and reading the
+# producer's descriptor directly means no relay, no half-close protocol and no
+# second thread.
+#
+# The command's end is the one thing that is still a message, because it is one
+# fact rather than a stream: {"status": N, "timed_out": bool, "end": true}, or
+# {"error": "..."}.  The daemon closes the output pipe *before* sending it, so
+# by the time the client reads the status its output is already complete at the
+# EOF on the pipe.
+#
+# On a send the client does not half-close its end of the socket, and the
+# daemon does not read from it: the socket going readable can then only mean
+# the client has gone, which is how a command notices that nobody is listening
+# any more.  status, stop and interrupt are a plain request, half-close, one
+# reply.
 
 
 def _reply(conn, payload):
+    """The daemon's one JSON line, and the half-close that ends the exchange."""
     try:
-        _send_json(conn, payload)
+        conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
         conn.shutdown(socket.SHUT_WR)
     except (socket.error, OSError):
         pass
@@ -2421,76 +2690,133 @@ def _connect_session(name, timeout):
     return conn
 
 
-def session_stream(name, payload, timeout=None, send_stdin=False):
-    """Send one request and yield each JSON message of the reply in turn.
+def _parse_reply(name, raw):
+    """One line of the daemon's JSON, or a SystemExit naming what came back."""
+    try:
+        return json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        raise SystemExit("mssh: session %s: malformed reply from the session "
+                         "daemon" % name)
 
-    The socket carries JSON only, in both directions.  With send_stdin the
-    request itself carries the local stdin descriptor (SCM_RIGHTS over the
-    same socket) and the daemon pumps the producer's bytes straight into the
-    remote command; relaying them through this process would take a second
-    thread and a half-close protocol on a connection that also carries
-    replies.  Without send_stdin the write side is half-closed right after
-    the request, which says the same thing: nothing else is coming.
+
+def session_request(name, payload, timeout=None):
+    """Send one request, half-close, and return the daemon's single reply.
+
+    What --status, --stop, --interrupt and the liveness probe use: one line of
+    JSON each way, nothing streamed.  A command's output does not come back
+    this way -- see session_send.
     """
     conn = _connect_session(name, timeout)
     buf = b""
-    seen = False
     try:
-        line = json.dumps(payload).encode("utf-8") + b"\n"
-        if send_stdin:
-            fd = stdin_fd()
-            if fd is None:
-                raise SystemExit("mssh: session %s: stdin was requested but "
-                                 "there is none to pass" % name)
-            sent = conn.sendmsg([line],
-                                [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                                  array.array("i", [fd]).tobytes())])
-            if sent < len(line):
-                # A request longer than the socket buffer went out in part;
-                # the descriptor rode on its first byte, the rest is plain.
-                conn.sendall(line[sent:])
-        else:
-            conn.sendall(line)
-            conn.shutdown(socket.SHUT_WR)
-        while True:
+        conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+        conn.shutdown(socket.SHUT_WR)
+        while b"\n" not in buf:
             try:
                 data = conn.recv(65536)
             except socket.timeout:
                 raise SystemExit("mssh: session %s: the session daemon "
                                  "stopped responding" % name)
             except ConnectionResetError:
-                # The daemon closed the moment its last reply was out.  The
-                # request was fully read long before, so nothing of ours was
-                # lost: whatever it said is already in buf, and a reset is
-                # not an error of its own.
+                # The daemon closed the moment its reply was out.  The request
+                # was fully read long before, so nothing of ours was lost, and
+                # a reset is not an error of its own.
                 break
             if not data:
                 break
             buf += data
-            while b"\n" in buf:
-                raw, buf = buf.split(b"\n", 1)
-                if not raw.strip():
-                    continue
-                seen = True
-                try:
-                    yield json.loads(raw.decode("utf-8", "replace"))
-                except ValueError:
-                    raise SystemExit("mssh: session %s: malformed reply from "
-                                     "the session daemon" % name)
     finally:
         conn.close()
 
-    if not seen:
+    line = buf.split(b"\n", 1)[0].strip()
+    if not line:
         raise SystemExit("mssh: session %s: the session daemon closed the "
                          "connection without replying" % name)
+    return _parse_reply(name, line)
 
 
-def session_request(name, payload, timeout=None):
-    """Send one request and return its last reply message."""
-    last = None
-    for message in session_stream(name, payload, timeout):
-        last = message
-    return last
+def session_send(name, payload, send_stdin=False):
+    """Run one command: stream its output to stdout, return the final message.
+
+    The output does not come back over the socket.  A pipe is created here and
+    its write end handed to the daemon with the request, so the remote
+    program's bytes are copied into it and read out of it unchanged -- no
+    framing, no base64, no JSON per line.  With send_stdin the local stdin
+    descriptor goes the same way and the daemon feeds the command from it
+    directly.
+
+    Both ends are watched until each is finished: the pipe until EOF, which is
+    what says the output is complete, and the socket until its one status
+    message arrives.  The daemon closes the pipe first, so neither order of
+    arrival loses anything.
+
+    The write side is deliberately left open.  The daemon reads nothing from
+    it, so the socket becoming readable on its end means only one thing -- this
+    process has gone -- which is how an abandoned command gets noticed.
+    """
+    conn = _connect_session(name, None)
+    rfd, wfd = os.pipe()
+    out = sys.stdout.buffer
+    buf = b""
+    message = None
+    try:
+        line = json.dumps(payload).encode("utf-8") + b"\n"
+        fds = [wfd]
+        if send_stdin:
+            fd = stdin_fd()
+            if fd is None:
+                raise SystemExit("mssh: session %s: stdin was requested but "
+                                 "there is none to pass" % name)
+            fds.append(fd)
+        sent = conn.sendmsg([line],
+                            [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                              array.array("i", fds).tobytes())])
+        if sent < len(line):
+            # A request longer than the socket buffer went out in part; the
+            # descriptors rode on its first byte, the rest is plain.
+            conn.sendall(line[sent:])
+        os.close(wfd)                     # the daemon holds the only write end
+        wfd = None
+
+        conn.settimeout(None)
+        watch = [rfd, conn]
+        while watch:
+            try:
+                ready, _w, _x = select.select(watch, [], [])
+            except (select.error, InterruptedError):
+                continue
+            if rfd in ready:
+                try:
+                    data = os.read(rfd, 65536)
+                except OSError:
+                    data = b""
+                if data:
+                    out.write(data)
+                    out.flush()
+                else:
+                    watch.remove(rfd)     # EOF: the output is complete
+            if conn in ready:
+                try:
+                    data = conn.recv(65536)
+                except (socket.error, OSError):
+                    data = b""
+                if data:
+                    buf += data
+                    if b"\n" in buf:
+                        watch.remove(conn)
+                else:
+                    watch.remove(conn)
+    finally:
+        if wfd is not None:
+            os.close(wfd)
+        os.close(rfd)
+        conn.close()
+
+    line = buf.split(b"\n", 1)[0].strip()
+    if not line:
+        raise SystemExit("mssh: session %s: the session daemon closed the "
+                         "connection without replying" % name)
+    return _parse_reply(name, line)
 
 
 def session_alive(name):
@@ -2619,72 +2945,17 @@ def _session_detach(name, opts):
         os.close(null)
 
 
-def _pump_stdin(fd, conn, chan, session):
-    """Copy the client's stdin descriptor into the writer channel.
-
-    The descriptor arrived over the request socket (SCM_RIGHTS), so this reads
-    the producer's bytes directly and the socket stays a pure JSON channel.
-    Runs in its own thread for the length of the command: the data arrives as
-    the producer makes it, and a filter ('mssh --session s cat' fed by a slow
-    producer) must see each piece as it comes rather than at the end.
-
-    Two descriptors are polled.  The request socket is watched because the one
-    held here is a dup that stays readable after the client dies -- without
-    that watch, a killed client would leave the command waiting for input that
-    will never come.  The poll times out once a second so the channel can be
-    checked: a command that ended while input kept coming must stop being fed.
-
-    End of input -- real EOF, or the client going away -- is turned into a
-    channel EOF so the remote command's read() returns 0.  Every error is
-    swallowed: the command still frames on its own marker, and a broken writer
-    must not take the daemon down.
-    """
-    conn_fd = conn.fileno()
-    poller = select.poll()
-    poller.register(fd, select.POLLIN)
-    poller.register(conn_fd, select.POLLIN)
-    try:
-        while True:
-            events = poller.poll(1000)
-            if not events:
-                if chan.closed or chan.exit_status_ready():
-                    break             # the command ended; nobody is reading
-                continue
-            if any(src == conn_fd for src, _event in events):
-                break                 # the client hung up: end of input
-            try:
-                data = os.read(fd, 65536)
-            except OSError:
-                break
-            if not data:
-                break                 # the producer is done: end of input
-            try:
-                chan.sendall(data)
-            except Exception:
-                break                 # remote 'cat' gone (the command ignored
-                                      # its stdin); drop the rest, as a pipe does
-    except Exception:
-        pass
-    finally:
-        try:
-            os.close(fd)              # our dup; the client's own copy lives on
-        except OSError:
-            pass
-        try:
-            chan.shutdown_write()
-        except Exception:
-            pass
-
-
 def _session_serve(session, srv, path, clients, opts):
     """Answer requests until stopped, the program dies, or idle expires."""
     state = {"stop": False}
 
     def handle(conn):
-        held = [None]        # the client's stdin descriptor, while it is ours
+        held = []            # the descriptors sent with the request, while ours
         try:
             uid = _peer_uid(conn)
             if uid is not None and uid != os.getuid():
+                # Before the request is even read: a foreign uid must not get
+                # as far as handing us descriptors.
                 _reply(conn, {"error": "mssh: permission denied: uid %d is "
                                        "not the session owner" % uid})
                 return
@@ -2692,17 +2963,19 @@ def _session_serve(session, srv, path, clients, opts):
             data = b""
             while b"\n" not in data:
                 chunk, ancdata, _flags, _addr = conn.recvmsg(
-                        65536, socket.CMSG_SPACE(array.array("i").itemsize))
+                        65536,
+                        socket.CMSG_SPACE(SESSION_MAX_FDS
+                                          * array.array("i").itemsize))
                 for level, ctype, cred in ancdata:
                     if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
-                        # The request may itself carry the stdin descriptor.
-                        # Anything beyond the first one is not part of the
-                        # protocol: close it rather than leak it.
+                        # A send carries the output pipe and, with stdin, the
+                        # client's producer.  Anything beyond those is not part
+                        # of the protocol: close it rather than leak it.
                         fds = array.array("i")
                         fds.frombytes(cred[:len(cred) - (len(cred) % fds.itemsize)])
-                        for i, one in enumerate(fds):
-                            if i == 0 and held[0] is None:
-                                held[0] = one
+                        for one in fds:
+                            if len(held) < SESSION_MAX_FDS:
+                                held.append(one)
                             else:
                                 os.close(one)
                 if not chunk:
@@ -2711,18 +2984,18 @@ def _session_serve(session, srv, path, clients, opts):
             if not data.strip():
                 return
             req = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
-            # Nothing follows the request line on this socket: stdin travels
-            # as the descriptor above, and what remains is a pure JSON
-            # channel in both directions.
+            # Nothing else is read from this socket: the output pipe and stdin
+            # are the descriptors above, and what remains is one JSON reply.
             dispatch(conn, req, held)
         except Exception as exc:                          # never kill the loop
             _reply(conn, {"error": "mssh: session daemon: %s" % exc})
         finally:
-            if held[0] is not None:
-                try:
-                    os.close(held[0])     # never taken over: leak nothing
-                except OSError:
-                    pass
+            for one in held:
+                if one is not None:
+                    try:
+                        os.close(one)     # never taken over: leak nothing
+                    except OSError:
+                        pass
             try:
                 conn.close()
             except Exception:
@@ -2731,21 +3004,27 @@ def _session_serve(session, srv, path, clients, opts):
     def dispatch(conn, req, held):
         """Handle one request.
 
-        held[0], when set, is the client's stdin descriptor that arrived with
-        the request.  Every path closes it except the one that hands it to
-        _pump_stdin, whose finally closes it in turn; the list is how the two
-        agree on who owns it.
+        held holds the descriptors that arrived with it -- for a send, the
+        output pipe's write end and (with stdin) the client's own stdin.  Each
+        is taken out of the list by whoever becomes responsible for closing it;
+        handle()'s finally closes whatever is left, so no path can leak one.  A
+        descriptor kept open by mistake is not harmless: the client's producer
+        (a 'yes' pipe) would be held for as long as the daemon lives.
         """
+        def take(index):
+            if index < len(held):
+                fd, held[index] = held[index], None
+                return fd
+            return None
+
         def drop():
-            # A descriptor only means something to send-with-stdin.  Closing
-            # it on every other path matters: one kept open would hold the
-            # client's producer (a 'yes' pipe) for as long as the daemon lives.
-            if held[0] is not None:
-                os.close(held[0])
-                held[0] = None
+            for index in range(len(held)):
+                fd = take(index)
+                if fd is not None:
+                    os.close(fd)
 
         op = req.get("op")
-        if op != "send" or not req.get("stdin"):
+        if op != "send":
             drop()
         if op == "status":
             _reply(conn, {
@@ -2800,63 +3079,72 @@ def _session_serve(session, srv, path, clients, opts):
                           "stdin cannot be forwarded to it"
                           % (session.command or "")})
             return
-        if with_stdin and held[0] is None:
-            # A client that asks for stdin owes a descriptor with the request;
-            # missing, it is a mismatch between client and running daemon.
+        out_fd = take(0)
+        if out_fd is None:
+            # Every send owes an output pipe with its request; missing, it is a
+            # mismatch between client and running daemon.
+            _reply(conn, {"error": "mssh: no output pipe came with the "
+                                   "request; the running daemon is older than "
+                                   "this client -- --stop the session and "
+                                   "start it again"})
+            return
+        in_fd = take(1) if with_stdin else None
+        if with_stdin and in_fd is None:
+            os.close(out_fd)
             _reply(conn, {"error": "mssh: stdin was requested but no "
                                    "descriptor came with it; the running "
                                    "daemon is older than this client -- "
                                    "--stop the session and start it again"})
             return
 
-        in_chan, in_path, pump = None, None, None
-        if with_stdin:
-            # Open the writer channel *before* the command is framed: it is what
-            # creates the fifo, and a command framed against a path that does
-            # not exist yet fails at once with "No such file or directory".
-            try:
-                in_chan, in_path = session.open_stdin_writer()
-            except _SessionDead as exc:
-                drop()
-                _reply(conn, {"error": "mssh: %s" % exc})
-                return
-            pump = threading.Thread(target=_pump_stdin,
-                                    args=(held[0], conn, in_chan, session))
-            pump.daemon = True
-            pump.start()
-            held[0] = None           # the pump owns it now, and closes it
-
-        # Streaming holds the pty lock for the command's whole life, so a
-        # client that walks away must not pin it: the send below fails once
-        # its socket buffer fills and the connection is gone, which closes
-        # the generator and releases the lock.
+        in_chan, in_path = None, None
         try:
-            for event in session.stream(req.get("line", ""), wait, in_path):
-                if event[0] == "out":
-                    _send_json(conn, {
-                        "out": base64.b64encode(event[1]).decode("ascii")})
-                else:
-                    _send_json(conn, {"status": event[1],
-                                      "timed_out": event[2], "end": True})
-        except _SessionDead as exc:
-            die(str(exc))
-            _reply(conn, {"error": "mssh: session ended: %s" % exc})
-            return
-        except (socket.error, OSError):
-            return                        # the client hung up mid-command
+            if with_stdin:
+                # Open the writer channel *before* the command is framed: it is
+                # what creates the fifo, and a command framed against a path
+                # that does not exist yet fails at once with "No such file or
+                # directory".
+                try:
+                    in_chan, in_path = session.open_stdin_writer()
+                except _SessionDead as exc:
+                    _reply(conn, {"error": "mssh: %s" % exc})
+                    return
+
+            # The output pipe is written from the one loop below, which must
+            # never block on it: a client that stopped reading would otherwise
+            # stop the channel being read and pin the pty lock with it.
+            os.set_blocking(out_fd, False)
+            sink = _FdSink(out_fd)
+
+            try:
+                status, timed_out = session.run(
+                    req.get("line", ""), wait, sink, in_path=in_path,
+                    in_fd=in_fd, in_chan=in_chan, conn=conn)
+            except _SessionDead as exc:
+                die(str(exc))
+                _reply(conn, {"error": "mssh: session ended: %s" % exc})
+                return
+            except _ClientGone:
+                return                    # nobody left to tell
+            # Whatever the pipe was too full to take is still output: hand it
+            # over before the descriptor goes, or a slow client loses the tail.
+            sink.drain()
         finally:
             # The command is over, so nothing will read the fifo again: closing
-            # the writer releases the remote 'cat' even while the pump is
-            # still feeding it, which is what makes
-            # 'yes | mssh --session s "echo hi"' end instead of streaming
-            # forever.
+            # the writer releases the remote 'cat' even if it is still being
+            # fed, which is what makes 'yes | mssh --session s "echo hi"' end
+            # instead of streaming forever.
             session.close_stdin_writer(in_chan)
-            if pump is not None:
-                pump.join(timeout=5.0)
-        try:
-            conn.shutdown(socket.SHUT_WR)
-        except (socket.error, OSError):
-            pass
+            for fd in (out_fd, in_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+        # The pipe is closed above, so the client has already seen the end of
+        # the output by the time this arrives.
+        _reply(conn, {"status": status, "timed_out": timed_out, "end": True})
 
     def die(reason):
         session.dead = reason
@@ -3092,10 +3380,8 @@ def run_session_send(name, line, opts):
                    if with_stdin else "",
                    ("%gs" % opts.wait) if opts.wait > 0 else "forever"))
         started = time.time()
-        code = _emit_session_stream(
-            name,
-            session_stream(name, request, timeout=None,
-                           send_stdin=with_stdin),
+        code = _session_exit_code(
+            name, session_send(name, request, send_stdin=with_stdin),
             opts, interrupted)
         verbose(opts, "session %s: finished in %.3fs, exit %d"
                 % (name, time.time() - started, code))
@@ -3122,20 +3408,16 @@ def run_session_interrupt(name):
     return 0
 
 
-def _emit_session_stream(name, messages, opts, interrupted=None):
-    """Write each output message as it arrives; return the exit status."""
-    out = sys.stdout.buffer
-    status, timed_out, error = None, False, None
-    for message in messages:
-        if message.get("error"):
-            error = message["error"]
-            continue
-        if "out" in message:
-            out.write(base64.b64decode(message["out"]))
-            out.flush()
-            continue
-        status = message.get("status")
-        timed_out = bool(message.get("timed_out"))
+def _session_exit_code(name, message, opts, interrupted=None):
+    """What this process should exit with, given the daemon's last word.
+
+    The output itself has already been written: it came off the pipe as the
+    command produced it, and this is only the one message that ends it.
+    """
+    message = message or {}
+    error = message.get("error")
+    status = message.get("status")
+    timed_out = bool(message.get("timed_out"))
 
     if error:
         sys.stderr.write(error.rstrip("\n") + "\n")

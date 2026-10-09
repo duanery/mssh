@@ -643,6 +643,264 @@ class TestInteractiveMode(SessionTest):
         self.assertIn(b"echoed back", proc.stdout)
 
 
+class TestWireProtocol(SessionTest):
+    """The socket carries JSON only; the output travels on a pipe.
+
+    These speak the protocol by hand rather than through the client, because
+    the whole point is what is and is not on the wire -- the client would hide
+    exactly that.
+    """
+
+    def raw_send(self, line, wait=30, extra_fds=0, omit_pipe=False):
+        """One send, done by hand.  Returns (pipe bytes, socket bytes)."""
+        probe = (
+            "import array, json, os, select, socket, sys\n"
+            "path, line, wait = sys.argv[1], sys.argv[2], float(sys.argv[3])\n"
+            "extra, omit = int(sys.argv[4]), sys.argv[5] == 'omit'\n"
+            "c = socket.socket(socket.AF_UNIX); c.connect(path)\n"
+            "r, w = os.pipe()\n"
+            "req = json.dumps({'op':'send','line':line,'wait':wait})\n"
+            "fds = [] if omit else [w]\n"
+            "fds += [os.open(os.devnull, os.O_RDONLY) for _ in range(extra)]\n"
+            "blob = req.encode() + b'\\n'\n"
+            "if fds:\n"
+            "    c.sendmsg([blob], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,\n"
+            "                        array.array('i', fds).tobytes())])\n"
+            "else:\n"
+            "    c.sendall(blob)\n"
+            "os.close(w)\n"
+            "pipe_bytes, sock_bytes, watch = b'', b'', [r, c]\n"
+            "while watch:\n"
+            "    ready, _, _ = select.select(watch, [], [], 60)\n"
+            "    if not ready: break\n"
+            "    if r in ready:\n"
+            "        d = os.read(r, 65536)\n"
+            "        if d: pipe_bytes += d\n"
+            "        else: watch.remove(r)\n"
+            "    if c in ready:\n"
+            "        d = c.recv(65536)\n"
+            "        if d: sock_bytes += d\n"
+            "        else: watch.remove(c)\n"
+            "        if b'\\n' in sock_bytes and c in watch: watch.remove(c)\n"
+            "sys.stdout.buffer.write(json.dumps(\n"
+            "    {'pipe': pipe_bytes.decode('utf-8','replace'),\n"
+            "     'sock': sock_bytes.decode('utf-8','replace')}).encode())\n"
+        )
+        path = os.path.join(SOCKDIR, self.name + ".sock")
+        proc = subprocess.run(
+            [sys.executable, "-c", probe, path, line, str(wait),
+             str(extra_fds), "omit" if omit_pipe else "pass"],
+            capture_output=True, env=ENV, timeout=90)
+        self.assertTrue(proc.stdout, proc.stderr)
+        got = json.loads(proc.stdout.decode())
+        return got["pipe"], got["sock"]
+
+    def test_output_is_on_the_pipe_and_never_on_the_socket(self):
+        self.start()
+        pipe, sock = self.raw_send("seq 1 2000")
+        self.assertEqual(pipe.strip().split("\n")[-1], "2000")
+        self.assertEqual(len(pipe.strip().split("\n")), 2000)
+        # The socket carries one JSON line and nothing else: no {"out": ...}
+        # messages, so no base64 and no JSON per line of output.
+        self.assertNotIn('"out"', sock)
+        self.assertEqual(sock.count("\n"), 1)
+        self.assertEqual(json.loads(sock),
+                         {"status": 0, "timed_out": False, "end": True})
+
+    def test_the_status_message_carries_the_exit_code(self):
+        self.start()
+        for line, want in [("true", 0), ("false", 1), ("(exit 7)", 7)]:
+            _pipe, sock = self.raw_send(line)
+            self.assertEqual(json.loads(sock)["status"], want, line)
+
+    def test_a_timeout_says_so_in_the_status(self):
+        self.start()
+        _pipe, sock = self.raw_send("sleep 30", wait=1)
+        reply = json.loads(sock)
+        self.assertTrue(reply["timed_out"])
+        self.assertIsNone(reply["status"])
+        run("--session", self.name, "--interrupt")
+
+    def test_a_slow_reader_still_gets_every_byte(self):
+        """A client that reads slowly must not lose the tail of the output.
+
+        The pipe fills, the daemon holds the rest rather than blocking on it,
+        and what is still held when the command ends has to be handed over
+        before the descriptor closes -- otherwise a client in a pager, or one
+        simply reading at its own pace, gets a truncated answer.
+        """
+        self.start()
+        probe = (
+            "import array, json, os, select, socket, sys, time\n"
+            "path = sys.argv[1]\n"
+            "c = socket.socket(socket.AF_UNIX); c.connect(path)\n"
+            "req = json.dumps({'op':'send','line':'seq 1 200000',"
+            "'wait':120}).encode() + b'\\n'\n"
+            "r, w = os.pipe()\n"
+            "c.sendmsg([req], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,\n"
+            "                   array.array('i', [w]).tobytes())])\n"
+            "os.close(w)\n"
+            "total, sock = 0, b''\n"
+            "watch = [r, c]\n"
+            "while watch:\n"
+            "    ready, _, _ = select.select(watch, [], [], 120)\n"
+            "    if not ready: break\n"
+            "    if r in ready:\n"
+            "        d = os.read(r, 4096)\n"
+            "        if d:\n"
+            "            total += len(d)\n"
+            "            time.sleep(0.002)\n"   # read far slower than bash writes
+            "        else: watch.remove(r)\n"
+            "    if c in ready:\n"
+            "        d = c.recv(65536)\n"
+            "        if d: sock += d\n"
+            "        else: watch.remove(c)\n"
+            "        if b'\\n' in sock and c in watch: watch.remove(c)\n"
+            "print(json.dumps({'bytes': total, 'sock': sock.decode()}))\n"
+        )
+        path = os.path.join(SOCKDIR, self.name + ".sock")
+        proc = subprocess.run([sys.executable, "-c", probe, path],
+                              capture_output=True, env=ENV, timeout=180)
+        self.assertTrue(proc.stdout, proc.stderr)
+        got = json.loads(proc.stdout.decode())
+        # 'seq 1 200000' is a known size: 1 288 895 bytes of digits and
+        # newlines.  A reader that dawdles must still see all of them.
+        self.assertEqual(got["bytes"], sum(
+            len(str(n)) + 1 for n in range(1, 200001)))
+        self.assertEqual(json.loads(got["sock"])["status"], 0)
+
+    def test_a_killed_client_does_not_pin_the_session(self):
+        """A client that dies mid-command must release the session promptly.
+
+        Nothing is read from the request socket during a send, so its going
+        readable means exactly one thing: the client is gone.  Without that
+        watch the command would hold the pty lock until --wait expired, and
+        the descriptors it was handed would stay open with it.
+        """
+        self.start()
+        info = session_status(self.name)
+        fds = "/proc/%d/fd" % info["pid"]
+        before = len(os.listdir(fds))
+
+        # --wait 0 is "until it ends": if the daemon does not notice the
+        # client going away, nothing else ever will.
+        proc = subprocess.Popen(
+            [sys.executable, FAKE, "--session", self.name,
+             "sleep 300", "--wait", "0"],
+            env=ENV, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        time.sleep(2.0)
+        self.assertTrue(session_status(self.name)["running"],
+                        "the command never started")
+        proc.kill()
+        proc.communicate(timeout=30)
+
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if not session_status(self.name)["running"]:
+                break
+            time.sleep(0.2)
+        else:
+            self.fail("the daemon held the session after the client was killed")
+        self.assertEqual(len(os.listdir(fds)), before,
+                         "descriptors were kept after the client died")
+
+    def test_output_nobody_reads_does_not_pile_up_in_the_daemon(self):
+        """Backpressure: a client that stops reading must not grow the daemon.
+
+        The loop drops the channel from its select once the sink is holding a
+        pipe's worth, so the pressure travels back to the remote program
+        through the SSH window.  Reading on regardless would buffer a command's
+        whole output in the daemon -- unbounded, for a command whose output is.
+        """
+        self.start()
+        info = session_status(self.name)
+
+        def rss():
+            with open("/proc/%d/status" % info["pid"]) as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1])
+            return 0
+
+        probe = (
+            "import array, json, os, socket, sys, time\n"
+            "c = socket.socket(socket.AF_UNIX); c.connect(sys.argv[1])\n"
+            "r, w = os.pipe()\n"
+            "req = json.dumps({'op':'send',"
+            "'line':'head -c 40000000 /dev/zero | base64','wait':120})\n"
+            "c.sendmsg([req.encode() + b'\\n'],\n"
+            "          [(socket.SOL_SOCKET, socket.SCM_RIGHTS,\n"
+            "            array.array('i', [w]).tobytes())])\n"
+            "os.close(w)\n"
+            "sys.stdout.write('sent\\n'); sys.stdout.flush()\n"
+            "time.sleep(10)\n"            # read nothing at all
+        )
+        path = os.path.join(SOCKDIR, self.name + ".sock")
+        proc = subprocess.Popen([sys.executable, "-c", probe, path],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=ENV)
+        try:
+            self.assertEqual(proc.stdout.readline(), b"sent\n")
+            base = rss()
+            time.sleep(8)
+            growth = rss() - base
+        finally:
+            proc.kill()
+            proc.communicate(timeout=30)
+        # Measured: ~0.2 MiB held with backpressure, ~12 MiB without, and
+        # still climbing.  2 MiB is far above the one and far below the other.
+        self.assertLess(growth, 2048,
+                        "the daemon buffered %d kB for a client that was not "
+                        "reading" % growth)
+        run("--session", self.name, "--interrupt")
+
+    def test_a_send_without_a_pipe_is_refused(self):
+        """An old client cannot be served: it is waiting for {"out": ...}."""
+        self.start()
+        _pipe, sock = self.raw_send("echo hi", omit_pipe=True)
+        self.assertIn("no output pipe", sock)
+        # ...and the session is unharmed by the refusal.
+        self.assertEqual(self.send("echo fine").stdout, b"fine\n")
+
+    def test_extra_descriptors_are_closed_not_kept(self):
+        # Anything past the two the protocol defines is not part of it.  The
+        # daemon must close them rather than hold a client's descriptor open
+        # for as long as it lives.
+        self.start()
+        info = session_status(self.name)
+        before = len(os.listdir("/proc/%d/fd" % info["pid"]))
+        for _ in range(5):
+            pipe, sock = self.raw_send("echo ok", extra_fds=3)
+            self.assertEqual(pipe.strip(), "ok")
+            self.assertEqual(json.loads(sock)["status"], 0)
+        after = len(os.listdir("/proc/%d/fd" % info["pid"]))
+        self.assertEqual(after, before, "the daemon kept descriptors")
+
+    def test_one_thread_serves_a_command_with_stdin(self):
+        # stdin used to need a thread of its own per command; it is now part
+        # of the same select loop, so a command in flight adds one thread (the
+        # handler), not two.
+        self.start()
+        info = session_status(self.name)
+        tasks = "/proc/%d/task" % info["pid"]
+        idle = len(os.listdir(tasks))
+        proc = subprocess.Popen(
+            [sys.executable, FAKE, "--session", self.name, "sleep 5",
+             "--wait", "20"],
+            env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE)
+        try:
+            proc.stdin.write(b"x" * 1024)
+            proc.stdin.flush()
+            time.sleep(2.0)
+            busy = len(os.listdir(tasks))
+        finally:
+            proc.communicate(timeout=60)
+        self.assertEqual(busy, idle + 1,
+                         "a stdin command should add one thread, not two")
+
+
 class TestSecurity(SessionTest):
     def test_socket_permissions(self):
         self.start()
