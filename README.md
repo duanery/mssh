@@ -185,6 +185,46 @@ mssh --session s --stop        # end it and close the connection
 mssh --sessions                # list every live session
 ```
 
+### Borrowing the connection without the shell
+
+Plenty of commands want the chain but nothing else: a `grep` over a log, a
+`systemctl status`, a `cat` of a config. `--exec` runs those on a channel of
+their own instead of in the session's shell.
+
+```bash
+mssh --session s --exec 'grep -c error /var/log/messages'
+mssh --session s --exec 'cat /etc/nginx/nginx.conf' 2>/dev/null
+mssh --session s --exec 'tar cf - /etc' > etc.tar
+```
+
+It shares the connection, not the shell: a `cd` from an earlier call does
+**not** apply, and neither do that shell's variables, functions or background
+jobs. What you get instead is everything the pty was costing —
+
+- **stdout and stderr stay apart**, since nothing merges them, so
+  `2>/dev/null` and `2>errors.log` do what they say.
+- **The bytes are untouched.** No pty means no line discipline, so no `\r`
+  before a `\n`, no 4095-byte line limit, and no control byte in the data
+  being read as a signal. Binary output survives.
+- **Nothing is framed.** The channel's own exit status ends the command, so
+  there is no marker printed into the output and no `base64`, `printf` or
+  POSIX shell needed on the target.
+- **Several run at once**, including while the session's shell is busy with
+  something else.
+
+`--wait`, `--interrupt`, Ctrl-C, stdin and the exit code behave as they do for
+a normal send, with one deliberate difference: a command that ends any way but
+normally — a `--wait` timeout, an `--interrupt`, a client that walked away — is
+**killed** rather than left running, because closing its channel is what ends
+it and nothing else is waiting on that channel. A shell command in the same
+position keeps running, since the next send has to share the same pty with it.
+
+`--exec` works against a `-c` session too, where it is the only way to reach a
+plain shell on the target.
+
+Use a normal send when the command depends on what came before it, and
+`--exec` when it does not.
+
 ### Holding a program instead of a shell
 
 With `-c`, the session holds an interactive program, and `--prompt` gives the
@@ -209,6 +249,7 @@ can.
   because the session runs behind a pty. The exit code, not the stream, is what
   tells you whether a command failed. (A pty is not optional here: without one
   the two streams arrive unordered, and Ctrl-C cannot be delivered correctly.)
+  `--exec` has no pty and keeps them apart, at the cost of the shell's state.
 - **stdin is forwarded when it is a pipe or a file**, so `echo hello | mssh
   --session s cat` behaves as it would through `ssh`, and it streams — a filter
   fed by a slow producer prints as it goes. The command still runs in the
@@ -293,8 +334,8 @@ points at a specific file.
 | `-V, --version` | Print the version |
 
 Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
-`--interrupt`, `--prompt REGEX`, `--stdin`, `--idle SEC`, `--wait SEC`,
-`--session-idle SEC`.
+`--interrupt`, `--exec`, `--prompt REGEX`, `--stdin`, `--idle SEC`,
+`--wait SEC`, `--session-idle SEC`.
 
 `mssh --help` carries the same detail plus worked examples.
 

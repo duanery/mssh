@@ -1756,10 +1756,12 @@ SESSION_TICK = 0.05
 # program rather than growing here.
 SESSION_BACKLOG = 65536
 
-# Descriptors a request may carry: the output pipe, then stdin.  The cap is
-# the protocol, not a buffer size -- a peer that sends more is not speaking it,
-# and the extras are closed rather than kept.
-SESSION_MAX_FDS = 2
+# Descriptors a request may carry: the output pipe(s), then stdin.  A send
+# carries two at most (stdout, stdin); an exec carries three, since its stderr
+# is a pipe of its own.  The cap is the protocol, not a buffer size -- a peer
+# that sends more is not speaking it, and the extras are closed rather than
+# kept.
+SESSION_MAX_FDS = 3
 
 # Terminal escapes, stripped in interactive mode before --prompt is matched.
 # TERM=dumb stops most of them, but not all: a coloured prompt would put
@@ -2158,6 +2160,26 @@ class _InteractiveFramer(object):
         return (130, False)
 
 
+class _ExecJob(object):
+    """One command running on a channel of its own, outside the session shell.
+
+    Held in the session only so that --interrupt can reach it: there is no pty
+    here and therefore no Ctrl-C to type, so the only way to stop the remote
+    command is to close the channel under it.
+    """
+
+    def __init__(self, chan):
+        self.chan = chan
+        self.aborted = False
+
+    def abort(self):
+        self.aborted = True
+        try:
+            self.chan.close()
+        except Exception:
+            pass
+
+
 class _Session(object):
     """One live remote program behind a pty, framed into request/response.
 
@@ -2175,6 +2197,13 @@ class _Session(object):
     own and polled the channel with a 50 ms blocking recv; this does the same
     work in one place, and wakes the moment anything is ready rather than at
     the next tick.
+
+    The same object also runs commands that do *not* use the shell: --exec
+    opens a channel of its own, with no pty, and copies its two streams to
+    two pipes (exec_run / _pump_exec).  Those take neither the lock nor the
+    pty, so any number of them run at once, alongside whatever the shell is
+    doing; they live here only because they share the transport and because
+    --interrupt has to be able to reach them.
     """
 
     def __init__(self, chan, mark, mode, prompt_re, idle, target, command,
@@ -2204,6 +2233,11 @@ class _Session(object):
         # for the lock -- the command holding it is exactly what needs
         # interrupting -- so it signals through this instead.
         self.abort = threading.Event()
+        # Commands running on channels of their own (--exec).  They do not
+        # touch the pty and do not take the lock, so several run at once and
+        # --interrupt has to be able to find them.
+        self.execs = set()
+        self.execs_lock = threading.Lock()
 
     @property
     def pending(self):
@@ -2495,6 +2529,208 @@ class _Session(object):
         except Exception:
             pass
 
+    # -- a command on a channel of its own --------------------------------
+
+    def exec_run(self, line, wait, out_sink, err_sink, in_fd=None, conn=None):
+        """Run one command on a new channel, outside the session's shell.
+
+        Nothing here touches the pty: a fresh channel is opened, the command
+        runs on it with no terminal at all, and its two streams are copied to
+        two sinks.  That means no framing -- there is no marker to look for,
+        because the channel's own exit status says when the command ended and
+        which code it ended with -- and no carriage returns to strip, because
+        no line discipline ever saw the bytes.  stdout and stderr stay apart
+        for the same reason.
+
+        What is given up is the session itself: open_session starts a new
+        process on the target, so the shell's working directory, variables,
+        functions and background jobs do not apply.  Only the chain is shared.
+        Because the pty lock is not taken, several of these run at once, and
+        one may run while the session's shell is busy with something else.
+
+        A command that ends any way but normally -- a timeout, an interrupt, a
+        client that walked away -- is killed rather than abandoned: the finally
+        below closes the channel, and the server ends the command with it.
+        That is the opposite of a shell command, which has no channel of its
+        own to close and so keeps running on the pty until something stops it;
+        there is nothing here for a later command to collide with, so there is
+        no reason to leave one running with nobody watching.
+        """
+        if self.transport is None:
+            raise _SessionDead("no transport for a command channel")
+        try:
+            chan = self.transport.open_session(timeout=self.timeout)
+        except Exception as exc:
+            raise _SessionDead("could not open a channel: %s" % exc)
+
+        job = _ExecJob(chan)
+        with self.execs_lock:
+            self.execs.add(job)
+        self.served += 1
+        try:
+            chan.settimeout(0.0)
+            try:
+                chan.exec_command(line)
+            except Exception as exc:
+                raise _SessionDead("could not start the command: %s" % exc)
+            return self._pump_exec(job, out_sink, err_sink, time.time() + wait,
+                                   in_fd=in_fd, conn=conn)
+        finally:
+            with self.execs_lock:
+                self.execs.discard(job)
+            try:
+                chan.close()
+            except Exception:
+                pass
+            self.last = time.time()
+
+    def _pump_exec(self, job, out_sink, err_sink, deadline, in_fd=None,
+                   conn=None):
+        """Drive one --exec command to its end.  Returns (status, timed_out).
+
+        The same shape as _pump: one select over everything that can block,
+        in the thread that asked for it.  The differences are all consequences
+        of there being no pty -- the client's stdin goes straight down this
+        channel rather than through a fifo, stderr is a stream of its own, and
+        the end is the channel's exit status rather than a printed marker.
+        """
+        chan = job.chan
+        pending_in = b""
+        in_done = in_fd is None
+        in_closed = False
+        out_eof = err_eof = False
+
+        while True:
+            for sink in (out_sink, err_sink):
+                if not sink.flush():
+                    raise _ClientGone("the client stopped reading")
+
+            # Push whatever stdin we are holding; a timeout means the remote
+            # window is full, so the rest waits for the next turn.
+            while pending_in:
+                try:
+                    sent = chan.send(pending_in)
+                except socket.timeout:
+                    break
+                except Exception:
+                    pending_in, in_fd, in_done = b"", None, True
+                    break
+                if sent == 0:
+                    pending_in, in_fd, in_done = b"", None, True
+                    break
+                pending_in = pending_in[sent:]
+            if in_done and not pending_in and not in_closed:
+                # End of input: the channel's EOF is what the remote command's
+                # read() sees as 0.
+                in_closed = True
+                try:
+                    chan.shutdown_write()
+                except Exception:
+                    pass
+
+            backed_up = (out_sink.backlog >= SESSION_BACKLOG
+                         or err_sink.backlog >= SESSION_BACKLOG)
+            rset = [] if backed_up else [chan]
+            if in_fd is not None and len(pending_in) < SESSION_BACKLOG:
+                rset.append(in_fd)
+            if conn is not None:
+                rset.append(conn)
+            wset = [s.wfd for s in (out_sink, err_sink)
+                    if s.backlog and s.wfd is not None]
+
+            timeout = SESSION_TICK
+            if deadline != float("inf"):
+                timeout = max(0.0, min(timeout, deadline - time.time()))
+            try:
+                ready, _w, _x = select.select(rset, wset, [], timeout)
+            except (select.error, InterruptedError):
+                ready = []
+
+            if conn is not None and conn in ready:
+                try:
+                    alive = bool(conn.recv(65536))
+                except (socket.error, OSError):
+                    alive = False
+                if not alive:
+                    raise _ClientGone("the client hung up")
+
+            if in_fd is not None and in_fd in ready:
+                try:
+                    data = os.read(in_fd, 65536)
+                except OSError:
+                    data = b""
+                if data:
+                    pending_in += data
+                else:
+                    in_fd, in_done = None, True   # the producer is done
+
+            if not backed_up:
+                # Both streams share one channel and one window, so neither is
+                # read ahead of the other: drain whatever has arrived of each.
+                try:
+                    if not out_eof:
+                        out_eof = self._drain_stream(
+                                chan.recv_ready, chan.recv, out_sink)
+                    if not err_eof:
+                        err_eof = self._drain_stream(
+                                chan.recv_stderr_ready, chan.recv_stderr,
+                                err_sink)
+                except socket.timeout:
+                    pass
+                except Exception as exc:
+                    if not job.aborted:
+                        raise _SessionDead("read failed: %s" % exc)
+
+            if job.aborted:
+                # --interrupt closed the channel under us; there is no pty to
+                # type a Ctrl-C into, so that is the only way to stop it.
+                return (130, False)
+
+            # Both streams have to be quiet before the status is taken: the
+            # exit status arrives on the channel while output may still be
+            # buffered in it, and returning on the status alone truncates the
+            # tail of a command that printed right before exiting.
+            quiet = ((out_eof or not chan.recv_ready())
+                     and (err_eof or not chan.recv_stderr_ready()))
+            if not backed_up and quiet and chan.exit_status_ready():
+                try:
+                    status = chan.recv_exit_status()
+                except Exception:
+                    status = -1
+                return (status if status is not None and status >= 0
+                        else -1, False)
+
+            if time.time() >= deadline:
+                return (None, True)
+
+    @staticmethod
+    def _drain_stream(ready, read, sink):
+        """Copy what has arrived on one of a channel's streams.  True at EOF.
+
+        Read until the stream has nothing more for now, rather than once per
+        turn: one select wakeup can cover several packets, and leaving them
+        for the next turn would hold output back by a tick each time.
+        """
+        while ready():
+            data = read(65536)
+            if not data:
+                return True
+            sink.write(data)
+        return False
+
+    def interrupt_execs(self):
+        """Stop every --exec command running on its own channel.
+
+        Closing the channel is the whole mechanism: without a pty there is no
+        Ctrl-C to deliver, and the server kills the command when its channel
+        goes.
+        """
+        with self.execs_lock:
+            jobs = list(self.execs)
+        for job in jobs:
+            job.abort()
+        return len(jobs)
+
     # -- operations -------------------------------------------------------
 
     def run(self, line, wait, sink, in_path=None, in_fd=None, in_chan=None,
@@ -2642,6 +2878,17 @@ class _Session(object):
 #     fds[0]   the write end of the client's output pipe   (always)
 #     fds[1]   the client's own stdin, for "stdin": true   (optional)
 #
+# "op": "exec" is the same exchange for a command that runs on a channel of
+# its own rather than in the session's shell.  It carries one descriptor more,
+# because without a pty the two output streams were never merged:
+#
+#     fds[0]   the write end of the client's stdout pipe   (always)
+#     fds[1]   the write end of the client's stderr pipe   (always)
+#     fds[2]   the client's own stdin, for "stdin": true   (optional)
+#
+# Its reply is the same single status message, and its stdin needs no fifo:
+# the command's own channel carries it natively, since no pty is in the way.
+#
 # stdin is passed the same way rather than being written down the socket: the
 # data is a byte stream of unknown length that must reach the remote command as
 # it arrives ('tail -f | mssh --session s cat' has to work), and reading the
@@ -2735,33 +2982,39 @@ def session_request(name, payload, timeout=None):
     return _parse_reply(name, line)
 
 
-def session_send(name, payload, send_stdin=False):
-    """Run one command: stream its output to stdout, return the final message.
+def _session_pipes(name, payload, outputs, send_stdin=False):
+    """Run one command behind N pipes: copy each to its stream, return the end.
 
-    The output does not come back over the socket.  A pipe is created here and
-    its write end handed to the daemon with the request, so the remote
-    program's bytes are copied into it and read out of it unchanged -- no
-    framing, no base64, no JSON per line.  With send_stdin the local stdin
-    descriptor goes the same way and the daemon feeds the command from it
-    directly.
+    The output does not come back over the socket.  A pipe per stream is
+    created here and its write end handed to the daemon with the request, so
+    the remote program's bytes are copied into it and read out of it unchanged
+    -- no framing, no base64, no JSON per line.  With send_stdin the local
+    stdin descriptor goes the same way and the daemon feeds the command from
+    it directly.
 
-    Both ends are watched until each is finished: the pipe until EOF, which is
-    what says the output is complete, and the socket until its one status
-    message arrives.  The daemon closes the pipe first, so neither order of
-    arrival loses anything.
+    outputs names the local streams, in the order the daemon expects the
+    descriptors: one (merged output) for a session send, two (stdout, stderr)
+    for an --exec.  Every end is watched until it is finished: each pipe until
+    EOF, which is what says that stream is complete, and the socket until its
+    one status message arrives.  The daemon closes the pipes first, so no
+    order of arrival loses anything.
 
     The write side is deliberately left open.  The daemon reads nothing from
     it, so the socket becoming readable on its end means only one thing -- this
     process has gone -- which is how an abandoned command gets noticed.
     """
     conn = _connect_session(name, None)
-    rfd, wfd = os.pipe()
-    out = sys.stdout.buffer
+    pipes = []                            # [(rfd, stream)], in request order
+    wfds = []
     buf = b""
-    message = None
     try:
+        for stream in outputs:
+            rfd, wfd = os.pipe()
+            pipes.append([rfd, stream])
+            wfds.append(wfd)
+
         line = json.dumps(payload).encode("utf-8") + b"\n"
-        fds = [wfd]
+        fds = list(wfds)
         if send_stdin:
             fd = stdin_fd()
             if fd is None:
@@ -2775,26 +3028,28 @@ def session_send(name, payload, send_stdin=False):
             # A request longer than the socket buffer went out in part; the
             # descriptors rode on its first byte, the rest is plain.
             conn.sendall(line[sent:])
-        os.close(wfd)                     # the daemon holds the only write end
-        wfd = None
+        while wfds:                       # the daemon holds the only write end
+            os.close(wfds.pop())
 
         conn.settimeout(None)
-        watch = [rfd, conn]
+        watch = [rfd for rfd, _stream in pipes] + [conn]
         while watch:
             try:
                 ready, _w, _x = select.select(watch, [], [])
             except (select.error, InterruptedError):
                 continue
-            if rfd in ready:
+            for rfd, stream in pipes:
+                if rfd not in ready:
+                    continue
                 try:
                     data = os.read(rfd, 65536)
                 except OSError:
                     data = b""
                 if data:
-                    out.write(data)
-                    out.flush()
+                    stream.write(data)
+                    stream.flush()
                 else:
-                    watch.remove(rfd)     # EOF: the output is complete
+                    watch.remove(rfd)     # EOF: that stream is complete
             if conn in ready:
                 try:
                     data = conn.recv(65536)
@@ -2807,9 +3062,10 @@ def session_send(name, payload, send_stdin=False):
                 else:
                     watch.remove(conn)
     finally:
-        if wfd is not None:
+        for wfd in wfds:
             os.close(wfd)
-        os.close(rfd)
+        for rfd, _stream in pipes:
+            os.close(rfd)
         conn.close()
 
     line = buf.split(b"\n", 1)[0].strip()
@@ -2817,6 +3073,25 @@ def session_send(name, payload, send_stdin=False):
         raise SystemExit("mssh: session %s: the session daemon closed the "
                          "connection without replying" % name)
     return _parse_reply(name, line)
+
+
+def session_send(name, payload, send_stdin=False):
+    """Run one command in the session's shell; its output is already merged."""
+    return _session_pipes(name, payload, [sys.stdout.buffer],
+                          send_stdin=send_stdin)
+
+
+def session_exec(name, payload, send_stdin=False):
+    """Run one command on a channel of its own, stdout and stderr apart.
+
+    Two pipes rather than one: without a pty the remote command's streams are
+    never merged, so they are carried separately all the way to this process's
+    own stdout and stderr, which is what lets 'mssh --session s --exec cmd
+    2>/dev/null' do what it says.
+    """
+    return _session_pipes(name, payload,
+                          [sys.stdout.buffer, sys.stderr.buffer],
+                          send_stdin=send_stdin)
 
 
 def session_alive(name):
@@ -3005,11 +3280,12 @@ def _session_serve(session, srv, path, clients, opts):
         """Handle one request.
 
         held holds the descriptors that arrived with it -- for a send, the
-        output pipe's write end and (with stdin) the client's own stdin.  Each
-        is taken out of the list by whoever becomes responsible for closing it;
-        handle()'s finally closes whatever is left, so no path can leak one.  A
-        descriptor kept open by mistake is not harmless: the client's producer
-        (a 'yes' pipe) would be held for as long as the daemon lives.
+        output pipe's write end and (with stdin) the client's own stdin; for an
+        exec, stdout, stderr and the same optional stdin.  Each is taken out of
+        the list by whoever becomes responsible for closing it; handle()'s
+        finally closes whatever is left, so no path can leak one.  A descriptor
+        kept open by mistake is not harmless: the client's producer (a 'yes'
+        pipe) would be held for as long as the daemon lives.
         """
         def take(index):
             if index < len(held):
@@ -3024,7 +3300,7 @@ def _session_serve(session, srv, path, clients, opts):
                     os.close(fd)
 
         op = req.get("op")
-        if op != "send":
+        if op not in ("send", "exec"):
             drop()
         if op == "status":
             _reply(conn, {
@@ -3038,7 +3314,7 @@ def _session_serve(session, srv, path, clients, opts):
             state["stop"] = True
             _reply(conn, {"ok": True})
             return
-        if op not in ("send", "interrupt"):
+        if op not in ("send", "exec", "interrupt"):
             _reply(conn, {"error": "mssh: unknown request %r" % (op,)})
             return
         if session.dead:
@@ -3053,6 +3329,10 @@ def _session_serve(session, srv, path, clients, opts):
                 die(str(exc))
                 _reply(conn, {"error": "mssh: session ended: %s" % exc})
                 return
+            # An --exec command has no pty to type a Ctrl-C into, so it is
+            # stopped by closing its channel; either kind counts as a command
+            # that was interrupted.
+            signalled = bool(session.interrupt_execs()) or signalled
             # Whatever output the interrupt produced belongs to the client
             # that is still streaming the interrupted command, not to this
             # one, so there is nothing to return but the fact of it.
@@ -3065,6 +3345,11 @@ def _session_serve(session, srv, path, clients, opts):
         if wait <= 0:
             wait = float("inf")           # --wait 0: until it ends or Ctrl-C
         with_stdin = bool(req.get("stdin"))
+
+        if op == "exec":
+            dispatch_exec(conn, req, take, wait, with_stdin)
+            return
+
         if with_stdin and session.mode != "shell":
             # Interactive mode has nowhere safe to put it.  The program owns
             # the pty, so input could only be typed at it, and a pty in
@@ -3144,6 +3429,71 @@ def _session_serve(session, srv, path, clients, opts):
 
         # The pipe is closed above, so the client has already seen the end of
         # the output by the time this arrives.
+        _reply(conn, {"status": status, "timed_out": timed_out, "end": True})
+
+    def dispatch_exec(conn, req, take, wait, with_stdin):
+        """Run one command on a channel of its own, outside the shell.
+
+        Three descriptors instead of two, because without a pty the command's
+        streams were never merged: fds[0] is stdout, fds[1] is stderr, and
+        fds[2] is the client's stdin when it asked for one.  stdin needs no
+        fifo and no writer channel here -- the command's own channel carries
+        it -- so there is far less to set up and far less to take down.
+        """
+        out_fd, err_fd = take(0), take(1)
+        if out_fd is None or err_fd is None:
+            for fd in (out_fd, err_fd):
+                if fd is not None:
+                    os.close(fd)
+            _reply(conn, {"error": "mssh: --exec needs two output pipes with "
+                                   "the request; the running daemon is older "
+                                   "than this client -- --stop the session "
+                                   "and start it again"})
+            return
+        in_fd = take(2) if with_stdin else None
+        if with_stdin and in_fd is None:
+            os.close(out_fd)
+            os.close(err_fd)
+            _reply(conn, {"error": "mssh: stdin was requested but no "
+                                   "descriptor came with it; the running "
+                                   "daemon is older than this client -- "
+                                   "--stop the session and start it again"})
+            return
+
+        try:
+            # Both pipes are written from the one loop below, which must never
+            # block on either: a client reading stdout while ignoring stderr
+            # would otherwise stop the channel being read at all.
+            os.set_blocking(out_fd, False)
+            os.set_blocking(err_fd, False)
+            out_sink, err_sink = _FdSink(out_fd), _FdSink(err_fd)
+
+            try:
+                status, timed_out = session.exec_run(
+                    req.get("line", ""), wait, out_sink, err_sink,
+                    in_fd=in_fd, conn=conn)
+            except _SessionDead as exc:
+                # A channel that could not be opened says nothing about the
+                # session's own shell, which is a different channel and may
+                # well still be fine; do not take the session down for it.
+                _reply(conn, {"error": "mssh: --exec: %s" % exc})
+                return
+            except _ClientGone:
+                return                    # nobody left to tell
+            # Whatever a pipe was too full to take is still output: hand it
+            # over before the descriptor goes, or a slow client loses a tail.
+            out_sink.drain()
+            err_sink.drain()
+        finally:
+            for fd in (out_fd, err_fd, in_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+        # Both pipes are closed above, so the client has already seen the end
+        # of each stream by the time this arrives.
         _reply(conn, {"status": status, "timed_out": timed_out, "end": True})
 
     def die(reason):
@@ -3342,10 +3692,16 @@ def _no_session(name):
 def run_session_send(name, line, opts):
     """Stream one command's output to stdout, then exit with its status.
 
+    With --exec the command runs on a channel of its own rather than in the
+    session's shell, so stdout and stderr arrive apart and nothing of the
+    shell's state applies; everything around it -- Ctrl-C, --wait, stdin, the
+    exit code -- is the same either way.
+
     Ctrl-C here interrupts the remote command, the way it would in a terminal,
     rather than killing this process and leaving the command running: an agent
     or a script that gives up on a command needs the session left usable.
     """
+    use_exec = bool(getattr(opts, "exec_channel", False))
     interrupted = {"count": 0}
 
     def on_sigint(_signum, _frame):
@@ -3369,19 +3725,22 @@ def run_session_send(name, line, opts):
     except ValueError:
         previous = None                   # not the main thread; leave it alone
 
-    request = {"op": "send", "line": line, "wait": opts.wait}
+    request = {"op": "exec" if use_exec else "send",
+               "line": line, "wait": opts.wait}
     if with_stdin:
         request["stdin"] = True
+    call = session_exec if use_exec else session_send
 
     try:
-        verbose(opts, "session %s: sending %d byte(s)%s, waiting up to %s"
-                % (name, len(line),
+        verbose(opts, "session %s: %s %d byte(s)%s, waiting up to %s"
+                % (name, "running on its own channel:" if use_exec
+                   else "sending", len(line),
                    " and forwarding stdin (%s)" % stdin_kind()
                    if with_stdin else "",
                    ("%gs" % opts.wait) if opts.wait > 0 else "forever"))
         started = time.time()
         code = _session_exit_code(
-            name, session_send(name, request, send_stdin=with_stdin),
+            name, call(name, request, send_stdin=with_stdin),
             opts, interrupted)
         verbose(opts, "session %s: finished in %.3fs, exit %d"
                 % (name, time.time() - started, code))
@@ -3529,6 +3888,10 @@ def run_session(parser, opts):
         if opts.args:
             parser.error("--%s takes no other arguments" % controls[0])
             return 2
+        if opts.exec_channel:
+            parser.error("--exec runs a command; it cannot be combined with "
+                         "--%s" % controls[0])
+            return 2
         try:
             if controls[0] == "status":
                 return run_session_status(name)
@@ -3583,6 +3946,13 @@ def run_session(parser, opts):
             # session that was never there: from here they are the same thing.
             _no_session(name)
 
+    if opts.exec_channel:
+        # --exec borrows a live session's chain; there is nothing to borrow
+        # before one exists, and the first call is the one that builds it.
+        parser.error("--exec runs a command in an existing session; start "
+                     "one first with: mssh --session %s [-j <jump>...] "
+                     "<target>" % name)
+        return 2
     if len(opts.args) != 1:
         _no_session(name)
     try:
@@ -3711,6 +4081,19 @@ persistent session (keep one connection and one shell alive):
   stdin is /dev/null, so a bare 'cat' ends instead of hanging the session.  A
   program that paginates will stall at its pager until --interrupt, so
   turn paging off in the program itself (gdb: -ex 'set pagination off').
+
+  --exec runs a command on a channel of its own instead of in the shell,
+  for the many commands that want the chain but no context:
+  mssh --session s --exec 'grep -c error /var/log/messages'
+  mssh --session s --exec 'cat big.log' 2>/dev/null   # stderr is separate
+  It shares the connection, not the shell, so a 'cd' from an earlier call
+  does NOT apply and neither do its variables or functions.  In exchange
+  there is no pty: stdout and stderr stay apart, nothing is framed and no
+  carriage returns are added, and several --exec commands can run at once,
+  even while the session's own shell is busy.  --wait, --interrupt, Ctrl-C,
+  stdin and the exit code behave as they do without it, except that a
+  command cut short -- a timeout, an interrupt, a client that walked away --
+  is killed with its channel rather than left running on the target.
 
   Sessions live in ~/.mssh/sessions, one socket each, mode 0600: holding
   one is equivalent to being logged in on the target.
@@ -3869,6 +4252,16 @@ def build_parser():
              "Ctrl-D would then be needed by every command, 'ls' included",
     )
     group.add_argument(
+        "--exec", dest="exec_channel", action="store_true",
+        help="run the command on a channel of its own instead of in the "
+             "session's shell.  It shares the connection but not the shell, "
+             "so the session's working directory, variables and functions do "
+             "NOT apply -- in exchange stdout and stderr come back separately "
+             "(no pty merges them), nothing is framed, and several such "
+             "commands can run at once.  Use it for the many commands that "
+             "need the chain but no context",
+    )
+    group.add_argument(
         "--idle", type=float, default=DEFAULT_SESSION_IDLE, metavar="SEC",
         help="without --prompt, how long output must pause before it counts "
              "as finished (default: %g)" % DEFAULT_SESSION_IDLE,
@@ -3916,6 +4309,11 @@ def main(argv=None):
             return 2
     if opts.prompt is not None:
         parser.error("--prompt only applies to --session -c")
+        return 2
+    if opts.exec_channel:
+        parser.error("--exec runs a command in a session's connection; name "
+                     "the session with --session NAME (without a session, a "
+                     "plain -c already runs on its own channel)")
         return 2
 
     if not opts.args:

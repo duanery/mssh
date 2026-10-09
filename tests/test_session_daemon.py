@@ -991,19 +991,22 @@ class TestRegression(unittest.TestCase):
         self.assertIn(b"no target given", proc.stderr)
 
     def test_non_session_paths_reach_the_chain(self):
-        # The fake chain only implements what a session needs, so the plain
-        # -c and copy paths are checked for reaching run_command/run_copy
-        # rather than for their output; the real ones are covered elsewhere.
-        # pump() runs to completion against the fake -- it treats every
-        # error as a dropped connection -- so the -c marker is the first
-        # thing only run_command itself asks for.
-        for argv, want in [(["root@10.0.0.1", "-c", "echo plain"],
-                            b"recv_exit_status"),
-                           (["./setup.py", "root@10.0.0.1:/tmp/"],
-                            b"open_sftp")]:
-            proc = subprocess.run([sys.executable, FAKE] + argv,
-                                  capture_output=True, env=ENV, timeout=30)
-            self.assertIn(want, proc.stderr, "%r: %r" % (argv, proc.stderr))
+        # -c runs end to end against the fake: a channel of its own, no pty,
+        # and the exit status taken from the channel -- the same shape --exec
+        # uses inside a session, which is why the fake can serve both.
+        proc = subprocess.run([sys.executable, FAKE, "root@10.0.0.1",
+                               "-c", "echo plain"],
+                              capture_output=True, env=ENV, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"plain", proc.stdout)
+
+        # The fake chain has no sftp, so the copy path is checked for reaching
+        # run_copy rather than for its result; the real one is covered by
+        # test_copy_mode.py against OpenSSH's own sftp-server.
+        proc = subprocess.run([sys.executable, FAKE, "./setup.py",
+                               "root@10.0.0.1:/tmp/"],
+                              capture_output=True, env=ENV, timeout=30)
+        self.assertIn(b"open_sftp", proc.stderr, proc.stderr)
 
 
 if __name__ == "__main__":

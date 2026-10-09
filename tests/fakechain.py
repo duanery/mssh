@@ -135,6 +135,17 @@ class _PtyChan(FakeChan):
             return self.proc.poll() is not None
         return FakeChan.exit_status_ready(self)
 
+    def recv_exit_status(self):
+        """The command's exit code, as a real channel reports it.
+
+        What --exec frames on: a command running on its own channel has no
+        marker printed into its output, so the channel itself is what says how
+        it ended.
+        """
+        if self.proc is None:
+            return -1
+        return self.proc.wait()
+
     def close(self):
         self.closed = True
         if self.proc is not None:
