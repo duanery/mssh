@@ -830,6 +830,152 @@ def stdin_fd():
     return fd
 
 
+def _both_ends_are_tty():
+    """True when this process's stdin and stdout are both terminals.
+
+    The test for whether a remote program can be given a terminal to drive.
+    Both ends matter and for different reasons: stdin is what the keystrokes
+    come from and what raw mode is set on, stdout is what the program's cursor
+    motion has to land on.  With either one redirected a pty would only damage
+    the result -- 'mssh --session s --exec -t top > log' would fill the file
+    with escape sequences, and nothing would be typing at it.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError, IOError):
+        return False
+
+
+class _RawTerminal(object):
+    """Hold the local terminal in raw mode for as long as a remote one runs.
+
+    Only the client does this.  Once the remote program has a pty, that pty is
+    the line discipline -- it echoes, it edits, it turns ^C into a signal -- so
+    a local terminal still doing the same work would do all of it twice: every
+    keystroke echoed locally and again by the remote, a Ctrl-C killing mssh
+    instead of reaching the program, and a line held back until Enter when the
+    program wanted the key itself.
+
+    Nothing of this belongs in the daemon.  It is detached, its own standard
+    descriptors are /dev/null, and the terminal in question is this process's.
+    """
+
+    def __init__(self, fd):
+        self.fd = fd
+        self.saved = None
+
+    def __enter__(self):
+        if self.fd is None:
+            return self
+        import termios
+        import tty
+        try:
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setraw(self.fd)
+            tty.setcbreak(self.fd)
+        except Exception:
+            self.saved = None
+        return self
+
+    def __exit__(self, *_exc):
+        if self.saved is None:
+            return False
+        import termios
+        try:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        except Exception:
+            pass
+        self.saved = None
+        return False
+
+
+class _WindowWatcher(object):
+    """Tell the daemon when this terminal is resized, so the remote pty follows.
+
+    The size is sent once with the request, which is right until the window is
+    dragged: from then on the remote program is drawing to the old one, and a
+    full-screen program -- an editor, top, anything using curses -- paints over
+    the wrong rectangle and stays wrong until it is restarted.  SIGWINCH is the
+    only notice there is, so it has to be carried across while the command runs.
+
+    It goes down the connection the command is already using.  That socket is
+    open for the command's whole life and the daemon's loop is already watching
+    it; a second connection would have to say which of several running commands
+    it meant, and this one is the answer by being that command's own.
+
+    The handler itself does nothing but write a byte to a pipe.  It can arrive
+    in the middle of anything, so it must not send or allocate; the pipe is
+    what turns an asynchronous signal into one more descriptor for the client's
+    select loop, which then does the work with nothing interrupted.  That pipe
+    is also the only way the loop hears about it at all: a select blocked with
+    no timeout retries itself after a handler returns (PEP 475), so a flag set
+    in the handler would go unread until the command happened to print.
+    """
+
+    def __init__(self):
+        self.rfd = self.wfd = None
+        self.previous = None
+        self.last = None
+
+    def fileno(self):
+        return self.rfd
+
+    def __enter__(self):
+        self.rfd, self.wfd = os.pipe()
+        os.set_blocking(self.rfd, False)
+        os.set_blocking(self.wfd, False)
+
+        def on_winch(_signum, _frame):
+            try:
+                os.write(self.wfd, b"w")
+            except OSError:
+                pass          # the pipe is full: a wakeup is already pending
+
+        try:
+            self.previous = signal.signal(signal.SIGWINCH, on_winch)
+        except (ValueError, AttributeError, OSError):
+            self.previous = None
+        self.last = term_size()
+        return self
+
+    def pump(self, conn):
+        """Drain the pipe and send the new size down the command's socket."""
+        try:
+            while os.read(self.rfd, 4096):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+        size = term_size()
+        if size == self.last:
+            return                        # a SIGWINCH that changed nothing
+        self.last = size
+        try:
+            conn.sendall(json.dumps({"op": "resize", "cols": size[0],
+                                     "rows": size[1]}).encode("utf-8") + b"\n")
+        except (socket.error, OSError):
+            # A resize is cosmetic.  The command is still running and its
+            # output is still arriving; losing one is not worth ending over,
+            # and a socket that is really gone is noticed where it matters --
+            # in the loop reading the status.
+            pass
+
+    def __exit__(self, *_exc):
+        if self.previous is not None:
+            try:
+                signal.signal(signal.SIGWINCH, self.previous)
+            except Exception:
+                pass
+            self.previous = None
+        for fd in (self.rfd, self.wfd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.rfd = self.wfd = None
+        return False
+
+
 def pump(chan, is_tty=False):
     """Bridge local stdin/stdout/stderr and the remote channel until it closes.
 
@@ -1864,7 +2010,7 @@ def stdin_kind(fd=None):
     return "pipe"
 
 
-def want_stdin(opts):
+def want_stdin(opts, with_pty=False):
     """True if this send should carry the client's stdin to the remote command.
 
     A pipe or a regular file is forwarded: that is 'echo aa | mssh --session s
@@ -1875,12 +2021,19 @@ def want_stdin(opts):
     the user to type an EOF before the command could finish.
 
     /dev/null and a closed stdin are never forwarded; there is nothing to send.
+
+    with_pty inverts the terminal rule, and only that rule: the command is
+    about to be given a terminal to read from, which is exactly the case the
+    default is written to avoid.  It says the pty was really asked for, not
+    merely that -t was typed -- with stdout redirected there is no pty, and
+    forwarding the terminal anyway would leave 'mssh --session s --exec -t ls
+    > out' waiting for a Ctrl-D that the user has no reason to type.
     """
     if opts.no_stdin:
         return False
     kind = stdin_kind()
     if kind == "tty":
-        return bool(opts.stdin)
+        return bool(with_pty or opts.stdin)
     return kind in ("pipe", "file")
 
 
@@ -2596,16 +2749,26 @@ class _Session(object):
 
     # -- a command on a channel of its own --------------------------------
 
-    def exec_run(self, line, wait, out_sink, err_sink, in_fd=None, conn=None):
+    def exec_run(self, line, wait, out_sink, err_sink, in_fd=None, conn=None,
+                 pty=None, control=b""):
         """Run one command on a new channel, outside the session's shell.
 
-        Nothing here touches the pty: a fresh channel is opened, the command
-        runs on it with no terminal at all, and its two streams are copied to
-        two sinks.  That means no framing -- there is no marker to look for,
-        because the channel's own exit status says when the command ended and
-        which code it ended with -- and no carriage returns to strip, because
-        no line discipline ever saw the bytes.  stdout and stderr stay apart
-        for the same reason.
+        Nothing here touches the session's pty: a fresh channel is opened, the
+        command runs on it with no terminal at all, and its two streams are
+        copied to two sinks.  That means no framing -- there is no marker to
+        look for, because the channel's own exit status says when the command
+        ended and which code it ended with -- and no carriage returns to strip,
+        because no line discipline ever saw the bytes.  stdout and stderr stay
+        apart for the same reason.
+
+        pty is the exception, and it is the client's decision alone: a dict of
+        term/cols/rows asks the server for a terminal on this channel, for the
+        programs that refuse to run without one.  The terminal then belongs to
+        the client's own -- it is the client that put its tty in raw mode and
+        whose window size came with the request -- so nothing here translates
+        or inspects the bytes either way.  With a pty the server merges stderr
+        into stdout, so the stderr sink stays empty; that is the terminal's
+        doing, not ours.
 
         What is given up is the session itself: open_session starts a new
         process on the target, so the shell's working directory, variables,
@@ -2633,13 +2796,21 @@ class _Session(object):
             self.execs.add(job)
         self.served += 1
         try:
+            if pty:
+                try:
+                    chan.get_pty(term=pty.get("term") or "xterm-256color",
+                                 width=int(pty.get("cols") or 80),
+                                 height=int(pty.get("rows") or 24))
+                except Exception as exc:
+                    raise _SessionDead("the server refused a terminal for "
+                                       "the command: %s" % exc)
             chan.settimeout(0.0)
             try:
                 chan.exec_command(line)
             except Exception as exc:
                 raise _SessionDead("could not start the command: %s" % exc)
             return self._pump_exec(job, out_sink, err_sink, time.time() + wait,
-                                   in_fd=in_fd, conn=conn)
+                                   in_fd=in_fd, conn=conn, control=control)
         finally:
             with self.execs_lock:
                 self.execs.discard(job)
@@ -2650,7 +2821,7 @@ class _Session(object):
             self.last = time.time()
 
     def _pump_exec(self, job, out_sink, err_sink, deadline, in_fd=None,
-                   conn=None):
+                   conn=None, control=b""):
         """Drive one --exec command to its end.  Returns (status, timed_out).
 
         The same shape as _pump: one select over everything that can block,
@@ -2658,12 +2829,29 @@ class _Session(object):
         of there being no pty -- the client's stdin goes straight down this
         channel rather than through a fifo, stderr is a stream of its own, and
         the end is the channel's exit status rather than a printed marker.
+
+        The one thing that does come back up the request socket is a resize:
+        with --exec -t the client is sitting in a window that can be dragged
+        while the command runs, and the remote pty has to be told or a
+        full-screen program keeps painting the old rectangle.  Those lines
+        arrive on the connection this command already owns, read here, in the
+        turn of the loop that noticed them -- the client has one connection
+        per command and this loop is awake for its whole length, so there is
+        nothing to look the channel up by and no second connection to make.
+
+        control is what came in behind the request line, for the window that
+        was dragged before the request had finished being read.  It is the
+        same bytes from the same socket, so it goes through the same parser
+        rather than being treated as a case of its own.
         """
         chan = job.chan
         pending_in = b""
         in_done = in_fd is None
         in_closed = False
         out_eof = err_eof = False
+        while b"\n" in control:
+            one, control = control.split(b"\n", 1)
+            self._exec_control(chan, one)
 
         while True:
             for sink in (out_sink, err_sink):
@@ -2713,11 +2901,23 @@ class _Session(object):
 
             if conn is not None and conn in ready:
                 try:
-                    alive = bool(conn.recv(65536))
+                    data = conn.recv(65536)
                 except (socket.error, OSError):
-                    alive = False
-                if not alive:
+                    data = b""
+                if not data:
                     raise _ClientGone("the client hung up")
+                # Anything the client does send while its command runs is a
+                # control line.  Only whole ones are acted on; the rest waits
+                # for the bytes that finish it.
+                control += data
+                while b"\n" in control:
+                    one, control = control.split(b"\n", 1)
+                    self._exec_control(chan, one)
+                if len(control) > 65536:
+                    # Not a control line: nothing in the protocol is that
+                    # long, so it is a client talking to the wrong daemon.
+                    raise _ClientGone("the client sent a request that is not "
+                                      "one")
 
             if in_fd is not None and in_fd in ready:
                 try:
@@ -2782,6 +2982,31 @@ class _Session(object):
                 return True
             sink.write(data)
         return False
+
+    @staticmethod
+    def _exec_control(chan, line):
+        """Act on one JSON line the client sent while its command runs.
+
+        Only a resize so far, and nothing here may fail the command: a line
+        that cannot be parsed, names something unknown, or is refused by the
+        server is dropped.  The command is still running and its output is
+        still arriving, and a window that did not get resized is worth less
+        than the command it would have ended.
+        """
+        line = line.strip()
+        if not line:
+            return
+        try:
+            msg = json.loads(line.decode("utf-8"))
+        except Exception:
+            return
+        if not isinstance(msg, dict) or msg.get("op") != "resize":
+            return
+        try:
+            chan.resize_pty(width=int(msg.get("cols") or 0),
+                            height=int(msg.get("rows") or 0))
+        except Exception:
+            pass
 
     def interrupt_execs(self):
         """Stop every --exec command running on its own channel.
@@ -2924,9 +3149,10 @@ class _Session(object):
 
 # -- wire protocol ---------------------------------------------------------
 #
-# One request per connection, so a wedged request cannot block the socket for
+# One command per connection, so a wedged one cannot block the socket for
 # everyone else.  The socket carries JSON and nothing else, in both directions:
-# the request is one line of it, and the reply is exactly one more line.
+# the request is one line of it and the reply is exactly one more line, with
+# only --exec -t adding anything in between (the resize lines below).
 #
 # The command's output does not travel on the socket at all.  It goes over a
 # pipe the *client* creates and whose write end it hands over with the request
@@ -2953,6 +3179,21 @@ class _Session(object):
 #
 # Its reply is the same single status message, and its stdin needs no fifo:
 # the command's own channel carries it natively, since no pty is in the way.
+#
+# An exec may carry a "pty": {"term": ..., "cols": N, "rows": N} for a command
+# that will not run without a terminal.  The size is the client's window and
+# the raw mode that goes with it is the client's own terminal: the daemon is
+# detached and has no terminal to set, so the request is all that crosses.
+#
+# That window can then be dragged while the command runs, and a resized one is
+# the single thing a client sends *after* its request:
+#
+#     {"op": "resize", "cols": N, "rows": N}\n
+#
+# up the connection the command is already using, read by the loop driving that
+# command and turned into a window-change on its channel.  It is not answered
+# and it cannot fail the command -- an unparseable or impossible one is
+# dropped.  No identifier is needed: the connection is the command.
 #
 # stdin is passed the same way rather than being written down the socket: the
 # data is a byte stream of unknown length that must reach the remote command as
@@ -3047,7 +3288,7 @@ def session_request(name, payload, timeout=None):
     return _parse_reply(name, line)
 
 
-def _session_pipes(name, payload, outputs, send_stdin=False):
+def _session_pipes(name, payload, outputs, send_stdin=False, watcher=None):
     """Run one command behind N pipes: copy each to its stream, return the end.
 
     The output does not come back over the socket.  A pipe per stream is
@@ -3064,9 +3305,17 @@ def _session_pipes(name, payload, outputs, send_stdin=False):
     one status message arrives.  The daemon closes the pipes first, so no
     order of arrival loses anything.
 
-    The write side is deliberately left open.  The daemon reads nothing from
-    it, so the socket becoming readable on its end means only one thing -- this
-    process has gone -- which is how an abandoned command gets noticed.
+    watcher is the SIGWINCH pipe of an --exec -t, watched alongside those: a
+    resize has to be sent while the command runs, and this loop is the only
+    place awake for its whole length.  It never ends the loop -- a window that
+    was resized is not a command that is over -- so it is not in the list the
+    loop drains down to nothing.
+
+    The write side is deliberately left open, and with --exec -t it is used:
+    the resize lines go up it.  A send with no watcher writes nothing after
+    the request, so the socket becoming readable on the daemon's end still
+    means what it always did -- this process has gone -- which is how an
+    abandoned command gets noticed.
     """
     conn = _connect_session(name, None)
     pipes = []                            # [(rfd, stream)], in request order
@@ -3100,9 +3349,12 @@ def _session_pipes(name, payload, outputs, send_stdin=False):
         watch = [rfd for rfd, _stream in pipes] + [conn]
         while watch:
             try:
-                ready, _w, _x = select.select(watch, [], [])
+                ready, _w, _x = select.select(
+                    watch + ([watcher.fileno()] if watcher else []), [], [])
             except (select.error, InterruptedError):
                 continue
+            if watcher is not None and watcher.fileno() in ready:
+                watcher.pump(conn)
             for rfd, stream in pipes:
                 if rfd not in ready:
                     continue
@@ -3140,13 +3392,13 @@ def _session_pipes(name, payload, outputs, send_stdin=False):
     return _parse_reply(name, line)
 
 
-def session_send(name, payload, send_stdin=False):
+def session_send(name, payload, send_stdin=False, watcher=None):
     """Run one command in the session's shell; its output is already merged."""
     return _session_pipes(name, payload, [sys.stdout.buffer],
-                          send_stdin=send_stdin)
+                          send_stdin=send_stdin, watcher=watcher)
 
 
-def session_exec(name, payload, send_stdin=False):
+def session_exec(name, payload, send_stdin=False, watcher=None):
     """Run one command on a channel of its own, stdout and stderr apart.
 
     Two pipes rather than one: without a pty the remote command's streams are
@@ -3156,7 +3408,7 @@ def session_exec(name, payload, send_stdin=False):
     """
     return _session_pipes(name, payload,
                           [sys.stdout.buffer, sys.stderr.buffer],
-                          send_stdin=send_stdin)
+                          send_stdin=send_stdin, watcher=watcher)
 
 
 def session_alive(name):
@@ -3323,10 +3575,14 @@ def _session_serve(session, srv, path, clients, opts):
                 data += chunk
             if not data.strip():
                 return
-            req = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
-            # Nothing else is read from this socket: the output pipe and stdin
-            # are the descriptors above, and what remains is one JSON reply.
-            dispatch(conn, req, held)
+            head, rest = data.split(b"\n", 1)
+            req = json.loads(head.decode("utf-8"))
+            # Whatever came after the request line is not read here.  Only an
+            # --exec -t sends anything more -- a resize, when the client's
+            # window changed before this read drained the socket -- and that
+            # belongs to the loop driving the command, so it is handed over
+            # rather than dropped.
+            dispatch(conn, req, held, rest)
         except Exception as exc:                          # never kill the loop
             _reply(conn, {"error": "mssh: session daemon: %s" % exc})
         finally:
@@ -3341,8 +3597,11 @@ def _session_serve(session, srv, path, clients, opts):
             except Exception:
                 pass
 
-    def dispatch(conn, req, held):
+    def dispatch(conn, req, held, rest=b""):
         """Handle one request.
+
+        rest is whatever arrived behind the request line, for the one op that
+        can have any: an --exec -t whose window was resized straight away.
 
         held holds the descriptors that arrived with it -- for a send, the
         output pipe's write end and (with stdin) the client's own stdin; for an
@@ -3412,7 +3671,7 @@ def _session_serve(session, srv, path, clients, opts):
         with_stdin = bool(req.get("stdin"))
 
         if op == "exec":
-            dispatch_exec(conn, req, take, wait, with_stdin)
+            dispatch_exec(conn, req, take, wait, with_stdin, rest)
             return
 
         if with_stdin and session.mode != "shell":
@@ -3496,7 +3755,7 @@ def _session_serve(session, srv, path, clients, opts):
         # the output by the time this arrives.
         _reply(conn, {"status": status, "timed_out": timed_out, "end": True})
 
-    def dispatch_exec(conn, req, take, wait, with_stdin):
+    def dispatch_exec(conn, req, take, wait, with_stdin, rest=b""):
         """Run one command on a channel of its own, outside the shell.
 
         Three descriptors instead of two, because without a pty the command's
@@ -3504,6 +3763,13 @@ def _session_serve(session, srv, path, clients, opts):
         fds[2] is the client's stdin when it asked for one.  stdin needs no
         fifo and no writer channel here -- the command's own channel carries
         it -- so there is far less to set up and far less to take down.
+
+        A "pty" in the request asks for a terminal on that channel, which the
+        client sends only when it has a terminal of its own on both ends.  The
+        raw mode that goes with it is the client's business too: the daemon has
+        no terminal at all -- it is a detached process whose standard
+        descriptors are /dev/null -- so there is nothing here to put in raw
+        mode and nothing to translate.
         """
         out_fd, err_fd = take(0), take(1)
         if out_fd is None or err_fd is None:
@@ -3533,10 +3799,13 @@ def _session_serve(session, srv, path, clients, opts):
             os.set_blocking(err_fd, False)
             out_sink, err_sink = _FdSink(out_fd), _FdSink(err_fd)
 
+            pty = req.get("pty") or None
+            if pty is not None and not isinstance(pty, dict):
+                pty = {}
             try:
                 status, timed_out = session.exec_run(
                     req.get("line", ""), wait, out_sink, err_sink,
-                    in_fd=in_fd, conn=conn)
+                    in_fd=in_fd, conn=conn, pty=pty, control=rest)
             except _SessionDead as exc:
                 # A channel that could not be opened says nothing about the
                 # session's own shell, which is a different channel and may
@@ -3762,11 +4031,20 @@ def run_session_send(name, line, opts):
     shell's state applies; everything around it -- Ctrl-C, --wait, stdin, the
     exit code -- is the same either way.
 
+    --exec -t asks for a terminal on that channel, for the programs that will
+    not run without one, and then this terminal is the one the remote program
+    is really driving: it goes into raw mode for as long as the command runs,
+    so a keystroke reaches the program unedited and what the program draws is
+    not rewritten on the way out.  That only happens when both ends are a
+    terminal -- with either one redirected there is nothing to put in raw mode
+    and no size to send, so the pty is not requested at all.
+
     Ctrl-C here interrupts the remote command, the way it would in a terminal,
     rather than killing this process and leaving the command running: an agent
     or a script that gives up on a command needs the session left usable.
     """
     use_exec = bool(getattr(opts, "exec_channel", False))
+    want_pty = use_exec and opts.force_tty and _both_ends_are_tty()
     interrupted = {"count": 0}
 
     def on_sigint(_signum, _frame):
@@ -3782,7 +4060,7 @@ def run_session_send(name, line, opts):
         except (SessionGone, SystemExit, OSError):
             pass
 
-    with_stdin = want_stdin(opts)
+    with_stdin = want_stdin(opts, with_pty=want_pty)
 
     previous = signal.getsignal(signal.SIGINT)
     try:
@@ -3794,19 +4072,33 @@ def run_session_send(name, line, opts):
                "line": line, "wait": opts.wait}
     if with_stdin:
         request["stdin"] = True
+    if want_pty:
+        cols, rows = term_size()
+        request["pty"] = {"term": os.environ.get("TERM", "xterm-256color"),
+                          "cols": cols, "rows": rows}
     call = session_exec if use_exec else session_send
 
     try:
-        verbose(opts, "session %s: %s %d byte(s)%s, waiting up to %s"
+        verbose(opts, "session %s: %s %d byte(s)%s%s, waiting up to %s"
                 % (name, "running on its own channel:" if use_exec
                    else "sending", len(line),
+                   " with a terminal" if want_pty else "",
                    " and forwarding stdin (%s)" % stdin_kind()
                    if with_stdin else "",
                    ("%gs" % opts.wait) if opts.wait > 0 else "forever"))
         started = time.time()
-        code = _session_exit_code(
-            name, call(name, request, send_stdin=with_stdin),
-            opts, interrupted)
+        # Raw from here until the command is over: the remote pty owns the
+        # line discipline now, so this one must not edit, echo or signal on
+        # the same keystrokes.  The watcher keeps the remote pty the size of
+        # this window for as long as the program is drawing in it.
+        with _RawTerminal(stdin_fd() if want_pty else None):
+            if want_pty:
+                with _WindowWatcher() as watcher:
+                    reply = call(name, request, send_stdin=with_stdin,
+                                 watcher=watcher)
+            else:
+                reply = call(name, request, send_stdin=with_stdin)
+        code = _session_exit_code(name, reply, opts, interrupted)
         verbose(opts, "session %s: finished in %.3fs, exit %d"
                 % (name, time.time() - started, code))
         return code
@@ -3969,9 +4261,15 @@ def run_session(parser, opts):
     if opts.copy_id:
         parser.error("--copy-id cannot be combined with --session")
         return 2
-    if opts.force_tty:
-        parser.error("-t cannot be combined with --session; a session always "
-                     "allocates a pty")
+    if opts.force_tty and not opts.exec_channel:
+        parser.error("-t only applies to --session --exec; the session's own "
+                     "shell already runs behind a pty, and a command sent to "
+                     "it reads a fifo rather than that terminal")
+        return 2
+    if opts.force_tty and opts.no_stdin:
+        parser.error("-t and -n contradict each other: a command given a "
+                     "terminal is given one to read from, and -n is what says "
+                     "not to forward it any input")
         return 2
     if opts.recursive or opts.preserve:
         parser.error("-r/-p only apply to a file copy, not to --session")
@@ -4160,6 +4458,17 @@ persistent session (keep one connection and one shell alive):
   command cut short -- a timeout, an interrupt, a client that walked away --
   is killed with its channel rather than left running on the target.
 
+  --exec -t asks for a pty on that channel, for the programs that refuse
+  to run without one, and then it is a login rather than a command:
+  mssh --session s --exec -t 'vim /etc/hosts'
+  mssh --session s --exec -t top
+  Your terminal becomes the program's input, goes raw until it ends,
+  resizing your window resizes the remote one, and --wait
+  defaults to 0, because time spent in an editor is not evidence that
+  anything is stuck.  Both your stdin and your stdout have to be a terminal
+  for any of that; redirect either and the command runs without a pty, the
+  way it does without -t.
+
   Sessions live in ~/.mssh/sessions, one socket each, mode 0600: holding
   one is equivalent to being logged in on the target.
 
@@ -4242,7 +4551,14 @@ def build_parser():
     )
     parser.add_argument(
         "-t", "--force-tty", action="store_true",
-        help="allocate a pty even with -c",
+        help="allocate a pty even with -c.  With --session it applies to "
+             "--exec only, for a program that refuses to run without a "
+             "terminal (vim, top, an interactive installer): the pty is "
+             "requested, your terminal is forwarded as its input, goes "
+             "raw for the length of the command, resizing your window "
+             "resizes the remote one, and --wait defaults to 0 since you are "
+             "sitting at the program.  A session's own shell already has a "
+             "pty, so the flag has no meaning there",
     )
     parser.add_argument(
         "-n", "--no-stdin", action="store_true",
@@ -4332,12 +4648,12 @@ def build_parser():
              "as finished (default: %g)" % DEFAULT_SESSION_IDLE,
     )
     group.add_argument(
-        "--wait", type=float, default=DEFAULT_SESSION_WAIT, metavar="SEC",
+        "--wait", type=float, default=None, metavar="SEC",
         help="how long to wait for a command to finish; its output streams "
              "as it arrives either way, and the session survives a timeout.  "
              "0 waits indefinitely, so a command that never ends keeps "
-             "printing until you Ctrl-C it (default: %g)"
-             % DEFAULT_SESSION_WAIT,
+             "printing until you Ctrl-C it (default: %g, or 0 with --exec -t, "
+             "where you are sitting at the program)" % DEFAULT_SESSION_WAIT,
     )
     group.add_argument(
         "--session-idle", type=float, default=0, metavar="SEC",
@@ -4356,6 +4672,16 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     opts = parser.parse_args(argv)
+
+    if opts.wait is None:
+        # --exec -t is a login, not a command: somebody is sitting at the
+        # program, and the time they spend in an editor or a debugger is not
+        # evidence that anything is stuck.  A deadline that cut it off mid-use
+        # would be the opposite of what asking for a terminal meant, so that
+        # case waits as long as the program lives and every other case keeps
+        # the deadline that catches a command which never ends.
+        opts.wait = 0.0 if (opts.exec_channel and opts.force_tty) \
+            else DEFAULT_SESSION_WAIT
 
     if opts.sessions:
         if opts.session or opts.args:

@@ -222,6 +222,37 @@ position keeps running, since the next send has to share the same pty with it.
 `--exec` works against a `-c` session too, where it is the only way to reach a
 plain shell on the target.
 
+#### A terminal for the programs that need one
+
+Some commands refuse to run without one. `-t` asks for a pty on the `--exec`
+channel, and then the call is a login rather than a command:
+
+```bash
+mssh --session s --exec -t 'vim /etc/hosts'
+mssh --session s --exec -t top
+mssh --session s --exec -t 'mysql -u root -p'
+```
+
+With `-t`:
+
+- **Your terminal is forwarded as the program's input**, which is the one case
+  the default rule holds back — here it is exactly what the program reads.
+- **Your terminal goes raw** for as long as the command runs and is restored
+  after. The remote pty is the line discipline now; a local one still echoing
+  and editing would do all of it twice.
+- **Resizing your window resizes the remote one**, so a full-screen program
+  keeps painting the right rectangle.
+- **`--wait` defaults to 0** — indefinite. Time spent in an editor is not
+  evidence that anything is stuck.
+
+All of that needs a terminal on **both** ends. Redirect either one and the
+command runs without a pty, as it would without `-t`: there would be nothing
+to put in raw mode, no size to send, and `--exec -t top > log` would otherwise
+fill the file with escape sequences.
+
+`-t` applies to `--exec` only. The session's own shell already runs behind a
+pty, and a command sent to it reads a fifo rather than your terminal.
+
 Use a normal send when the command depends on what came before it, and
 `--exec` when it does not.
 
@@ -261,9 +292,9 @@ can.
   a script being read from a pipe. `/dev/null` is never forwarded — it cannot be
   told apart from having no input, so a bare `cat` still ends instead of wedging
   the session.
-- **`--wait SEC`** (default 30) bounds how long one command is watched; `0`
-  means indefinitely. A timeout exits 124 and leaves the session usable — the
-  next command stops whatever was still running.
+- **`--wait SEC`** (default 30, or 0 with `--exec -t`) bounds how long one
+  command is watched; `0` means indefinitely. A timeout exits 124 and leaves
+  the session usable — the next command stops whatever was still running.
 - **Ctrl-C interrupts the remote command**, not your local process, so the
   session survives it. Press it twice to walk away and leave the command
   running.
@@ -316,7 +347,7 @@ points at a specific file.
 | --- | --- |
 | `-j, --jump SPEC` | Add a jump host; repeat for each hop, in order |
 | `-c, --command CMD` | Run `CMD` instead of opening a shell |
-| `-t, --force-tty` | Allocate a pty even with `-c` |
+| `-t, --force-tty` | Allocate a pty even with `-c`; with `--session --exec`, run the command on a terminal |
 | `-n, --no-stdin` | Never forward stdin; the remote command reads `/dev/null` |
 | `-r, --recursive` | Copy directories recursively |
 | `-p, --preserve` | Keep the exact mode and mtime on copied files |

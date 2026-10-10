@@ -8,12 +8,16 @@ process by test_session_daemon.py, because "state survives across processes"
 is the whole point of the feature and cannot be tested in one.
 """
 
+import fcntl
 import importlib.util
 import os
 import select
+import signal
 import socket
+import struct
 import subprocess
 import sys
+import termios
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,18 +63,55 @@ class _PtyChan(FakeChan):
         self.pid = None
         self.fd = None
         self.want_pty = False
+        self.term = "dumb"
+        self.size = (0, 0)
+        self.status = None                # the pty child's, once reaped
         self.proc = None                  # set when running without a pty
         self.closed = False
 
     def get_pty(self, term=None, width=0, height=0):
+        """Record what was asked for, as a server would act on it.
+
+        --exec -t carries the client's own terminal type and window size, so a
+        fake that dropped them would let a wrong size pass unnoticed; the size
+        is put on the pty below, where the remote program can read it.
+        """
         self.want_pty = True
+        self.term = term or "dumb"
+        self.size = (int(width or 0), int(height or 0))
+
+    def resize_pty(self, width=0, height=0, width_pixels=0, height_pixels=0):
+        """The client's window changed; a real server puts it on the pty.
+
+        Doing the ioctl here is what makes the resize observable at all: the
+        remote program learns its new size by asking the terminal, so a fake
+        that only recorded the request would let a size that never arrived
+        pass for one that did.
+        """
+        self.size = (int(width or 0), int(height or 0))
+        self._set_size()
+        try:
+            os.kill(self.pid, signal.SIGWINCH)
+        except (OSError, TypeError):
+            pass
+
+    def _set_size(self):
+        cols, rows = self.size
+        if self.fd is None or not (cols and rows):
+            return
+        try:
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", rows, cols, 0, 0))
+        except OSError:
+            pass
 
     def exec_command(self, command):
         if self.want_pty:
             self.pid, self.fd = os.forkpty()
             if self.pid == 0:
-                os.environ["TERM"] = "dumb"
+                os.environ["TERM"] = self.term
                 os.execvp("/bin/sh", ["/bin/sh", "-c", command])
+            self._set_size()
             return
         # No pty: pipes, so shutdown_write() below is a genuine EOF.
         self.proc = subprocess.Popen(
@@ -142,9 +183,17 @@ class _PtyChan(FakeChan):
         marker printed into its output, so the channel itself is what says how
         it ended.
         """
-        if self.proc is None:
+        if self.proc is not None:
+            return self.proc.wait()
+        if self.pid is None:
             return -1
-        return self.proc.wait()
+        if self.status is None:
+            try:
+                _pid, raw = os.waitpid(self.pid, 0)
+            except OSError:
+                return -1
+            self.status = raw >> 8 if raw & 0xFF == 0 else 128 + (raw & 0x7F)
+        return self.status
 
     def close(self):
         self.closed = True
