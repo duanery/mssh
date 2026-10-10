@@ -843,6 +843,11 @@ def pump(chan, is_tty=False):
     remote pty unwrapped, and SIGWINCH keeps the remote pty sized to the
     window.  A pty merges the remote's stderr into stdout, so the stderr
     stream only ever carries data in the non-tty case.
+
+    Input is held in a buffer rather than handed to sendall(): the channel is
+    non-blocking here, so a remote that is slow to read makes send() raise
+    socket.timeout, and sendall() would have swallowed an unknowable number
+    of bytes before doing so.
     """
     import termios
     import tty
@@ -851,6 +856,7 @@ def pump(chan, is_tty=False):
     err = sys.stderr.buffer
     chan.settimeout(0.0)
     infd = stdin_fd()
+    ttyfd = infd                      # infd is cleared at EOF; this is not
 
     resized = [False]
 
@@ -867,10 +873,13 @@ def pump(chan, is_tty=False):
         if infd is not None:
             old_attrs = termios.tcgetattr(infd)
 
+    pending = b""                     # read locally, not yet on the channel
+    sent_eof = False                  # the remote's stdin has been closed
+
     try:
         if old_attrs is not None:
-            tty.setraw(infd)
-            tty.setcbreak(infd)
+            tty.setraw(ttyfd)
+            tty.setcbreak(ttyfd)
 
         while True:
             if resized[0]:
@@ -905,13 +914,55 @@ def pump(chan, is_tty=False):
             if got:
                 continue
 
-            if chan.exit_status_ready() and not chan.recv_ready() \
-                    and not chan.recv_stderr_ready():
+            # Push whatever input is still in hand.  The channel is
+            # non-blocking, so send() returns short and raises socket.timeout
+            # once the remote's window is full -- which says the remote is
+            # slow to read, not that anything is wrong.  sendall() cannot be
+            # used here at all: it would raise that same timeout after
+            # sending an unknowable amount, and there would be no way to tell
+            # what still needs sending.
+            stalled = False
+            while pending:
+                try:
+                    sent = chan.send(pending)
+                except socket.timeout:
+                    stalled = True
+                    break
+                except Exception:
+                    pending, infd = b"", None
+                    break
+                if sent == 0:            # the remote closed its input
+                    pending, infd = b"", None
+                    break
+                pending = pending[sent:]
+            if not pending and infd is None and not sent_eof:
+                # Local EOF, and the last of it is on its way: close the
+                # remote's stdin so it can finish, then stay in the loop to
+                # collect whatever it still prints -- stdin ending does not
+                # mean the remote has.
+                sent_eof = True
+                try:
+                    chan.shutdown_write()
+                except Exception:
+                    pass
+
+            if not pending and chan.exit_status_ready() \
+                    and not chan.recv_ready() and not chan.recv_stderr_ready():
                 break
 
-            watch = [chan] if infd is None else [chan, infd]
+            watch = [chan]
+            # Stop reading local input while the channel will not take it:
+            # the backlog belongs in the pipe or the terminal we are reading
+            # from, not in this process.
+            if infd is not None and not stalled:
+                watch.append(infd)
+            # Nothing wakes us when the remote's window reopens -- the
+            # channel's fileno() is an event pipe for arriving data, not for
+            # sending room -- so a stalled send is retried on a short tick
+            # rather than waited for.
             try:
-                ready, _, _ = select.select(watch, [], [], 0.2)
+                ready, _w, _x = select.select(watch, [], [],
+                                              0.01 if stalled else 0.2)
             except (select.error, InterruptedError):
                 continue
 
@@ -921,22 +972,12 @@ def pump(chan, is_tty=False):
                 except OSError:
                     data = b""
                 if data:
-                    try:
-                        chan.sendall(data)
-                    except Exception:
-                        break
+                    pending += data
                 else:
-                    # Local EOF: close the remote's stdin so it can finish,
-                    # then stay in the loop to collect whatever it still
-                    # prints -- stdin ending does not mean the remote has.
-                    try:
-                        chan.shutdown_write()
-                    except Exception:
-                        pass
-                    infd = None
+                    infd = None          # the local side is done
     finally:
         if old_attrs is not None:
-            termios.tcsetattr(infd, termios.TCSADRAIN, old_attrs)
+            termios.tcsetattr(ttyfd, termios.TCSADRAIN, old_attrs)
         if old_winch is not None:
             try:
                 signal.signal(signal.SIGWINCH, old_winch)
@@ -2246,10 +2287,34 @@ class _Session(object):
     # -- channel i/o ------------------------------------------------------
 
     def _write(self, text):
-        try:
-            self.chan.sendall(text.encode("utf-8"))
-        except Exception as exc:
-            raise _SessionDead("write failed: %s" % exc)
+        """Send to the program's input, whatever timeout was left on the channel.
+
+        sendall() is wrong here.  The channel outlives every command, and the
+        loops that use it leave their own timeout on it -- _pump sets 0.0 and
+        _await_token 0.05 -- so a later write finds a non-blocking channel and
+        gets socket.timeout the moment the remote's window is full.  That is
+        not a dead session, only a slow one, and sendall() gives no way to
+        tell how much went out before it gave up.  Send in a loop against a
+        deadline of our own instead, which behaves the same under every
+        timeout the channel might be carrying.
+        """
+        data = text.encode("utf-8")
+        deadline = time.time() + max(self.timeout, 1.0)
+        while data:
+            try:
+                sent = self.chan.send(data)
+            except socket.timeout:
+                if time.time() >= deadline:
+                    raise _SessionDead(
+                        "write timed out: the remote program is not reading "
+                        "its input")
+                time.sleep(0.01)
+                continue
+            except Exception as exc:
+                raise _SessionDead("write failed: %s" % exc)
+            if sent == 0:
+                raise _SessionDead("the remote program closed its input")
+            data = data[sent:]
 
     def _recv(self):
         try:
