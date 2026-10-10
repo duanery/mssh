@@ -6,6 +6,7 @@ Run: python3 tests/test_pty_bridge.py
 import fcntl
 import os
 import pty
+import re
 import select
 import signal
 import struct
@@ -611,6 +612,102 @@ while True:                  # relay, the way a console would
         os.WEXITSTATUS(status) == 0
     check('serial: escape exits after the TCSAFLUSH switch', ok, repr(status))
 
+    # 25d) -w: the Enter waits for the banner text as well as the raw
+    #      switch. ORDER picks how the fake console comes up: raw first
+    #      and the banner later (the raw switch alone must not release
+    #      the Enter), or the banner first and then a TCSAFLUSH switch
+    #      (virsh console's own order: the text alone must not release
+    #      it either). The banner is split across two writes, so the
+    #      match has to span reads. Before the banner is complete the
+    #      input queue must be empty; the byte read after it is the
+    #      poke Enter -- at least 100ms after the banner, the settle
+    #      time -- answered with the prompt
+    fake_banner = os.path.join(tmpdir, 'banner.py')
+    with open(fake_banner, 'w') as f:
+        f.write(r'''
+import fcntl, os, struct, sys, termios, time
+
+def inq():
+    return struct.unpack('i', fcntl.ioctl(0, termios.TIOCINQ,
+                                          struct.pack('i', 0)))[0]
+
+def go_raw():
+    a = termios.tcgetattr(0)
+    a[0] &= ~(termios.BRKINT | termios.ICRNL | termios.INPCK |
+              termios.ISTRIP | termios.IXON)
+    a[1] &= ~termios.OPOST
+    a[3] &= ~(termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG)
+    a[6][termios.VMIN] = 1
+    a[6][termios.VTIME] = 0
+    termios.tcsetattr(0, termios.TCSAFLUSH, a)
+
+raw_first = sys.argv[1] == 'raw-first'
+if raw_first:
+    go_raw()
+    time.sleep(0.5)          # raw, but no banner yet: no Enter allowed
+os.write(1, b'Connected to domain vm7\r\n')
+os.write(1, b'Escape char')
+time.sleep(0.3)              # the banner arrives in two pieces
+n = inq()
+os.write(1, b'acter is ^]\r\n')
+t0 = time.time()             # the banner is complete
+if not raw_first:
+    time.sleep(0.5)          # banner out, still cooked: no Enter allowed
+    n += inq()
+    go_raw()
+os.write(1, b'pre-enter input: %d byte(s)\r\n' % n)
+os.read(0, 1)                # the poke Enter
+os.write(1, b'enter after banner: %d ms\r\n' % ((time.time() - t0) * 1000))
+os.write(1, b']# ')
+while True:
+    b = os.read(0, 4096)
+    if not b:
+        break
+    os.write(1, b)
+''')
+    for order in ('raw-first', 'banner-first'):
+        pid21d, m21d = pty.fork()
+        if pid21d == 0:
+            os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ',
+                            '-w', 'Escape character is ^]', '--',
+                            sys.executable, fake_banner, order],
+                      dict(os.environ, TERM='xterm-test'))
+        set_winsize(m21d, 27, 77)
+        got = read_avail(m21d, 3.0)
+        check('-w %s: no Enter before the banner and the raw switch' % order,
+              b'pre-enter input: 0 byte' in got, repr(got))
+        check('-w %s: Enter typed after both, prompt answered' % order,
+              b'export TERM=xterm-test; stty rows 27 columns 77\r' in got,
+              repr(got))
+        m = re.search(rb'enter after banner: (\d+) ms', got)
+        check('-w %s: Enter held %d ms past the banner' % (order, 100),
+              m is not None and int(m.group(1)) >= 100, repr(got))
+        os.write(m21d, b'\x1d')
+        status = wait_pid_exit(pid21d)
+        ok = status is not None and os.WIFEXITED(status) and \
+            os.WEXITSTATUS(status) == 0
+        check('-w %s: escape exits' % order, ok, repr(status))
+
+# 25e) -w only applies to a serial channel COMMAND: elsewhere it warns
+#      and goes unused, the bridge still works
+pid21e, m21e = pty.fork()
+if pid21e == 0:
+    os.execv(BIN, ['pty-bridge', '-w', 'ready', '--',
+                   'sh', '-c', 'stty raw -echo; printf "up> "; cat'])
+got = read_avail(m21e, 1.0)
+check('-w on a pty channel: warned', b'--wait-for ignored' in got, repr(got))
+check('-w on a pty channel: output still relayed', b'up> ' in got, repr(got))
+os.write(m21e, b'\x1d')
+wait_pid_exit(pid21e)
+
+# 25f) an empty -w text is refused
+pid21f, m21f = pty.fork()
+if pid21f == 0:
+    os.execv(BIN, ['pty-bridge', '-w', '', '--', 'true'])
+got = read_avail(m21f, 1.0)
+status = wait_pid_exit(pid21f)
+check('-w "": refused with exit 2',
+      os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2, repr((status, got)))
 # 26) auto: any other COMMAND stays on the pty method -- the sentinel
 #     types nothing, the size goes through TIOCSWINSZ
 pid22, m22 = pty.fork()

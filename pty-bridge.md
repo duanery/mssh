@@ -16,7 +16,7 @@ gcc -Wall -Wextra -O2 -o pty-bridge pty-bridge.c -lutil
 ```sh
 pty-bridge [-e CHAR|--escape CHAR] [-p "<match> <reply>"]... \
            [-s "<command>"]... [--term pty|serial|auto] \
-           [--pty /dev/pts/3] [command [arg ...]]
+           [-w "<text>"] [--pty /dev/pts/3] [command [arg ...]]
 ```
 
 ## Overview
@@ -142,13 +142,62 @@ For the serial console the phase has two parts:
    is safe: it answers a prompt the command is reading right then, so
    it is consumed before the switch; the Enter has no reader until
    the console connects, so it must wait for the poll to see raw
-   mode.) Then the pty is polled:
+   mode.) With `-w/--wait-for TEXT` the raw switch alone is not
+   enough: the Enter also waits until `TEXT` has appeared in the
+   output (see below). Then the pty is polled:
    as soon as it answers (or the command exits) the phase returns
    *without reading* -- the output is the main loop's, where the
    patterns match it. While the console stays silent the Enter is
    repeated every `ENTER_RETRY_SEC` (3s): a virtual machine may take
    a while to reach its getty, and a silent console has nothing
    better to offer than another Enter.
+
+#### Waiting for the channel's banner (`-w/--wait-for`)
+
+The raw switch is a good sign that the channel is connected, but it
+is not always the right moment: a command may switch the pty to raw
+before it has finished coming up, and an Enter typed then is read by
+the command rather than passed on to the console. `-w TEXT` makes the
+condition explicit: the Enter is typed only once the channel has
+printed `TEXT` **and** the pty is raw, in either order. `virsh
+console` announces the attach with
+
+```
+Connected to domain 078ca7b8-a183-4b5c-bcc4-cd049fa4d09f
+Escape character is ^]
+```
+
+so `-w "Escape character is ^]"` holds the Enter back until virsh
+says it is attached to the console.
+
+Seeing the text is not quite the moment either: the command prints it
+on its way into the console and still has the last steps of its setup
+to take. So the Enter waits `WAIT_SETTLE_MS` (100ms) more, counted
+from the moment the text shows up (and for the raw switch, if that
+has not come yet). The wait is not a plain `sleep`: the output is
+still read throughout, so nothing the channel prints in those 100ms
+is left in the pty for the post-Enter poll to take as the console's
+answer.
+
+- The text is searched **anywhere** in the output, not only at its
+  tail as the patterns are: it is a banner line followed by a
+  newline, not a prompt the peer stops at. The comparison is a
+  literal byte match (`^]` is the two characters `^` and `]`, as
+  virsh prints them).
+- The output is read, printed and recorded through
+  `record_and_check()` for the whole wait -- before the switch and
+  after it, until the text shows up -- so nothing is lost and a
+  prompt printed meanwhile is still answered. The text may be split
+  across reads: the last `strlen(TEXT) - 1` bytes are kept and
+  searched together with the next chunk (`wait_text_check()`).
+- There is no timeout, the same as for the raw switch: everything
+  read is printed, so a channel that never prints the text shows on
+  screen, and `^C` ends the wait (the local tty is still cooked and
+  untouched at this point).
+- `TEXT` is 1 to 256 bytes; an empty one is refused (exit 2). Outside
+  a serial channel COMMAND (`--pty`, a pty channel, or the serial
+  method falling back for want of a sentinel) there is no startup
+  phase to gate: `-w` warns and is ignored.
 
 The phase runs before any terminal change and before the signal
 handlers are installed, which is safe: the local tty has not been
@@ -166,8 +215,9 @@ Which end gets an unsolicited Enter typed into it, and when:
 - **Serial channel COMMAND**: typed inside the startup phase, right
   after the console is connected (the pty turns raw -- and not a
   moment earlier: the switch may be a `TCSAFLUSH`, which would drop
-  an Enter typed before it; see above), and repeated while it stays
-  silent -- see the section above.
+  an Enter typed before it; see above -- and, with `-w`, not before
+  the channel has printed the given text either), and repeated while
+  it stays silent -- see the section above.
 - **Pty-channel COMMAND**: never. Its prompts are printed immediately
   and matched by the main loop as they come; a bare `\r` would only
   wait in the input queue to be consumed as an empty answer by the
@@ -476,7 +526,12 @@ command stays pty), the serial-console startup phase (a fake `virsh`
 that answers the first Enter, and one that stays silent through it and
 answers the retried Enter; a prompt printed before the pty goes raw
 matched during the wait; a channel that switches with `TCSAFLUSH`
-receiving the Enter only after the switch), and COMMAND mode (bytes
+receiving the Enter only after the switch; `-w` holding the Enter
+until a banner split across two reads has appeared, and for at least
+the 100ms settle time after it, both when the
+channel goes raw before printing it and when it prints it before a
+`TCSAFLUSH` switch; `-w` warned about and ignored on a pty channel,
+an empty `-w` refused), and COMMAND mode (bytes
 relayed to the
 child, a prompt printed before the channel goes raw matched by the
 main loop, with the simulated Enter typed for `--pty` only and

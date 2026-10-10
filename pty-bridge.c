@@ -35,6 +35,7 @@
  * Build: gcc -Wall -O2 -o pty-bridge pty-bridge.c -lutil
  * Usage: ./pty-bridge [-e CHAR|--escape CHAR] [-p "login: root"] \
  *                     [-s "uptime"] [--term pty|serial|auto] [-v] \
+ *                     [-w "Escape character is ^]"] \
  *                     [--pty /dev/pts/3] [command [arg ...]]
  */
 #define _GNU_SOURCE
@@ -173,6 +174,25 @@ static size_t outlen;
  * answer an Enter before it types another one.
  */
 #define ENTER_RETRY_SEC 3
+
+/*
+ * -w/--wait-for: text the serial channel must have printed before the
+ * startup Enter is typed, e.g. virsh console's "Escape character is
+ * ^]" -- the channel says it is connected, so an Enter now reaches the
+ * console rather than the command. Searched anywhere in the output,
+ * not only at its tail: it is a banner line, not a prompt. NULL: the
+ * raw switch alone decides.
+ *
+ * Seeing the text is not quite the moment either: the command prints
+ * it on its way into the console and still has the last steps of its
+ * setup to take. The Enter waits WAIT_SETTLE_MS more after the text
+ * shows up -- reading on all the while, so nothing it prints then is
+ * left behind to pass for the console's answer.
+ */
+#define WAIT_MAX 256
+#define WAIT_SETTLE_MS 100
+static const char *wait_text;
+static size_t wait_len;
 
 /* Restore original terminal settings. Must be called before exit. */
 static void restore_tty(void)
@@ -347,6 +367,10 @@ static void usage(FILE *out)
         "                      applies -- and TERM is exported with the first push.\n"
         "                      auto (default): a \"virsh console\" COMMAND means serial,\n"
         "                      anything else pty.\n"
+        "  -w, --wait-for TEXT on a serial channel, type the startup Enter only once\n"
+        "                      the command has printed TEXT (anywhere in its output),\n"
+        "                      100ms have passed since, and the pty is raw, e.g.\n"
+        "                      \"Escape character is ^]\" for virsh console\n"
         "  -v, --verbose       trace what happens on stderr: the parsed patterns, the\n"
         "                      output tail checked against them, which pattern matched\n"
         "                      and what was typed, window-size pushes, and the\n"
@@ -362,8 +386,9 @@ static void usage(FILE *out)
         "  %s -p \"login: root\" -p \"]# \" -- ssh -tt admin@10.0.0.1\n"
         "  %s -p \"]# \" -s \"ls\" -- ssh -tt host   # run ls at the prompt,\n"
         "                                                # exit when it returns\n"
-        "  %s -p \"]# \" --term serial -- virsh console vm1\n",
-        prog, prog, prog, prog, prog, prog);
+        "  %s -p \"]# \" --term serial -- virsh console vm1\n"
+        "  %s -p \"]# \" -w \"Escape character is ^]\" -- virsh console vm1\n",
+        prog, prog, prog, prog, prog, prog, prog);
 }
 
 /*
@@ -861,6 +886,47 @@ static int pty_is_raw(int fd)
 }
 
 /*
+ * Feed a chunk of startup output to the -w search; returns 1 once the
+ * text has been seen. The text may be split across reads, so the last
+ * wait_len - 1 bytes of the output so far are kept and searched
+ * together with the next chunk.
+ */
+static int wait_text_check(const unsigned char *buf, size_t n)
+{
+    static unsigned char carry[WAIT_MAX];
+    static size_t carry_len;
+    unsigned char win[WAIT_MAX + 4096];
+
+    while (n > 0) {
+        size_t take = sizeof(win) - carry_len;
+        size_t len;
+
+        if (take > n)
+            take = n;
+        memcpy(win, carry, carry_len);
+        memcpy(win + carry_len, buf, take);
+        len = carry_len + take;
+        buf += take;
+        n -= take;
+        if (memmem(win, len, wait_text, wait_len))
+            return 1;
+        carry_len = len < wait_len - 1 ? len : wait_len - 1;
+        memcpy(carry, win + len - carry_len, carry_len);
+    }
+    return 0;
+}
+
+/* Milliseconds elapsed since *t, on the monotonic clock */
+static long ms_since(const struct timespec *t)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - t->tv_sec) * 1000 +
+           (now.tv_nsec - t->tv_nsec) / 1000000;
+}
+
+/*
  * Wake the serial console: wait for it to connect, then poke it into
  * showing its prompt. Runs for a COMMAND mode channel resolved to the
  * serial method -- a "virsh console" command picked by auto, or an
@@ -896,7 +962,13 @@ static int pty_is_raw(int fd)
  *    no such risk, a queued command included: it answers a prompt
  *    that is being read right then, so it is consumed before the
  *    switch happens; the Enter has no reader until the console is
- *    connected, and must wait.) After the Enter the pty is polled:
+ *    connected, and must wait.) With -w the switch alone is not
+ *    enough: the Enter also waits until the -w text (e.g. virsh's
+ *    "Escape character is ^]") has shown up in the output -- before
+ *    or after the switch, whichever order the command prints in --
+ *    and then WAIT_SETTLE_MS more, counted from the text. The
+ *    output is read, printed and recorded the whole time, raw or not,
+ *    exactly as in 1. After the Enter the pty is polled:
  *    as soon as it answers, or the command exits, the phase returns WITHOUT
  *    reading -- the output is the main loop's, where the patterns
  *    match it. While the console stays silent the Enter is
@@ -916,8 +988,20 @@ static void wake_serial_console(int pty_fd)
     struct timespec ts = { .tv_nsec = 100 * 1000 * 1000 }; /* 100ms */
     unsigned char buf[4096];
     ssize_t n;
+    int raw = 0;
+    int seen = wait_text == NULL; /* no -w: the raw switch alone decides */
+    struct timespec seen_at;
 
-    while (!pty_is_raw(pty_fd)) {
+    for (;;) {
+        long settle = 0; /* ms still to wait after the -w text */
+
+        raw = pty_is_raw(pty_fd);
+        if (seen && wait_text)
+            settle = WAIT_SETTLE_MS - ms_since(&seen_at);
+        if (raw && seen && settle <= 0)
+            break;
+        /* wake every 100ms to notice the switch, sooner to end the settle */
+        ts.tv_nsec = (settle > 0 && settle < 100 ? settle : 100) * 1000000L;
         if (ppoll(&pfd, 1, &ts, NULL) > 0 &&
             (pfd.revents & (POLLIN | POLLERR | POLLHUP))) {
             n = read(pty_fd, buf, sizeof(buf));
@@ -925,11 +1009,18 @@ static void wake_serial_console(int pty_fd)
                 VLOG("startup: command gone");
                 return; /* command gone: let the main loop see it too */
             }
-            VLOG("startup: %zu bytes, pty not raw yet", (size_t)n);
+            VLOG("startup: %zu bytes, pty %s", (size_t)n,
+                 raw ? "raw, waiting for the -w text" : "not raw yet");
             write_stdout(buf, (size_t)n);
             record_and_check(pty_fd, buf, (size_t)n);
             if (quit_pending)
-                return; /* every command ran before the pty went raw */
+                return; /* every command ran during the startup wait */
+            if (!seen && wait_text_check(buf, (size_t)n)) {
+                seen = 1;
+                clock_gettime(CLOCK_MONOTONIC, &seen_at);
+                VLOG("startup: saw '%s'; Enter in %d ms at the earliest",
+                     esc_str(wait_text), WAIT_SETTLE_MS);
+            }
         }
     }
 
@@ -971,6 +1062,7 @@ int main(int argc, char **argv)
         { "pattern", required_argument, NULL, 'p' },
         { "send",    required_argument, NULL, 's' },
         { "term",    required_argument, NULL, 't' },
+        { "wait-for", required_argument, NULL, 'w' },
         { "verbose", no_argument,       NULL, 'v' },
         { "pty",     required_argument, NULL, 1 },
         { "help",    no_argument,       NULL, 'h' },
@@ -982,7 +1074,7 @@ int main(int argc, char **argv)
      * channel command's own options (e.g. "ssh -tt host") belong to
      * the command, not to us.
      */
-    while ((opt = getopt_long(argc, argv, "+e:p:s:t:vh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+e:p:s:t:w:vh", long_options, NULL)) != -1) {
         switch (opt) {
         case 'e':
             escape_str = optarg;
@@ -1062,6 +1154,16 @@ int main(int argc, char **argv)
                         prog, optarg);
                 return 2;
             }
+            break;
+        case 'w':
+            wait_len = strlen(optarg);
+            if (wait_len == 0 || wait_len > WAIT_MAX) {
+                fprintf(stderr,
+                        "%s: --wait-for text must be 1 to %d bytes\n",
+                        prog, WAIT_MAX);
+                return 2;
+            }
+            wait_text = optarg;
             break;
         case 1: /* --pty */
             pty_path = optarg;
@@ -1150,6 +1252,17 @@ int main(int argc, char **argv)
 
     /* resolve the terminal type now that the command (if any) is known */
     resolve_term_mode(pty_path, argv + optind, argc - optind);
+
+    /*
+     * -w only gates the serial startup Enter: anywhere else there is no
+     * startup phase for it to hold back, so say it goes unused.
+     */
+    if (wait_text && (pty_path || !term_serial))
+        fprintf(stderr,
+                "%s: --wait-for ignored: not a serial channel COMMAND\n",
+                prog);
+    else if (wait_text)
+        VLOG("startup Enter waits for '%s'", esc_str(wait_text));
 
     escape_char = parse_escape(escape_str);
 
