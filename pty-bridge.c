@@ -26,7 +26,9 @@
  * once on a serial console (--term).
  *
  * Requires stdin to be the controlling terminal of this process,
- * otherwise it exits immediately.
+ * otherwise it exits immediately -- unless commands are queued: such a
+ * run ends by itself once they ran, nobody needs to type into it, and
+ * it goes ahead unattended without reading stdin at all.
  *
  * Exit by pressing the escape character (default ^] = Ctrl-]), when
  * the pty peer closes, or by itself once every queued command has
@@ -63,6 +65,22 @@ static int verbose;
 static int tty_fd = -1;          /* local terminal (stdin) */
 static struct termios saved_tio; /* original terminal settings */
 static int tio_saved = 0;
+
+/*
+ * Unattended run: stdin is not the controlling terminal, but commands
+ * are queued, so the bridge exits by itself once they ran and nobody
+ * has to type anything. stdin is never read (an EOF on it must not end
+ * the run early) and never switched to raw; the escape key is gone
+ * with it.
+ *
+ * local_fd is the local terminal the remote side is described by --
+ * its termios and window size seed the channel pty, its size is what
+ * gets pushed: stdin normally; in an unattended run stdout if that is
+ * still a terminal (the output is watched there), else -1 -- there is
+ * no terminal to describe, and no size or TERM is pushed at all.
+ */
+static int unattended;
+static int local_fd = STDIN_FILENO;
 
 /*
  * Auto-reply pattern, from -p "<match> <reply>", split at the FIRST
@@ -236,6 +254,9 @@ static void setup_signals(void)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
 
+    /* no local terminal: no window to follow, SIGWINCH keeps its default */
+    if (local_fd < 0)
+        return;
     sa.sa_handler = on_winch;
     sigaction(SIGWINCH, &sa, NULL);
 }
@@ -353,7 +374,9 @@ static void usage(FILE *out)
         "                      too -- see --send\n"
         "  -s, --send CMD      queue CMD to be typed at the sentinel prompt, one per\n"
         "                      prompt, in the order given; repeatable. The bridge exits\n"
-        "                      by itself once every queued command has run.\n"
+        "                      by itself once every queued command has run. Such a\n"
+        "                      run needs no terminal on stdin: without one it goes\n"
+        "                      unattended and never reads stdin.\n"
         "                      Needs a sentinel pattern (a -p with an empty reply)\n"
         "      --pty PATH      attach to an existing pty (e.g. /dev/pts/3) instead of\n"
         "                      running COMMAND on a new pty\n"
@@ -588,7 +611,7 @@ static void resolve_term_mode(const char *pty_path, char **cmd, int ncmd)
 
     term_pending = 0;
     t = getenv("TERM");
-    if (term_serial && t != NULL && *t != '\0') {
+    if (term_serial && local_fd >= 0 && t != NULL && *t != '\0') {
         size_t tl = strlen(t);
         if (tl < sizeof(term_val) && term_val_ok(t)) {
             memcpy(term_val, t, tl + 1);
@@ -607,9 +630,11 @@ static void resolve_term_mode(const char *pty_path, char **cmd, int ncmd)
      * of band -- COMMAND mode seeds the new pty with the local size
      * at openpty(), and --pty mode pushes it once at startup (main) --
      * so nothing is pending at startup; resizes are pushed as they
-     * happen.
+     * happen. With no local terminal there is nothing to push, now or
+     * later (and a pending push typing nothing would cost the prompt
+     * its one line).
      */
-    winch_pending = term_serial;
+    winch_pending = term_serial && local_fd >= 0;
 }
 
 /*
@@ -626,7 +651,7 @@ static void sync_winsize(int pty_fd)
     struct winsize ws;
     char cmd[192];
 
-    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) < 0)
+    if (ioctl(local_fd, TIOCGWINSZ, &ws) < 0)
         return;
 
     if (term_pending) {
@@ -653,7 +678,7 @@ static void push_winsize(int pty_fd)
 {
     struct winsize ws;
 
-    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
+    if (ioctl(local_fd, TIOCGWINSZ, &ws) == 0) {
         ioctl(pty_fd, TIOCSWINSZ, &ws);
         VLOG("window size %dx%d pushed via TIOCSWINSZ", ws.ws_row, ws.ws_col);
     }
@@ -824,7 +849,7 @@ static int open_command_pty(char **cmd, pid_t *pidp)
     struct winsize ws, *wsp = NULL;
     pid_t pid;
 
-    if (tcgetattr(STDIN_FILENO, &tio) == 0) {
+    if (tcgetattr(local_fd, &tio) == 0) {
         tiop = &tio;
         /*
          * The copy keeps the input side: the line settings of the
@@ -839,11 +864,21 @@ static int open_command_pty(char **cmd, pid_t *pidp)
          */
         tio.c_oflag &= ~OPOST;
     }
-    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
+    if (ioctl(local_fd, TIOCGWINSZ, &ws) == 0)
         wsp = &ws;
 
     if (openpty(&master, &slave, NULL, tiop, wsp) < 0)
         die_errno("openpty");
+
+    /*
+     * No local terminal to copy (an unattended run, stdout not a
+     * terminal either): the pty keeps the driver defaults, but loses
+     * OPOST all the same -- the bytes are display-ready already.
+     */
+    if (!tiop && tcgetattr(slave, &tio) == 0) {
+        tio.c_oflag &= ~OPOST;
+        tcsetattr(slave, TCSANOW, &tio);
+    }
 
     pid = fork();
     if (pid < 0)
@@ -1250,6 +1285,25 @@ int main(int argc, char **argv)
             VLOG("matching the last %zu bytes of pty output", max_mlen);
     }
 
+    /*
+     * stdin must be the controlling terminal: the bridge is an
+     * interactive attach console. A run with commands queued is the
+     * exception -- it exits by itself once they ran, nobody needs to
+     * type into it, so it goes ahead unattended (see local_fd). Decided
+     * before the terminal type: what gets pushed depends on it.
+     */
+    if (!isatty(STDIN_FILENO) || tcgetsid(STDIN_FILENO) != getsid(0)) {
+        if (!has_commands) {
+            if (!isatty(STDIN_FILENO))
+                die("stdin is not a terminal");
+            die("stdin is not the controlling terminal of this process");
+        }
+        unattended = 1;
+        local_fd = isatty(STDOUT_FILENO) ? STDOUT_FILENO : -1;
+        VLOG("stdin is not the controlling terminal: running unattended%s",
+             local_fd < 0 ? ", no local terminal" : ", stdout is the terminal");
+    }
+
     /* resolve the terminal type now that the command (if any) is known */
     resolve_term_mode(pty_path, argv + optind, argc - optind);
 
@@ -1266,12 +1320,6 @@ int main(int argc, char **argv)
 
     escape_char = parse_escape(escape_str);
 
-    /* stdin must be the controlling terminal */
-    if (!isatty(STDIN_FILENO))
-        die("stdin is not a terminal");
-    if (tcgetsid(STDIN_FILENO) != getsid(0))
-        die("stdin is not the controlling terminal of this process");
-
     /*
      * A piped or redirected stdout has no line discipline to hand a
      * "\r\n" to: translate it to "\n" on the way out (write_stdout),
@@ -1286,17 +1334,20 @@ int main(int argc, char **argv)
      * COMMAND mode announce the command being run, so the escape hint
      * the command itself may print later (e.g. virsh console prints
      * "Escape character is ^]" for the virtual machine console) is
-     * not mistaken for ours.
+     * not mistaken for ours. Unattended there is no escape key to
+     * announce.
      */
     escape_name(escape_char, name, sizeof(name));
     if (pty_path) {
-        printf("Escape character is %s\n", name);
+        if (!unattended)
+            printf("Escape character is %s\n", name);
     } else {
         printf("Running: ");
         for (int i = optind; i < argc; i++)
             printf("%s%s", i > optind ? " " : "", argv[i]);
         printf("\n");
-        printf("Escape character is %s (exits %s)\n", name, prog);
+        if (!unattended)
+            printf("Escape character is %s (exits %s)\n", name, prog);
     }
     fflush(stdout);
 
@@ -1333,11 +1384,16 @@ int main(int argc, char **argv)
         }
     }
 
-    /* save the original local terminal settings, for restore on exit */
-    tty_fd = STDIN_FILENO;
-    if (tcgetattr(tty_fd, &saved_tio) < 0)
-        die_errno("tcgetattr");
-    tio_saved = 1;
+    /*
+     * save the original local terminal settings, for restore on exit
+     * -- unattended, stdin is left alone altogether: nothing to save
+     */
+    if (!unattended) {
+        tty_fd = STDIN_FILENO;
+        if (tcgetattr(tty_fd, &saved_tio) < 0)
+            die_errno("tcgetattr");
+        tio_saved = 1;
+    }
 
     /*
      * Block SIGWINCH for the whole session and let ppoll unblock it
@@ -1360,15 +1416,18 @@ int main(int argc, char **argv)
      * "\r" that repeats a return the line already made. And with the
      * flags untouched, every other writer on this terminal -- od at
      * the end of a pipe, the shell after us -- keeps rendering its
-     * own "\n" the way the user configured it.
+     * own "\n" the way the user configured it. Unattended there is no
+     * keyboard to take raw.
      */
-    raw = saved_tio;
-    cfmakeraw(&raw);
-    raw.c_oflag = saved_tio.c_oflag;
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-    if (tcsetattr(tty_fd, TCSANOW, &raw) < 0)
-        die_errno("tcsetattr");
+    if (!unattended) {
+        raw = saved_tio;
+        cfmakeraw(&raw);
+        raw.c_oflag = saved_tio.c_oflag;
+        raw.c_cc[VMIN] = 1;
+        raw.c_cc[VTIME] = 0;
+        if (tcsetattr(tty_fd, TCSANOW, &raw) < 0)
+            die_errno("tcsetattr");
+    }
 
     /*
      * --pty mode: the attached pty keeps whatever size the previous
@@ -1393,10 +1452,10 @@ int main(int argc, char **argv)
     if (pty_path)
         write_all(pty_fd, (const unsigned char *)"\r", 1);
 
-    /* main loop: forward both directions */
+    /* main loop: forward both directions (unattended: the pty only) */
     for (;;) {
         struct pollfd pfd[2] = {
-            { .fd = STDIN_FILENO, .events = POLLIN },
+            { .fd = unattended ? -1 : STDIN_FILENO, .events = POLLIN },
             { .fd = pty_fd,       .events = POLLIN },
         };
         unsigned char buf[4096];

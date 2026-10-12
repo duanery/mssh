@@ -1184,6 +1184,124 @@ check('piped: not a single \\r in the whole stream', b'\r' not in out37,
       repr(out37))
 os.close(pr3)
 
+# 37) a run with commands queued exits by itself and needs nobody at the
+#     keyboard: stdin need not be a terminal. Unattended, stdin is never
+#     read -- a pipe at EOF before the prompt even shows up must not end
+#     the run -- and with no terminal on stdout either there is no
+#     escape key to announce and no window to describe
+def run_unattended(argv, env=None, stdout_tty=False, timeout=5.0):
+    """Run the bridge with a pipe at EOF on stdin. stdout goes to a pipe,
+    or with stdout_tty to a pty of its own (whose window is 27x77).
+    Returns (exit status, stdout bytes, stderr bytes)."""
+    ir, iw = os.pipe()
+    os.close(iw)                     # stdin: EOF from the start
+    er, ew = os.pipe()
+    if stdout_tty:
+        out_r, out_w = pty.openpty()
+        set_winsize(out_r, 27, 77)
+    else:
+        out_r, out_w = os.pipe()
+    p = os.fork()
+    if p == 0:
+        os.setsid()                  # no controlling terminal at all
+        os.dup2(ir, 0)
+        os.dup2(out_w, 1)
+        os.dup2(ew, 2)
+        os.execve(BIN, argv, env if env is not None else os.environ)
+    for fd in (ir, out_w, ew):
+        os.close(fd)
+    out = err = b''
+    end = time.time() + timeout
+    fds = [out_r, er]
+    while fds and time.time() < end:
+        r, _, _ = select.select(fds, [], [], 0.1)
+        for fd in r:
+            try:
+                d = os.read(fd, 4096)
+            except OSError:
+                d = b''
+            if not d:
+                fds.remove(fd)
+            elif fd == out_r:
+                out += d
+            else:
+                err += d
+    status = wait_pid_exit(p)
+    os.close(out_r)
+    os.close(er)
+    return status, out, err
+
+
+status, out, err = run_unattended(
+    ['pty-bridge', '-p', ']# ', '-s', 'echo one', '-s', 'echo two', '--',
+     'sh', '-c',
+     'sleep 0.3; printf "]# "; while IFS= read -r line; do '
+     'printf "ran:%s\\n" "$line"; printf "]# "; done'])
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('unattended: runs with stdin at EOF and exits 0', ok,
+      repr(status) + ' err=' + repr(err))
+i1, i2 = out.find(b'ran:echo one'), out.find(b'ran:echo two')
+check('unattended: the commands ran in order',
+      i1 != -1 and i2 != -1 and i1 < i2, repr(out))
+check('unattended: no escape key announced',
+      out.startswith(b'Running: ') and b'Escape character' not in out,
+      repr(out))
+
+# 37b) without commands there is nothing to finish by itself: a non-tty
+#      stdin is still refused, as before
+status, out, err = run_unattended(['pty-bridge', '-p', ']# ', '--', 'true'])
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
+check('no commands: non-tty stdin still refused', ok, repr(status))
+check('no commands: refusal message', b'not a terminal' in err, repr(err))
+
+# 37c) unattended serial channel with no terminal anywhere: there is no
+#      window to describe, so the first prompt goes to the command --
+#      no stty, no TERM export -- and the run still exits by itself
+status, out, err = run_unattended(
+    ['pty-bridge', '--term', 'serial', '-p', ']# ', '-s', 'echo one', '--',
+     'sh', '-c',
+     'stty -icanon -echo min 1 time 0; '
+     'while IFS= read -r line; do '
+     'printf "ran:%s\\n" "$line"; printf "]# "; done'],
+    env=dict(os.environ, TERM='xterm-test'))
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('unattended serial: exits by itself', ok,
+      repr(status) + ' err=' + repr(err))
+check('unattended serial, no terminal: the command takes the first prompt',
+      b'ran:echo one' in out and b'stty' not in out.split(b'\n', 1)[1] and
+      b'TERM' not in out, repr(out))
+
+# 37d) stdin is not a terminal, but stdout still is: that is where the
+#      output is watched, so it is the terminal the remote side is
+#      described by -- the serial push carries its size and TERM
+status, out, err = run_unattended(
+    ['pty-bridge', '--term', 'serial', '-p', ']# ', '-s', 'echo one', '--',
+     'sh', '-c',
+     'stty -icanon -echo min 1 time 0; '
+     'while IFS= read -r line; do '
+     'printf "ran:%s\\n" "$line"; printf "]# "; done'],
+    env=dict(os.environ, TERM='xterm-test'), stdout_tty=True)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('unattended serial, stdout a tty: exits by itself', ok,
+      repr(status) + ' err=' + repr(err))
+ipush, icmd = out.find(b'ran:export TERM='), out.find(b'ran:echo one')
+check('unattended serial, stdout a tty: push from stdout, then the command',
+      b'ran:export TERM=xterm-test; stty rows 27 columns 77' in out and
+      ipush != -1 and icmd != -1 and ipush < icmd, repr(out))
+
+# 37e) the pty-channel counterpart: the new pty is seeded with the size
+#      of the stdout terminal
+status, out, err = run_unattended(
+    ['pty-bridge', '-p', ']# ', '-s', 'echo one', '--',
+     'sh', '-c',
+     'stty size; printf "]# "; while IFS= read -r line; do '
+     'printf "ran:%s\\n" "$line"; printf "]# "; done'],
+    stdout_tty=True)
+ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+check('unattended pty, stdout a tty: size seeded from stdout',
+      ok and b'27 77' in out and b'ran:echo one' in out,
+      repr(status) + ' out=' + repr(out))
+
 print('---')
 print('FAILURES:', failures)
 sys.exit(1 if failures else 0)

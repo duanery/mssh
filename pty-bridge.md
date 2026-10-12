@@ -68,17 +68,46 @@ works identically on both modes: it only sees the one bridge fd.
 1. `isatty(0)` -- stdin must be a terminal.
 2. `tcgetsid(0) == getsid(0)` -- stdin must be the *controlling terminal*
    of the process. Running under a pipe or a background job is refused;
-   the tool is an interactive attach console.
+   the tool is an interactive attach console. The exception is a run
+   with commands queued (`-s`, or a command pattern): it exits by
+   itself once they ran and nobody needs to type into it, so it goes
+   ahead **unattended** instead (below).
 3. The pty is acquired (see above): `--pty` opens the path with
    `O_RDWR | O_NOCTTY` and checks it with `isatty()` (`O_NOCTTY`
    matters: opening a slave pty must never steal the
    controlling-terminal role from the session that owns it); COMMAND
    mode creates the pty and forks the child in `open_command_pty()`.
 
+### Unattended runs
+
+A run that is automated end to end -- `-p ']# ' -s 'uptime' -- ssh -tt
+host </dev/null`, from a script or cron -- has no use for a keyboard.
+When stdin is not the controlling terminal and commands are queued:
+
+- stdin is **never read**: an EOF on it (`</dev/null`, a closed pipe)
+  must not end the run before the commands ran, and whatever a pipe
+  carries is not meant for the session. With it the escape key is gone
+  too, and is not announced (`Running: <command>` is still printed).
+- stdin is not touched: no `tcgetattr()`/raw switch, nothing to
+  restore.
+- The local terminal the remote side is described by (`local_fd`) --
+  normally stdin -- becomes **stdout, if that is still a terminal**:
+  the output is watched there, so its termios and window size seed the
+  channel pty, the serial push types its size (and the TERM export),
+  and its `SIGWINCH` is followed as usual. With no terminal on stdout
+  either there is nothing to describe: the channel pty gets the driver
+  defaults (minus `OPOST`, as always) and a 0x0 size, no `SIGWINCH`
+  handler is installed, and a serial channel gets no `stty`/TERM push
+  at all -- the first prompt goes straight to the first command.
+
+Without commands the run never ends by itself, so a non-terminal stdin
+is refused as before.
+
 ## The channel command (`open_command_pty()`)
 
 `openpty()` creates the pty pair, seeded with the local terminal's own
-`termios` and window size -- both read from stdin, which is still in
+`termios` and window size -- both read from stdin (stdout in an
+unattended run, see above), which is still in
 its original state at this point. The new pty therefore looks exactly
 like the terminal the user is sitting at, so `ssh -tt` relays the
 right size and line settings to the remote pty from the very start.
@@ -550,7 +579,11 @@ created with `OPOST` off), the piped CRLF translation (an inline
 `\r\n` pair dropped, a lone `\r` kept, a `\r`/`\n` split across
 chunks merged, a trailing `\r` flushed at exit, and the whole piped
 stream -- the echoed command included -- free of `\r` while patterns
-and the self-exit still work), and the
+and the self-exit still work), unattended runs (stdin a pipe at EOF:
+commands still run and the bridge exits 0 with no escape announced, a
+non-tty stdin without commands still refused, a serial channel with no
+terminal anywhere getting no push, and with stdout a terminal its size
+pushed on a serial channel and seeded into a pty channel), and the
 verbose trace (`-v`: parsed patterns,
 matching tail, matches and replies on stderr). The test
 compiles the binary itself if it is missing and exits non-zero on any
