@@ -13,9 +13,13 @@ dependencies beyond libc (+ libutil for `openpty`), built with:
 gcc -Wall -Wextra -O2 -o pty-bridge pty-bridge.c -lutil
 ```
 
+The ZMODEM end of `--put`/`--get` lives in `zmodem.c`, which
+`pty-bridge.c` `#include`s -- it is not compiled on its own.
+
 ```sh
 pty-bridge [-e CHAR|--escape CHAR] [-p "<match> <reply>"]... \
-           [-s "<command>"]... [--term pty|serial|auto] \
+           [-s "<command>"]... [--put FILE]... [--get FILE]... \
+           [--term pty|serial|auto] \
            [-w "<text>"] [--pty /dev/pts/3] [command [arg ...]]
 ```
 
@@ -543,6 +547,136 @@ The trigger logic:
    `--pty` mode pushes it once at attach), so nothing is pending at
    startup.
 
+## File transfer (`--put`/`--get`, `zmodem.c`)
+
+A serial console carries nothing but the console: no scp, no second
+channel. What it does carry is bytes, and lrzsz's `rz`/`sz` move files
+over exactly that. `--put FILE` and `--get FILE` are queued commands
+like `--send`, typed by the sentinel at their turn in the queue --
+`rz` to put, `sz -- 'FILE'` to get (single-quoted for the remote
+shell, a `'` in the name spelled `'\''`) -- and the bridge itself is
+the other ZMODEM end:
+
+```sh
+pty-bridge -p ']# ' --put app.tgz --get /var/log/messages \
+           -s 'tar xzf app.tgz' -- virsh console vm1
+```
+
+- `--put FILE` sends the local `FILE` into the remote shell's current
+  directory, under its last component. It is sent with "clobber"
+  management, so an existing file there is replaced (rz skips existing
+  files by default; scp replaces them). The file must be readable when
+  the options are parsed (exit 2 otherwise), regular, under 4 GiB.
+- `--get FILE` receives what `sz FILE` sends into the local current
+  directory, under the last component of its name. It is written to a
+  `NAME.XXXXXX` temporary file next to it and renamed over `NAME` only
+  once all of it arrived: a broken transfer leaves `NAME` untouched and
+  no temporary file behind. Mode (minus the umask) and mtime are taken
+  from the sender. One file per `--get`; a second one sz offers is
+  skipped.
+
+When the sentinel types the transfer's command it hands the pty over
+(`zm_job`), and the main loop runs `zm_transfer()` before anything
+else: the pty goes non-blocking, and until rz/sz is done every byte on
+it is ZMODEM's. What the remote end prints before the first header
+(the echoed command, `rz waiting to receive.`, a `command not found`)
+is shown and goes through `record_and_check()` as usual -- if the
+sentinel sees the prompt in it, rz/sz is not running at all, and the
+transfer fails at once (`the remote rz did not start`) instead of
+waiting `ZM_START_SEC` (30s) for a header. Bytes read past the end of
+a good session are the shell's again, handed back to the main loop
+(`zm_leftover()`), where the returning prompt is the transfer's
+completion and the queue goes on.
+
+### The protocol
+
+What one file in one direction needs, as lrzsz speaks it:
+
+- **put**: rz opens with `ZRINIT` (its capabilities). The bridge sends
+  `ZFILE` (`name NUL "size mtime mode 0 1 size"`, the mode the whole
+  `st_mode` -- rz applies permissions only to a mode that says regular
+  file) and streams `ZDATA` from the `ZRPOS` rz answers with: 1 KiB
+  `ZCRCG` subpackets, a `ZCRCQ` every 8 KiB for rz to `ZACK`, no more
+  than 32 KiB unacknowledged (rz's own buffer size if it names one, a
+  `ZCRCW` then waiting at its end). Between subpackets anything rz
+  says is looked at without waiting: a `ZRPOS` -- rz saw a damaged
+  subpacket -- rewinds the stream there. `ZEOF`, `ZRINIT`, `ZFIN`,
+  `ZFIN`, `OO`. A `ZCRC` request is answered with the file's CRC.
+- **get**: sz opens with `ZRQINIT`; the bridge answers `ZRINIT`
+  (full duplex, overlapped I/O, CRC-32), takes `ZFILE`, asks for the
+  data from 0 (`ZRPOS`) and writes what arrives, acknowledging
+  `ZCRCQ`/`ZCRCW`. A damaged subpacket (CRC, framing, overlong) is
+  answered with a `ZRPOS` for the position the good data reaches; sz
+  rewinds there. `ZEOF` at that position closes the file, `ZFIN` ends
+  the session, the `OO` after it is swallowed. A `ZCOMMAND` is
+  refused.
+- Control frames go as hex headers, data behind binary headers --
+  CRC-32 when the receiver offers it, CRC-16 otherwise. Received
+  headers and subpackets are checked with whichever CRC they carry.
+  Retries are bounded (`ZM_RETRIES`, 10 in a row), every answer is
+  waited for `ZM_TIMEOUT_SEC` (10s).
+
+The channel between the bridge and rz/sz is not assumed transparent:
+what the bridge sends passes the channel command first, and `virsh
+console` leaves at a raw `^]`, `ssh -tt` at `~.` after a newline. So
+beyond what ZMODEM always escapes (ZDLE, XON, XOFF, DLE) `zm_putz()`
+also ZDLE-escapes `^]` and every CR and LF, with or without the high
+bit -- and every control character if the receiver asks for it
+(`ESCCTL`, `rz -e`). A receiver decodes an escaped byte whether it
+asked for it or not.
+
+### Interrupting a transfer
+
+Nothing typed can go into the ZMODEM stream, so during a transfer the
+keyboard knows two keys and drops the rest:
+
+- the **escape key**: the transfer is cancelled, and the bridge leaves
+  as soon as the cancel has arrived -- at most `ZM_ESC_WAIT_MS` (2s)
+  later; a second press leaves at once.
+- **`^C`** (or, unattended, `SIGINT` -- see above): the transfer is
+  cancelled, the bridge leaves -- an unattended run dying of `SIGINT`
+  as usual. Unlike a `^C` at a running command, no `^C` byte is typed:
+  rz/sz has the remote tty in raw mode, where it would be just another
+  byte of data. The cancel is what ends them -- and rz/sz was the
+  remote command.
+
+Cancelling (`zm_abort()`) drops what is still buffered for the other
+end and sends eight CANs (`ZDLE` = `0x18`) instead -- every ZMODEM
+program stops at five in a row (lrzsz: `GOTCAN`; sz looks at its back
+channel between subpackets, so it stops mid-stream too) -- plus
+backspaces to wipe them off a line editor should one be reading
+instead. rz/sz restores its tty and exits; the remote shell prints its
+prompt again.
+
+Writing the CANs is not the end of it: they have only reached the
+local pty, the channel command still has to read them and pass them
+on. A bridge leaving right then -- closing the pty, hanging up the
+command -- may take them down with it. Over `ssh -tt` that does no
+harm, the hangup ends rz/sz all the same; over `virsh console` it
+does: nothing hangs up the guest's serial line, so rz/sz would sit on
+it until its own timeouts gave up, the console's shell out of reach
+meanwhile. So after the cancel the bridge waits for the **prompt** --
+the sentinel's -- which is proof rz/sz is gone. Merely hearing back
+from the other end is not: bytes sent before the cancel may still be
+on their way, a dead line has those too. What comes in meanwhile is
+kept off the screen (data in flight would be binary garbage there),
+but checked for the prompt. The wait is bounded: `INTR_WAIT_SEC` (5s)
+for `^C` and the failures below, `ZM_ESC_WAIT_MS` (2s) for the escape
+key, whose second press ends it at once. `-v` says how it ended (the
+prompt is back / escape pressed again / no prompt in time / the
+channel is gone).
+
+A failure from the other side -- the remote breaking off (five CANs:
+no cancel to send, the prompt still waited for), sz unable to open the
+file, the channel gone (nothing to wait for), a timeout, too many
+errors -- ends the same way. Either way the reason is printed on
+stderr, the rest of the queue is not typed, and the bridge exits with
+status **1**.
+
+Progress goes to stderr when it is a terminal, one line rewritten
+every 500ms; each transfer ends with a summary line (bytes, seconds,
+rate), wherever stderr goes. `-v` traces every header but the ZACKs.
+
 ## Testing
 
 `tests/test_pty_bridge.py` drives the real binary through real ptys
@@ -602,7 +736,20 @@ terminal anywhere getting no push, and with stdout a terminal its size
 pushed on a serial channel and seeded into a pty channel; `^C` passed
 on to the remote job with the bridge leaving at the returning prompt
 and dying of `SIGINT`, leaving after the 5s wait when the remote end
-ignores it, and at once on a second `^C`), and the
+ignores it, and at once on a second `^C`), file transfers against the
+real lrzsz (skipped without it: `--put` and `--get` byte for byte with
+the bytes a channel may act on in the data, the mode kept, the queue
+going on after them; through `tests/fake_serial.py`, a virsh-like
+channel that leaves at a raw `^]` and here flips one byte each way,
+repaired by `ZRPOS`; a missing remote file and a missing remote rz
+failing with status 1 and nothing left behind; a missing local file
+refused; the escape key and `^C` in the middle of a slow transfer, and
+an unattended `SIGINT`, cancelling it with no rz/sz left running -- for
+the escape key with the channel leaving like virsh does, the guest's
+console not hung up (`FS_LINGER`), so only the CANs can have ended
+rz/sz; on a line gone dead (`SIGUSR1` to the relay) the escape key
+giving up on the prompt after 2s, and a second press leaving at once),
+and the
 verbose trace (`-v`: parsed patterns,
 matching tail, matches and replies on stderr). The test
 compiles the binary itself if it is missing and exits non-zero on any

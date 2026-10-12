@@ -1361,6 +1361,282 @@ check('second ^C: leaves at once, dying of SIGINT',
       os.WTERMSIG(status) == signal.SIGINT and took < 3.0,
       '%r %.1fs' % (status, took))
 
+# 38) --put/--get: a queued rz/sz, and the bridge's ZMODEM end talking
+#     to it. Needs lrzsz here, as the remote end would. The fake console
+#     runs every line in REMOTE; the files are random data plus the bytes
+#     a channel may act on (^], "~." after a newline, CAN, XON/XOFF)
+def zm_console(prompt_first=True, path_prefix=''):
+    return (path_prefix + 'cd "$REMOTE"; ' + ('printf "]# "; ' if prompt_first else '') +
+            'while IFS= read -r line; do sh -c "$line"; printf "]# "; done')
+
+
+FAKE_SERIAL = os.path.join(HERE, 'fake_serial.py')
+have_lrzsz = all(subprocess.call(['sh', '-c', 'command -v ' + c],
+                                 stdout=subprocess.DEVNULL) == 0
+                 for c in ('rz', 'sz'))
+if not have_lrzsz:
+    print('SKIP --put/--get: no rz/sz (lrzsz) installed')
+else:
+    zdir = tempfile.mkdtemp(prefix='pty-bridge-zm-')
+    zlocal, zremote = os.path.join(zdir, 'local'), os.path.join(zdir, 'remote')
+    os.mkdir(zlocal)
+    os.mkdir(zremote)
+    special = b'a\x1d\r~.\r\n~.\n\x18\x18\x18\x18\x18\x11\x13\x10\x7f\xff**\x18B'
+    up = os.urandom(200000) + special + os.urandom(1000)
+    down = special + os.urandom(300000)
+    with open(os.path.join(zlocal, 'up.bin'), 'wb') as f:
+        f.write(up)
+    with open(os.path.join(zremote, "it's down.bin"), 'wb') as f:
+        f.write(down)
+    os.chmod(os.path.join(zremote, "it's down.bin"), 0o640)
+    zenv = dict(os.environ, REMOTE=zremote)
+
+    def zread(*parts):
+        with open(os.path.join(*parts), 'rb') as f:
+            return f.read()
+
+    def zcwd(argv, **kw):
+        """run_unattended() from the local directory"""
+        here = os.getcwd()
+        os.chdir(zlocal)
+        try:
+            return run_unattended(argv, **kw)
+        finally:
+            os.chdir(here)
+
+    # 38a) up and down over a pty channel, in queue order with --send
+    status, out, err = zcwd(
+        ['pty-bridge', '-p', ']# ', '--put', os.path.join(zlocal, 'up.bin'),
+         '--get', "it's down.bin", '-s', 'echo AFTER-$((6*7))', '--',
+         'sh', '-c', zm_console()], env=zenv, timeout=30.0)
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    check('zmodem: put + get exit 0', ok, repr(status) + ' err=' + repr(err))
+    check('zmodem: put arrives byte for byte',
+          os.path.exists(os.path.join(zremote, 'up.bin')) and
+          zread(zremote, 'up.bin') == up, repr(err))
+    check('zmodem: get arrives byte for byte, under the remote name',
+          os.path.exists(os.path.join(zlocal, "it's down.bin")) and
+          zread(zlocal, "it's down.bin") == down, repr(err))
+    check('zmodem: the received file keeps the remote mode',
+          os.path.exists(os.path.join(zlocal, "it's down.bin")) and
+          os.stat(os.path.join(zlocal, "it's down.bin")).st_mode & 0o777 == 0o640)
+    check('zmodem: the queue goes on after the transfers',
+          b'AFTER-42' in out and b'put ' in err and b'get ' in err and
+          (b'%d bytes in' % len(up)) in err, repr(out[-200:]) + repr(err))
+    check('zmodem: no ZMODEM on the screen',
+          b'**\x18B' not in out.replace(special, b''), repr(out[-300:]))
+
+    # 38b) a serial channel that leaves at a raw ^] -- the file carries
+    #      one -- and flips a byte each way: the bridge escapes the ^],
+    #      the damaged subpacket is asked for again (ZRPOS)
+    for name in ('up.bin', "it's down.bin"):
+        os.unlink(os.path.join(zremote if name == 'up.bin' else zlocal, name))
+    status, out, err = zcwd(
+        ['pty-bridge', '-v', '--term', 'serial', '-p', ']# ',
+         '--put', 'up.bin', '--get', "it's down.bin", '--',
+         sys.executable, FAKE_SERIAL, 'sh', '-c', zm_console(False)],
+        env=dict(zenv, FS_CORRUPT_IN='60000', FS_CORRUPT_OUT='90000'),
+        timeout=30.0)
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    check('zmodem serial: put + get through a damaging line exit 0', ok,
+          repr(status) + ' err=' + repr(err[-600:]))
+    check('zmodem serial: both files intact',
+          os.path.exists(os.path.join(zremote, 'up.bin')) and
+          zread(zremote, 'up.bin') == up and
+          os.path.exists(os.path.join(zlocal, "it's down.bin")) and
+          zread(zlocal, "it's down.bin") == down, repr(err[-600:]))
+    check('zmodem serial: the damage was repaired with ZRPOS both ways',
+          re.search(rb'<- ZRPOS [1-9]', err) is not None and
+          b'bad subpacket at' in err, repr(err[-600:]))
+    check('zmodem serial: the ^] in the data did not end the channel',
+          b'ESCAPED' not in out + err, repr(err[-300:]))
+
+    # 38c) a remote file sz cannot open: the run ends with status 1, the
+    #      rest of the queue untyped, nothing left behind locally
+    before = sorted(os.listdir(zlocal))
+    status, out, err = zcwd(
+        ['pty-bridge', '-p', ']# ', '--get', 'nope.bin', '-s', 'echo NEXT',
+         '--', 'sh', '-c', zm_console()], env=zenv, timeout=30.0)
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
+    check('zmodem: a missing remote file fails with status 1',
+          ok and b'sent no file' in err and b'\nNEXT' not in out,
+          repr(status) + ' err=' + repr(err) + ' out=' + repr(out[-200:]))
+    check('zmodem: a failed get leaves nothing behind',
+          sorted(os.listdir(zlocal)) == before, repr(os.listdir(zlocal)))
+
+    # 38d) no rz on the remote end: its prompt comes back, rz never spoke
+    t0 = time.time()
+    status, out, err = zcwd(
+        ['pty-bridge', '-p', ']# ', '--put', 'up.bin', '--',
+         '/bin/sh', '-c', zm_console(path_prefix='PATH=/nonexistent; ')],
+        env=zenv, timeout=30.0)
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
+    check('zmodem: no rz remotely -- said so at the prompt, status 1',
+          ok and b'did not start' in err and time.time() - t0 < 5,
+          repr(status) + ' err=' + repr(err))
+
+    # 38e) a local file to put that is not there: refused up front
+    status, out, err = zcwd(['pty-bridge', '-p', ']# ', '--put', 'nope.bin',
+                             '--', 'true'])
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
+    check('zmodem: --put of a missing local file refused', ok and
+          b'nope.bin' in err, repr(status) + ' err=' + repr(err))
+
+    def zm_interactive(argv, key, after=1.5, env=None):
+        """Run the bridge on a terminal of its own over a slow serial line,
+        type key after a while -- or each of the (seconds, key) pairs a
+        list holds; returns (status, seconds from the first key to the
+        exit, output)."""
+        keys = list(key) if isinstance(key, list) else [(after, key)]
+        pid, m = pty.fork()
+        if pid == 0:
+            os.chdir(zlocal)
+            os.execve(BIN, argv, dict(zenv, FS_RATE='20000', **(env or {})))
+        out, t0, tkey = b'', time.time(), None
+        while time.time() - t0 < 20:
+            while keys and time.time() - t0 > keys[0][0]:
+                os.write(m, keys.pop(0)[1])
+                tkey = tkey or time.time()
+            r, _, _ = select.select([m], [], [], 0.1)
+            if r:
+                try:
+                    d = os.read(m, 4096)
+                except OSError:
+                    break
+                if not d:
+                    break
+                out += d
+        status = wait_pid_exit(pid)
+        os.close(m)
+        return status, time.time() - (tkey or t0), out
+
+    def zm_remote_left():
+        return subprocess.call(
+            ['sh', '-c', 'ps -eo args | grep -q "^/usr/bin/[rs]z\\|^[rs]z"']) == 0
+
+    big = os.urandom(2000000)
+    with open(os.path.join(zlocal, 'big.bin'), 'wb') as f:
+        f.write(big)
+    with open(os.path.join(zremote, 'big2.bin'), 'wb') as f:
+        f.write(big)
+
+    # 38f) the escape key in the middle of a put: rz cancelled, the
+    #      bridge leaves with status 1 -- once the cancel got there. The
+    #      channel leaves the way virsh does (FS_LINGER): the guest's
+    #      console is not hung up, so nothing but the CANs can end rz;
+    #      an rz still running a second later means they never arrived
+    zm_virsh = {'FS_LINGER': '15'}
+    status, took, out = zm_interactive(
+        [BIN, '-v', '--term', 'serial', '-p', ']# ', '--put', 'big.bin', '--',
+         sys.executable, FAKE_SERIAL, 'sh', '-c', zm_console(False)], b'\x1d',
+        env=zm_virsh)
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
+    check('zmodem: escape during put leaves, status 1, after the answer',
+          ok and took < 2.5 and b'cancelled, leaving' in out and
+          b'drained after the cancel, the prompt is back' in out,
+          '%r %.1fs %r' % (status, took, out[-400:]))
+    time.sleep(1.0)
+    check('zmodem: escape during put, guest not hung up: no rz running',
+          not zm_remote_left())
+
+    # 38f2) the same for a get: sz is stopped by the CANs alone
+    status, took, out = zm_interactive(
+        [BIN, '-v', '--term', 'serial', '-p', ']# ', '--get', 'big2.bin', '--',
+         sys.executable, FAKE_SERIAL, 'sh', '-c', zm_console(False)], b'\x1d',
+        env=zm_virsh)
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
+    check('zmodem: escape during get leaves, status 1, after the answer',
+          ok and took < 2.5 and b'drained after the cancel, the prompt is back' in out,
+          '%r %.1fs %r' % (status, took, out[-400:]))
+    time.sleep(1.0)
+    check('zmodem: escape during get, guest not hung up: no sz running',
+          not zm_remote_left())
+
+    # 38f3) the wait for that answer has its limits: a remote end that
+    #      does not answer -- the line goes dead mid-transfer (SIGUSR1 to
+    #      the relay) -- holds the escape key up for ZM_ESC_WAIT_MS (2s)
+    #      at most, and a second press leaves at once
+    def zm_dead_line_escape(second_press):
+        """Escape after the line went dead, pressed once more 0.5s later
+        if second_press; returns (status, seconds from the last press to
+        the exit, output)."""
+        pidfile = os.path.join(zremote, 'relay.pid')
+        pid, m = pty.fork()
+        if pid == 0:
+            os.chdir(zlocal)
+            os.execve(BIN, [BIN, '-v', '--term', 'serial', '-p', ']# ',
+                            '--put', 'big.bin', '--', 'sh', '-c',
+                            'echo $$ > "$REMOTE/relay.pid"; exec "$@"', 'x',
+                            sys.executable, FAKE_SERIAL, 'sh', '-c',
+                            zm_console(False)],
+                      dict(zenv, FS_RATE='20000'))
+        presses = [1.5, 2.0] if second_press else [1.5]
+        out, t0, tlast = b'', time.time(), None
+        while time.time() - t0 < 15:
+            if presses and time.time() - t0 > presses[0]:
+                if tlast is None:
+                    with open(pidfile) as f:
+                        os.kill(int(f.read()), signal.SIGUSR1)
+                presses.pop(0)
+                os.write(m, b'\x1d')
+                tlast = time.time()
+            r, _, _ = select.select([m], [], [], 0.05)
+            if r:
+                try:
+                    d = os.read(m, 4096)
+                except OSError:
+                    break
+                if not d:
+                    break
+                out += d
+        status = wait_pid_exit(pid)
+        os.close(m)
+        return status, time.time() - tlast if tlast else -1, out
+
+    status, took, out = zm_dead_line_escape(False)
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
+    check('zmodem: escape on a dead line gives up waiting after 2s',
+          ok and 1.8 < took < 3.0 and b'no prompt in time' in out,
+          '%r %.1fs %r' % (status, took, out[-400:]))
+    status, took, out = zm_dead_line_escape(True)
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
+    check('zmodem: a second escape leaves without waiting for the answer',
+          ok and 0 <= took < 0.5 and b'escape pressed again' in out,
+          '%r %.1fs %r' % (status, took, out[-400:]))
+
+    # 38g) ^C in the middle of a get: sz cancelled, no partial file
+    before = sorted(os.listdir(zlocal))
+    status, took, out = zm_interactive(
+        [BIN, '--term', 'serial', '-p', ']# ', '--get', 'big2.bin',
+         '-s', 'echo NEXT', '--',
+         sys.executable, FAKE_SERIAL, 'sh', '-c', zm_console(False)], b'\x03')
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
+    check('zmodem: ^C during get cancels, status 1, queue stops',
+          ok and took < 7.0 and b'interrupted' in out and b'\r\nNEXT' not in out,
+          '%r %.1fs %r' % (status, took, out[-300:]))
+    time.sleep(0.5)
+    check('zmodem: ^C during get leaves no partial file, no sz running',
+          sorted(os.listdir(zlocal)) == before and not zm_remote_left(),
+          repr(os.listdir(zlocal)))
+
+    # 38h) unattended, ^C is SIGINT: the put is cancelled, the bridge
+    #      dies of it -- without waiting for a prompt the cancel ate
+    t0 = time.time()
+    status, out, err = zcwd(
+        ['pty-bridge', '--term', 'serial', '-p', ']# ', '--put', 'big.bin',
+         '--', sys.executable, FAKE_SERIAL, 'sh', '-c', zm_console(False)],
+        env=dict(zenv, FS_RATE='20000'), timeout=15.0,
+        kills=[(1.5, signal.SIGINT)])
+    check('zmodem: unattended ^C cancels the put and dies of SIGINT',
+          status is not None and os.WIFSIGNALED(status) and
+          os.WTERMSIG(status) == signal.SIGINT and time.time() - t0 < 5.0 and
+          b'interrupted' in err,
+          '%r %.1fs err=%r' % (status, time.time() - t0, err))
+    time.sleep(0.5)
+    check('zmodem: unattended ^C leaves no rz running', not zm_remote_left())
+
+    subprocess.call(['rm', '-rf', zdir])
+
 print('---')
 print('FAILURES:', failures)
 sys.exit(1 if failures else 0)

@@ -23,7 +23,9 @@
  * match -- run at the prompt, one per prompt, until the queue is empty
  * and the bridge exits by itself, and the remote side is kept in sync
  * with the local terminal -- the window size on every change, TERM
- * once on a serial console (--term).
+ * once on a serial console (--term). Files travel the same way: --put
+ * and --get queue a remote rz or sz, and the bridge speaks ZMODEM to it
+ * (zmodem.c) -- all a serial console needs to get a file in or out.
  *
  * Requires stdin to be the controlling terminal of this process,
  * otherwise it exits immediately -- unless commands are queued: such a
@@ -35,8 +37,10 @@
  * run.
  *
  * Build: gcc -Wall -O2 -o pty-bridge pty-bridge.c -lutil
+ *        (zmodem.c is #included, not compiled on its own)
  * Usage: ./pty-bridge [-e CHAR|--escape CHAR] [-p "login: root"] \
- *                     [-s "uptime"] [--term pty|serial|auto] [-v] \
+ *                     [-s "uptime"] [--put FILE] [--get FILE] \
+ *                     [--term pty|serial|auto] [-v] \
  *                     [-w "Escape character is ^]"] \
  *                     [--pty /dev/pts/3] [command [arg ...]]
  */
@@ -48,10 +52,12 @@
 #include <pty.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -101,6 +107,8 @@ struct pattern {
     const char *response; /* string auto-typed after a match */
     int sentinel;         /* empty response: the command prompt marker */
     int command;          /* match equals the sentinel's: run at the prompt */
+    int xfer;             /* --put/--get: ZM_PUT/ZM_GET, the command is rz/sz */
+    const char *path;     /* ... the file to put or get */
     int used;
 };
 static struct pattern patterns[MAX_PATTERNS];
@@ -178,6 +186,24 @@ static int quit_pending;
 static volatile sig_atomic_t intr_count; /* SIGINTs received */
 static int intr_sent;                    /* the ^C byte has been typed */
 static struct timespec intr_at;          /* ... at this moment */
+
+/*
+ * File transfer (--put/--get): a queued command like any other, typed
+ * at the prompt by the sentinel -- "rz" to put a file, "sz FILE" to get
+ * one -- after which the pty belongs to the ZMODEM transfer (zmodem.c)
+ * until rz/sz is done; the prompt that comes back then is the
+ * command's completion, as with every other command. zm_job is the
+ * transfer just typed, for the main loop to run. Should the prompt come
+ * back before rz/sz even spoke (no rz on the remote end, a file sz
+ * cannot open), the sentinel says so in zm_prompt, and types nothing.
+ *
+ * A failed transfer -- broken off by the user (^C, the escape key), by
+ * the remote end, a timeout -- ends the run: the rest of the queue is
+ * not typed, and the bridge exits with status 1 (xfer_failed).
+ */
+static struct pattern *zm_job;
+static int zm_prompt;
+static int xfer_failed;
 
 /*
  * Terminal type of the channel (--term): what the channel can carry
@@ -382,6 +408,19 @@ static const char *esc_str(const char *s)
     return esc_bytes(s, strlen(s));
 }
 
+/* Milliseconds elapsed since *t, on the monotonic clock */
+static long ms_since(const struct timespec *t)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - t->tv_sec) * 1000 +
+           (now.tv_nsec - t->tv_nsec) / 1000000;
+}
+
+/* ZMODEM, the protocol behind --put/--get: zm_transfer() */
+#include "zmodem.c"
+
 static void usage(FILE *out)
 {
     fprintf(out,
@@ -413,6 +452,18 @@ static void usage(FILE *out)
         "                      unattended and never reads stdin; ^C then interrupts\n"
         "                      the remote command too and leaves at its prompt.\n"
         "                      Needs a sentinel pattern (a -p with an empty reply)\n"
+        "      --put FILE      queue an upload: \"rz\" is typed at the prompt and the\n"
+        "                      local FILE is sent to it over ZMODEM, into the remote\n"
+        "                      shell's current directory (an existing file there is\n"
+        "                      replaced). Repeatable, queued with --send in order\n"
+        "      --get FILE      queue a download: \"sz FILE\" is typed at the prompt and\n"
+        "                      the file it sends is saved in the local current\n"
+        "                      directory, under FILE's last component -- replacing\n"
+        "                      it only once all of it arrived. Repeatable. During a\n"
+        "                      transfer the keyboard only knows the escape key\n"
+        "                      (leave) and ^C (cancel); unattended, ^C cancels.\n"
+        "                      A failed transfer ends the run with exit status 1.\n"
+        "                      Both need a sentinel pattern and lrzsz on the remote\n"
         "      --pty PATH      attach to an existing pty (e.g. /dev/pts/3) instead of\n"
         "                      running COMMAND on a new pty\n"
         "  -t, --term pty|serial|auto\n"
@@ -445,8 +496,10 @@ static void usage(FILE *out)
         "  %s -p \"]# \" -s \"ls\" -- ssh -tt host   # run ls at the prompt,\n"
         "                                                # exit when it returns\n"
         "  %s -p \"]# \" --term serial -- virsh console vm1\n"
-        "  %s -p \"]# \" -w \"Escape character is ^]\" -- virsh console vm1\n",
-        prog, prog, prog, prog, prog, prog, prog);
+        "  %s -p \"]# \" -w \"Escape character is ^]\" -- virsh console vm1\n"
+        "  %s -p \"]# \" --put app.tgz --get /var/log/messages -- \\\n"
+        "      virsh console vm1                     # file in, file out\n",
+        prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 /*
@@ -833,7 +886,11 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
                 max_mlen = p->mlen;
                 VLOG("  recording trimmed to the last %zu bytes", max_mlen);
             }
-            if (intr_sent) {
+            if (zm_job) {
+                VLOG("  back at the prompt: no %s to talk to",
+                     zm_job->xfer == ZM_PUT ? "rz" : "sz");
+                zm_prompt = 1;
+            } else if (intr_sent) {
                 VLOG("  back at the prompt after ^C; exiting");
                 quit_pending = 1;
             } else if (winch_pending) {
@@ -846,6 +903,8 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
                 write_all(pty_fd, (const unsigned char *)cmd->response,
                           strlen(cmd->response));
                 write_all(pty_fd, (const unsigned char *)"\r", 1);
+                if (cmd->xfer)
+                    zm_job = cmd; /* the main loop runs the transfer */
             } else if (has_commands) {
                 VLOG("  every command ran; exiting");
                 quit_pending = 1;
@@ -861,6 +920,21 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
         outlen = 0;
         return;
     }
+}
+
+/*
+ * What the remote end prints around a transfer that is not ZMODEM: the
+ * echoed command, "rz waiting to receive.", an error, before rz/sz
+ * speaks -- shown as usual -- and what comes in after a cancel, kept
+ * off the screen (show 0). Either way it is checked for the prompt,
+ * which tells the transfer rz/sz is not running (any more).
+ */
+static int zm_text(int fd, const unsigned char *buf, size_t n, int show)
+{
+    if (show)
+        write_stdout(buf, n);
+    record_and_check(fd, buf, n);
+    return zm_prompt;
 }
 
 /*
@@ -989,16 +1063,6 @@ static int wait_text_check(const unsigned char *buf, size_t n)
     return 0;
 }
 
-/* Milliseconds elapsed since *t, on the monotonic clock */
-static long ms_since(const struct timespec *t)
-{
-    struct timespec now;
-
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (now.tv_sec - t->tv_sec) * 1000 +
-           (now.tv_nsec - t->tv_nsec) / 1000000;
-}
-
 /*
  * Wake the serial console: wait for it to connect, then poke it into
  * showing its prompt. Runs for a COMMAND mode channel resolved to the
@@ -1088,6 +1152,8 @@ static void wake_serial_console(int pty_fd)
             record_and_check(pty_fd, buf, (size_t)n);
             if (quit_pending)
                 return; /* every command ran during the startup wait */
+            if (zm_job)
+                return; /* a transfer was typed: the main loop runs it */
             if (!seen && wait_text_check(buf, (size_t)n)) {
                 seen = 1;
                 clock_gettime(CLOCK_MONOTONIC, &seen_at);
@@ -1117,6 +1183,30 @@ static void wake_serial_console(int pty_fd)
     }
 }
 
+/*
+ * The line --get types: sz with the remote path in single quotes, so
+ * the remote shell takes it verbatim -- a quote in it closes the
+ * quoting, adds an escaped one, and opens it again.
+ */
+static char *sz_command(const char *path)
+{
+    char *cmd = malloc(strlen(path) * 4 + 16), *q;
+
+    if (!cmd)
+        die("out of memory");
+    q = cmd + sprintf(cmd, "sz -- '");
+    for (; *path; path++) {
+        if (*path == '\'') {
+            memcpy(q, "'\\''", 4);
+            q += 4;
+        } else {
+            *q++ = *path;
+        }
+    }
+    strcpy(q, "'");
+    return cmd;
+}
+
 int main(int argc, char **argv)
 {
     const char *escape_str = "^]";
@@ -1128,6 +1218,7 @@ int main(int argc, char **argv)
     sigset_t winch_set, orig_set;
     int opt;
     int nr_sends = 0;
+    const char *first_send = NULL;  /* --send/--put/--get, for the refusal */
     char name[4];
 
     static const struct option long_options[] = {
@@ -1138,6 +1229,8 @@ int main(int argc, char **argv)
         { "wait-for", required_argument, NULL, 'w' },
         { "verbose", no_argument,       NULL, 'v' },
         { "pty",     required_argument, NULL, 1 },
+        { "put",     required_argument, NULL, 2 },
+        { "get",     required_argument, NULL, 3 },
         { "help",    no_argument,       NULL, 'h' },
         { NULL, 0, NULL, 0 },
     };
@@ -1212,6 +1305,47 @@ int main(int argc, char **argv)
             nr_unused++;
             has_commands = 1;
             nr_sends++;
+            if (!first_send)
+                first_send = "send";
+            break;
+        }
+        case 2:   /* --put */
+        case 3: { /* --get */
+            struct pattern *p;
+            const char *base = strrchr(optarg, '/');
+
+            /*
+             * A command in the queue like --send, typed at its turn:
+             * rz to receive what is put, sz to send what is got. The
+             * file goes by its last component -- into the remote
+             * shell's current directory, or the local one.
+             */
+            base = base ? base + 1 : optarg;
+            if (!*base || !strcmp(base, ".") || !strcmp(base, "..")) {
+                fprintf(stderr, "%s: --%s needs a file, not '%s'\n",
+                        prog, opt == 2 ? "put" : "get", optarg);
+                return 2;
+            }
+            if (opt == 2 && access(optarg, R_OK) < 0) {
+                fprintf(stderr, "%s: %s: %s\n", prog, optarg, strerror(errno));
+                return 2;
+            }
+            if (nr_patterns >= MAX_PATTERNS)
+                die("too many patterns");
+            p = &patterns[nr_patterns++];
+            p->match = NULL;
+            p->mlen = 0;
+            p->response = opt == 2 ? "rz" : sz_command(optarg);
+            p->sentinel = 0;
+            p->command = 1;
+            p->xfer = opt == 2 ? ZM_PUT : ZM_GET;
+            p->path = optarg;
+            p->used = 0;
+            nr_unused++;
+            has_commands = 1;
+            nr_sends++;
+            if (!first_send)
+                first_send = opt == 2 ? "put" : "get";
             break;
         }
         case 't':
@@ -1264,15 +1398,15 @@ int main(int argc, char **argv)
     }
 
     /*
-     * --send types at the sentinel's prompt: without a sentinel there
-     * is no prompt boundary to wait for, and the command would be
-     * typed blind. (The serial method refuses the same way, for the
-     * same reason.)
+     * --send types at the sentinel's prompt, and so do --put/--get:
+     * without a sentinel there is no prompt boundary to wait for, and
+     * the command would be typed blind. (The serial method refuses the
+     * same way, for the same reason.)
      */
     if (nr_sends && !has_sentinel) {
         fprintf(stderr,
-                "%s: --send needs a sentinel pattern (e.g. -p \"]# \")\n",
-                prog);
+                "%s: --%s needs a sentinel pattern (e.g. -p \"]# \")\n",
+                prog, first_send);
         return 2;
     }
 
@@ -1308,6 +1442,10 @@ int main(int argc, char **argv)
 
             if (p->sentinel)
                 VLOG("pattern[%d] sentinel: match '%s'", i, esc_str(p->match));
+            else if (p->xfer)
+                VLOG("pattern[%d] -> %s '%s', command '%s'", i,
+                     p->xfer == ZM_PUT ? "put" : "get", esc_str(p->path),
+                     esc_str(p->response));
             else if (p->command) {
                 if (p->match)
                     VLOG("pattern[%d] match '%s' -> command '%s'",
@@ -1505,6 +1643,44 @@ int main(int argc, char **argv)
         struct timespec intr_left, *wait = NULL;
 
         /*
+         * A transfer was just typed at the prompt: the pty is the
+         * transfer's until it is over (zmodem.c), the keyboard only
+         * good for the escape key and ^C. What came in behind a good
+         * session is the remote shell's again, its prompt included.
+         * A failed one ends the run here: the remote rz/sz has been
+         * cancelled already (zm_abort), so a SIGINT has nothing left
+         * to pass on -- the bridge leaves at once, and dies of it.
+         */
+        if (zm_job) {
+            struct zm_link link = {
+                .fd = pty_fd,
+                .key_fd = unattended ? -1 : STDIN_FILENO,
+                .escape = escape_char,
+                .mask = &orig_set,
+                .intr = &intr_count,
+                .text = zm_text,
+            };
+            const unsigned char *rest;
+            size_t nrest;
+            int r = zm_transfer(&link, zm_job->xfer, zm_job->path);
+
+            zm_job = NULL;
+            zm_prompt = 0;
+            if (r != ZM_OK) {
+                xfer_failed = 1;
+                goto out;
+            }
+            nrest = zm_leftover(&rest);
+            if (nrest) {
+                write_stdout(rest, nrest);
+                record_and_check(pty_fd, rest, nrest);
+                if (quit_pending)
+                    goto out;
+            }
+            continue;
+        }
+
+        /*
          * ^C in an unattended run: type it into the pty for the remote
          * job, then give the prompt INTR_WAIT_SEC to come back -- the
          * sentinel leaves when it does (record_and_check) -- and leave
@@ -1631,5 +1807,5 @@ out:
         sigprocmask(SIG_SETMASK, &orig_set, NULL);
         raise(SIGINT);
     }
-    return 0;
+    return xfer_failed ? 1 : 0;
 }
