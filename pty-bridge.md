@@ -596,12 +596,32 @@ What one file in one direction needs, as lrzsz speaks it:
   `ZFILE` (`name NUL "size mtime mode 0 1 size"`, the mode the whole
   `st_mode` -- rz applies permissions only to a mode that says regular
   file) and streams `ZDATA` from the `ZRPOS` rz answers with: 1 KiB
-  `ZCRCG` subpackets, a `ZCRCQ` every 8 KiB for rz to `ZACK`, no more
-  than 32 KiB unacknowledged (rz's own buffer size if it names one, a
-  `ZCRCW` then waiting at its end). Between subpackets anything rz
-  says is looked at without waiting: a `ZRPOS` -- rz saw a damaged
-  subpacket -- rewinds the stream there. `ZEOF`, `ZRINIT`, `ZFIN`,
-  `ZFIN`, `OO`. A `ZCRC` request is answered with the file's CRC.
+  `ZCRCG` subpackets, a `ZCRCQ` every 8 KiB for rz to `ZACK`, up to
+  `ZM_WINDOW` (512 KiB) unacknowledged (rz's own buffer size if it
+  names one, a `ZCRCW` then waiting at its end). Between subpackets
+  anything rz says is looked at without waiting: a `ZRPOS` -- rz saw a
+  damaged subpacket -- rewinds the stream there. `ZEOF`, `ZRINIT`,
+  `ZFIN`, `ZFIN`, `OO`. A `ZCRC` request is answered with the file's
+  CRC.
+- **the window** has to hold a round trip of the line: over ssh or
+  a console server far away, a small one is what limits the speed --
+  32 KiB at 30 ms each way made 0.5 MB/s. It cannot be unbounded,
+  though, the way lsz streams: after a `ZRPOS` rz must read through
+  everything already on its way before the new `ZDATA` comes, counts
+  it as garbage, and gives up after some 20 * (1400 + baud rate) bytes
+  -- 800 KB at a pty's 38400. Meanwhile it repeats its `ZRPOS` every
+  40 KB or so; one for the position just rewound to, with nothing
+  acknowledged since, is taken for such a repeat and ignored (should
+  the `ZDATA` have been lost all the same, the wait for an ack times
+  out and the data goes again). A `ZRPOS` halves the window, 32 KiB
+  at least, and every ack widens it again.
+- **rz gone** mid-transfer -- killed, given up -- leaves the data
+  going to the remote shell. What rz says outside its headers is
+  nothing, so these bytes go past the sentinel during a put: the
+  prompt among them ends the transfer (`the remote rz is gone`), the
+  window bounds what was on its way, and the cancel's trailing `^U`
+  kills the line it left at the shell. (Not during a get: there the
+  bytes skipped in a resync are sz's data, which may hold a prompt.)
 - **get**: sz opens with `ZRQINIT`; the bridge answers `ZRINIT`
   (full duplex, overlapped I/O, CRC-32), takes `ZFILE`, asks for the
   data from 0 (`ZRPOS`) and writes what arrives, acknowledging
@@ -645,7 +665,8 @@ end and sends eight CANs (`ZDLE` = `0x18`) instead -- every ZMODEM
 program stops at five in a row (lrzsz: `GOTCAN`; sz looks at its back
 channel between subpackets, so it stops mid-stream too) -- plus
 backspaces to wipe them off a line editor should one be reading
-instead. rz/sz restores its tty and exits; the remote shell prints its
+instead, and a `^U` for the rest of that line. rz/sz restores its tty
+and exits; the remote shell prints its
 prompt again.
 
 Writing the CANs is not the end of it: they have only reached the
@@ -741,7 +762,10 @@ real lrzsz (skipped without it: `--put` and `--get` byte for byte with
 the bytes a channel may act on in the data, the mode kept, the queue
 going on after them; through `tests/fake_serial.py`, a virsh-like
 channel that leaves at a raw `^]` and here flips one byte each way,
-repaired by `ZRPOS`; a missing remote file and a missing remote rz
+repaired by `ZRPOS`; a far line (`FS_DELAY`, 40 ms each way) taking
+4 MiB in well under 5s, one byte flipped and repaired with a single
+rewind; rz killed mid-put ending the transfer at the prompt; a
+missing remote file and a missing remote rz
 failing with status 1 and nothing left behind; a missing local file
 refused; the escape key and `^C` in the middle of a slow transfer, and
 an unattended `SIGINT`, cancelling it with no rz/sz left running -- for

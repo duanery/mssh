@@ -1451,6 +1451,34 @@ else:
     check('zmodem serial: the ^] in the data did not end the channel',
           b'ESCAPED' not in out + err, repr(err[-300:]))
 
+    # 38b2) a far line, 40 ms each way: the upload does not wait for
+    #       each ack (a 32 KiB window took over 10 s for this); the
+    #       damaged subpacket narrows the window, and the ZRPOS rz repeats
+    #       while it skips what was on its way are not taken for new ones
+    #       -- each would send it more to skip, until it gave up
+    far = os.urandom(4 << 20)
+    with open(os.path.join(zlocal, 'far.bin'), 'wb') as f:
+        f.write(far)
+    t0 = time.time()
+    status, out, err = zcwd(
+        ['pty-bridge', '-v', '-p', ']# ', '--put', 'far.bin', '--',
+         sys.executable, FAKE_SERIAL, 'sh', '-c', zm_console()],
+        env=dict(zenv, FS_DELAY='40', FS_CORRUPT_IN='1000000'),
+        timeout=30.0)
+    took = time.time() - t0
+    ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    check('zmodem far line: put exits 0, the file intact', ok and
+          os.path.exists(os.path.join(zremote, 'far.bin')) and
+          zread(zremote, 'far.bin') == far,
+          repr(status) + ' err=' + repr(err[-600:]))
+    check('zmodem far line: 4 MiB in under 5 s', took < 5.0, '%.1fs' % took)
+    check('zmodem far line: one rewind for the damage, the window halved',
+          err.count(b'unacked at most') == 1 and
+          b'262144 unacked at most' in err, repr(err[-600:]))
+    for d in (zlocal, zremote):
+        if os.path.exists(os.path.join(d, 'far.bin')):
+            os.unlink(os.path.join(d, 'far.bin'))
+
     # 38c) a remote file sz cannot open: the run ends with status 1, the
     #      rest of the queue untyped, nothing left behind locally
     before = sorted(os.listdir(zlocal))
@@ -1634,6 +1662,36 @@ else:
           '%r %.1fs err=%r' % (status, time.time() - t0, err))
     time.sleep(0.5)
     check('zmodem: unattended ^C leaves no rz running', not zm_remote_left())
+
+    # 38i) rz killed in the middle of a put: what is sent would go to the
+    #      shell, so the prompt that comes back ends the transfer. This
+    #      console runs nothing but rz -- not the lines of data it gets
+    console = ('cd "$REMOTE"; printf "]# "; while IFS= read -r line; do '
+               'case "$line" in rz) sh -c \'echo $$ > rz.pid; exec rz\';; esac; '
+               'printf "]# "; done')
+    pidfile = os.path.join(zremote, 'rz.pid')
+    p = subprocess.Popen(
+        [BIN, '-p', ']# ', '--put', 'big.bin', '--',
+         sys.executable, FAKE_SERIAL, 'sh', '-c', console],
+        cwd=zlocal, env=dict(zenv, FS_RATE='200000'), start_new_session=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE)
+    t0 = time.time()
+    while not os.path.exists(pidfile) and time.time() - t0 < 5:
+        time.sleep(0.05)
+    time.sleep(1.0)
+    with open(pidfile) as f:
+        os.kill(int(f.read()), signal.SIGKILL)
+    tkill = time.time()
+    try:
+        err = p.communicate(timeout=10)[1]
+    except subprocess.TimeoutExpired:
+        p.kill()
+        err = p.communicate()[1]
+    took = time.time() - tkill
+    check('zmodem: rz killed mid-put: back at the prompt, status 1, soon',
+          p.returncode == 1 and took < 4.0 and b'rz is gone' in err,
+          '%r %.1fs err=%r' % (p.returncode, took, err[-300:]))
 
     subprocess.call(['rm', '-rf', zdir])
 

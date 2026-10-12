@@ -79,8 +79,9 @@
 
 #define ZM_SUBPKT       1024            /* data subpacket we send */
 #define ZM_MAXPKT       8192            /* largest one we take (sz -8) */
-#define ZM_WINDOW       32768           /* unacked data in flight, at most */
-#define ZM_ACK_EVERY    8192            /* ... with a ZCRCQ this often */
+#define ZM_ACK_EVERY    8192            /* a ZCRCQ this often, for a ZACK */
+#define ZM_WINDOW       (512L << 10)    /* unacked data, at most: zm_send() */
+#define ZM_WINDOW_MIN   32768           /* ... after a ZRPOS, growing back */
 #define ZM_START_SEC    30              /* for rz/sz to come up */
 #define ZM_TIMEOUT_SEC  10              /* for each answer once it runs */
 #define ZM_RETRIES      10
@@ -125,6 +126,7 @@ struct zm_link {
 #define ZE_BAD      (-6)    /* CRC or framing error */
 #define ZE_NOSTART  (-7)    /* the prompt came back before rz/sz spoke */
 #define ZE_LONG     (-8)    /* subpacket longer than ZM_MAXPKT */
+#define ZE_SHELL    (-10)   /* the prompt, amid a put: rz is gone */
 #define GOTOR       0x100
 
 static struct zm {
@@ -140,6 +142,7 @@ static struct zm {
     int rx32;               /* the last header read was CRC-32 */
     int tx32;               /* send CRC-32 */
     int escctl;             /* escape every control character */
+    int watch;              /* data goes out: see zm_stray() */
     const char *what;       /* "put NAME" / "get NAME", for messages */
     off_t total;            /* file size, -1: unknown */
     off_t done;             /* bytes through so far */
@@ -147,20 +150,33 @@ static struct zm {
     int shown;              /* a progress line is on stderr */
 } zm;
 
+/* table-driven: a fast line takes tens of MB/s through these */
+static uint16_t zm_crc16tab[256];
+static uint32_t zm_crc32tab[256];
+
+static void zm_crc_init(void)
+{
+    for (unsigned n = 0; n < 256; n++) {
+        uint16_t c16 = (uint16_t)(n << 8);
+        uint32_t c32 = n;
+
+        for (int i = 0; i < 8; i++) {
+            c16 = c16 & 0x8000 ? (uint16_t)((c16 << 1) ^ 0x1021) : (uint16_t)(c16 << 1);
+            c32 = c32 & 1 ? (c32 >> 1) ^ 0xedb88320 : c32 >> 1;
+        }
+        zm_crc16tab[n] = c16;
+        zm_crc32tab[n] = c32;
+    }
+}
+
 static uint16_t zm_crc16(uint16_t crc, unsigned char c)
 {
-    crc ^= (uint16_t)(c << 8);
-    for (int i = 0; i < 8; i++)
-        crc = crc & 0x8000 ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
-    return crc;
+    return (uint16_t)(crc << 8) ^ zm_crc16tab[(crc >> 8) ^ c];
 }
 
 static uint32_t zm_crc32(uint32_t crc, unsigned char c)
 {
-    crc ^= c;
-    for (int i = 0; i < 8; i++)
-        crc = crc & 1 ? (crc >> 1) ^ 0xedb88320 : crc >> 1;
-    return crc;
+    return (crc >> 8) ^ zm_crc32tab[(crc ^ c) & 0xff];
 }
 
 /* a failure the user has to hear of, -v or not */
@@ -348,6 +364,20 @@ static int zm_rawc(long ms)
 }
 
 /*
+ * A byte that is not part of a frame, while a put sends its data:
+ * nothing rz says outside of its headers, but the shell's prompt -- rz
+ * gone, killed or given up, and what is sent going to the shell. The
+ * sentinel looks at it, a byte at a time: the echo of the data follows
+ * the prompt at once. Not while getting a file: there the bytes passed
+ * over in a resync are sz's data -- which might hold a prompt -- and
+ * nothing goes to the shell but a few headers.
+ */
+static int zm_stray(unsigned char c)
+{
+    return zm.watch && zm.l->text(zm.l->fd, &c, 1, 0);
+}
+
+/*
  * Has the receiver said something? Looked at between two subpackets,
  * without waiting: bytes that cannot start a header (the XON after a
  * hex header) are skipped, so only a header -- or CANs -- count.
@@ -362,6 +392,8 @@ static int zm_pending(void)
 
             if ((c & 0x7f) == ZPAD || c == ZDLE)
                 return 1;
+            if (zm_stray(c))
+                return ZE_SHELL;
         }
         r = zm_fill(0);
         if (r == ZE_TIMEOUT)
@@ -650,6 +682,8 @@ static int zm_gethdr(unsigned char h[4], long ms)
             return ZE_NOSTART;
         if ((c = zm_rawc(ms)) < 0)
             return c;
+        if (zm_stray((unsigned char)c))
+            return ZE_SHELL;
         if (!zm.session)
             zm.tbuf[zm.tlen++] = (unsigned char)c;
         ncan = c == ZDLE ? ncan + 1 : 0;
@@ -772,7 +806,8 @@ static void zm_progress(off_t done, int final)
  * end broke off itself (cancel 0), the CANs every ZMODEM program stops
  * at go out first, whatever was still buffered dropped (the backspaces
  * after them wipe them off a line editor, should one be reading
- * instead).
+ * instead, and a ^U the rest of the line: the data that reached the
+ * shell if rz was gone).
  *
  * Then the wait for rz/sz to be gone -- the remote shell's prompt,
  * which the sentinel recognizes. Merely writing the CANs is not
@@ -796,7 +831,7 @@ static int zm_abort(int cancel, long max_ms)
 {
     static const unsigned char canit[] = {
         ZDLE, ZDLE, ZDLE, ZDLE, ZDLE, ZDLE, ZDLE, ZDLE,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 0x15,
     };
     struct timespec t0;
     size_t total = 0;
@@ -863,20 +898,37 @@ static uint32_t zm_filecrc(int fd, uint32_t len)
  * Send the open file fd to the remote rz, as name. rz speaks first --
  * ZRINIT, its capabilities -- and asks for the data from where it
  * wants it (ZRPOS). The data streams as ZCRCG subpackets, with a ZCRCQ
- * every ZM_ACK_EVERY bytes for rz to ZACK; no more than ZM_WINDOW
- * goes out unacknowledged (rz's own buffer size instead, if it names
- * one -- then the frame ends with a ZCRCW there, waiting for the
- * ZACK). Between subpackets anything rz says is read without waiting:
- * a ZRPOS -- rz saw a bad subpacket -- rewinds the stream to where it
- * says.
+ * every ZM_ACK_EVERY bytes for rz to ZACK; up to ZM_WINDOW goes out
+ * before an ack is waited for -- a window that has to cover a round trip
+ * of the line: a far one (ssh, a console server) holds a lot. If rz
+ * names a buffer size, the frame ends with a ZCRCW there instead,
+ * waiting for the ZACK.
+ *
+ * Between subpackets anything rz says is read without waiting: a ZRPOS
+ * -- rz saw a bad subpacket -- rewinds the stream to where it says. rz
+ * then has to read through all that was on its way before the new ZDATA
+ * comes, and that bounds the window: rz counts it as garbage, and gives
+ * up after some 20 * (1400 + baud rate) bytes of it -- 800 KB at 38400.
+ * Meanwhile it repeats its ZRPOS at every 40 KB or so: a ZRPOS for the
+ * position just rewound to, with nothing acked since, is one of those,
+ * and ignored -- every rewind more would send rz another load of data it
+ * has to skip. Should the ZDATA have been lost all the same, the wait
+ * for an ack times out and the data goes again. A ZRPOS also narrows
+ * the window -- the line may be losing data -- to half, ZM_WINDOW_MIN
+ * at least, from where it grows back with every ack.
+ *
+ * Should rz be gone -- killed, given up -- what is sent goes to the
+ * shell instead, so the prompt coming back ends the transfer
+ * (ZE_SHELL); the window bounds what was on its way.
  */
 static int zm_send(int fd, const char *name, const struct stat *st)
 {
     static unsigned char buf[ZM_SUBPKT];
     unsigned char h[4], info[1024];
-    uint32_t size = (uint32_t)st->st_size, pos, acked, window;
+    uint32_t size = (uint32_t)st->st_size, pos, acked, window, resync;
+    uint32_t limit = ZM_WINDOW;
     size_t ilen, sinceq;
-    int t, flags, tries = 0;
+    int t, flags, tries = 0, dup;
 
     for (;;) {
         if ((t = zm_gethdr(h, ZM_START_SEC * 1000L)) < 0)
@@ -936,8 +988,9 @@ static int zm_send(int fd, const char *name, const struct stat *st)
         }
     }
 
-    pos = zm_getpos(h);
+    resync = pos = zm_getpos(h);
     tries = 0;
+    zm.watch = 1;
     for (;;) {                          /* a frame of data from pos */
         if (pos > size)
             pos = size;
@@ -970,9 +1023,9 @@ static int zm_send(int fd, const char *name, const struct stat *st)
             if (end == ZCRCE)
                 break;
 
-            /* what rz says: waited for at a ZCRCW or a full window */
+            /* what rz says: waited for at a ZCRCW or the limit */
             for (;;) {
-                must = end == ZCRCW || pos - acked >= (window ? window : ZM_WINDOW);
+                must = end == ZCRCW || pos - acked >= limit;
                 if (!must) {
                     int r = zm_pending();
 
@@ -986,6 +1039,9 @@ static int zm_send(int fd, const char *name, const struct stat *st)
                     uint32_t a = zm_getpos(h);
 
                     if (a > acked && a <= pos) {
+                        limit += a - acked;
+                        if (limit > ZM_WINDOW)
+                            limit = ZM_WINDOW;
                         acked = a;
                         tries = 0;
                     }
@@ -994,17 +1050,23 @@ static int zm_send(int fd, const char *name, const struct stat *st)
                     continue;
                 }
                 if (t == ZRPOS) {
+                    if (zm_getpos(h) == resync && acked == resync)
+                        continue;       /* sent before the ZDATA got there */
                     if (++tries >= ZM_RETRIES)
                         return ZE_BAD;
-                    pos = zm_getpos(h);
+                    resync = pos = zm_getpos(h);
                     zm.olen = 0;        /* stale data: rz skips it anyway */
+                    limit = limit / 2 > ZM_WINDOW_MIN ? limit / 2 : ZM_WINDOW_MIN;
+                    VLOG("zmodem: rz wants %lu again; %lu unacked at most",
+                         (unsigned long)pos, (unsigned long)limit);
                     goto frame;
                 }
                 if (t == ZE_TIMEOUT && must) {
-                    /* the ack got lost: send again from what is acked */
+                    /* the ack -- or the ZDATA -- got lost: send again
+                       from what is acked */
                     if (++tries >= ZM_RETRIES)
                         return t;
-                    pos = acked;
+                    resync = pos = acked;
                     goto frame;
                 }
                 if (t == ZSKIP || t == ZCAN || t == ZABORT || t == ZFERR)
@@ -1014,21 +1076,42 @@ static int zm_send(int fd, const char *name, const struct stat *st)
             }
         }
 
-        /* all of it is out: ZEOF, which rz answers with ZRINIT */
+        /*
+         * all of it is out: ZEOF, which rz answers with ZRINIT. A
+         * repeated ZRPOS is ignored here too -- but if nothing else
+         * comes, rz is still waiting for that position: it gets the
+         * data again
+         */
         for (;;) {
             zm_setpos(h, size);
             zm_hexhdr(ZEOF, h);
+            dup = 0;
         eof:
             t = zm_gethdr(h, ZM_TMO);
             if (t == ZRINIT)
                 goto fin;
-            if (t == ZRPOS) {
+            if (t == ZRPOS && zm_getpos(h) == resync && acked == resync) {
+                dup = 1;
+                goto eof;
+            }
+            if (t == ZRPOS || (t == ZE_TIMEOUT && dup)) {
                 if (++tries >= ZM_RETRIES)
-                    return ZE_BAD;
-                pos = zm_getpos(h);
+                    return t == ZRPOS ? ZE_BAD : t;
+                if (t == ZRPOS) {
+                    resync = zm_getpos(h);
+                    limit = limit / 2 > ZM_WINDOW_MIN ? limit / 2 : ZM_WINDOW_MIN;
+                }
+                pos = resync;
                 goto frame;
             }
-            if (t == ZACK || t == ZE_BAD)
+            if (t == ZACK) {
+                uint32_t a = zm_getpos(h);
+
+                if (a > acked && a <= size)
+                    acked = a;
+                goto eof;
+            }
+            if (t == ZE_BAD)
                 goto eof;
             if (t == ZE_TIMEOUT) {
                 if (++tries >= ZM_RETRIES)
@@ -1267,6 +1350,8 @@ static int zm_transfer(const struct zm_link *l, int dir, const char *path)
     int r, fd = -1, flags;
 
     memset(&zm, 0, sizeof(zm));
+    if (!zm_crc32tab[1])
+        zm_crc_init();
     zm.l = l;
     zm.total = -1;
     zm_keyev = 0;
@@ -1315,16 +1400,22 @@ static int zm_transfer(const struct zm_link *l, int dir, const char *path)
         case ZE_TIMEOUT: zm_err("no answer from the remote end"); break;
         case ZE_NOSTART: zm_err("the remote %s did not start",
                                 dir == ZM_PUT ? "rz" : "sz"); break;
+        case ZE_SHELL:   zm_err("the remote rz is gone: back at the prompt");
+                         break;
         default:         zm_err("too many errors"); break;
         }
         if (zm_tmp[0])
             unlink(zm_tmp);
         /*
          * Nothing to wait for if rz/sz never came, or the channel is
-         * gone; nothing to cancel if the remote broke off itself
+         * gone; nothing to cancel if the remote broke off itself. With
+         * rz gone the prompt is back already: the CANs are for the
+         * shell's line, and anything coming back -- its echo -- says
+         * they got there
          */
         if (r != ZE_GONE && r != ZE_NOSTART &&
-            zm_abort(r != ZE_RCAN, r == ZE_ESCAPE ? ZM_ESC_WAIT_MS
+            zm_abort(r != ZE_RCAN, r == ZE_ESCAPE || r == ZE_SHELL
+                                   ? ZM_ESC_WAIT_MS
                                    : INTR_WAIT_SEC * 1000L) == ZE_ESCAPE)
             r = ZE_ESCAPE;
         zm.ipos = zm.ilen;      /* nothing in there is the shell's */

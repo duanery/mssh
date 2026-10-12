@@ -11,12 +11,17 @@ both ways. Like virsh it leaves at a raw ^] (0x1d) on stdin, printing
   FS_CORRUPT_IN=N   flip the bits of the N-th byte towards COMMAND
   FS_CORRUPT_OUT=N  ... of the N-th byte coming from COMMAND
   FS_RATE=B         at most B bytes/s in each direction (a slow line)
+  FS_DELAY=MS       every byte arrives MS milliseconds after it was sent,
+                    either way (a far line); at most FS_QUEUE bytes
+                    (default 1 MiB) are on the way in each direction.
+                    Not with FS_RATE.
   SIGUSR1           the line goes dead: nothing is relayed any more, either
                     way (a SIGHUP still ends it)
   FS_LINGER=S       leave the way virsh does: the guest's console is not
                     hung up -- COMMAND keeps its pty for S more seconds,
                     its output read and dropped, after this exits
 """
+import collections
 import os
 import pty
 import select
@@ -48,11 +53,57 @@ def linger(m, seconds):
     os._exit(0)
 
 
+def relay_delayed(m, delay, cap, corrupt):
+    """Relay stdin <-> m, each chunk held for delay seconds; corrupt:
+    the byte to flip each way, as FS_CORRUPT_IN/OUT say."""
+    lanes = [(0, m, collections.deque()), (m, 1, collections.deque())]
+    held, count = [0, 0], [0, 0]
+    while True:
+        now = time.time()
+        rd, wait = [], None
+        for i, (src, dst, q) in enumerate(lanes):
+            while q and q[0][0] <= now:
+                _, d = q.popleft()
+                held[i] -= len(d)
+                try:
+                    os.write(dst, d)
+                except OSError:
+                    return
+            if q:
+                left = q[0][0] - now
+                wait = left if wait is None else min(wait, left)
+            if held[i] < cap:
+                rd.append(src)
+        try:
+            r, _, _ = select.select(rd, [], [], wait)
+        except InterruptedError:
+            continue
+        for i, (src, dst, q) in enumerate(lanes):
+            if src not in r:
+                continue
+            try:
+                d = os.read(src, 65536)
+            except OSError:
+                return
+            if not d:
+                return
+            if src == 0 and 0x1d in d:
+                print('ESCAPED', file=sys.stderr, flush=True)
+                return
+            d = bytearray(d)
+            if count[i] <= corrupt[i] < count[i] + len(d):
+                d[corrupt[i] - count[i]] ^= 0xff
+            count[i] += len(d)
+            q.append((time.time() + delay, d))
+            held[i] += len(d)
+
+
 def main():
     corrupt_in = int(os.environ.get('FS_CORRUPT_IN', '-1'))
     corrupt_out = int(os.environ.get('FS_CORRUPT_OUT', '-1'))
     rate = int(os.environ.get('FS_RATE', '0'))
     keep = float(os.environ.get('FS_LINGER', '0'))
+    delay = float(os.environ.get('FS_DELAY', '0')) / 1000
     pid, m = pty.fork()
     if pid == 0:
         os.execvp(sys.argv[1], sys.argv[1:])
@@ -66,7 +117,10 @@ def main():
     print('Escape character is ^]', file=sys.stderr, flush=True)
     nin = nout = 0
     chunk = max(1, rate // 50) if rate else 4096
-    while True:
+    if delay:
+        relay_delayed(m, delay, int(os.environ.get('FS_QUEUE', 1 << 20)),
+                      (corrupt_in, corrupt_out))
+    while not delay:
         if stalled:
             time.sleep(1)
             continue
