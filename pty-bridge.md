@@ -99,6 +99,22 @@ When stdin is not the controlling terminal and commands are queued:
   defaults (minus `OPOST`, as always) and a 0x0 size, no `SIGWINCH`
   handler is installed, and a serial channel gets no `stty`/TERM push
   at all -- the first prompt goes straight to the first command.
+- **`^C` ends the remote command too.** With stdin unread the key
+  never reaches the pty as a byte: the terminal turns it into `SIGINT`
+  for the bridge. Dying of it right away would leave the remote command
+  running -- on a serial console nothing hangs up on the guest's side
+  at all. So the first `SIGINT` is passed on: a `^C` byte (0x03) is
+  typed into the pty, the remote line discipline turns it into
+  `SIGINT` for the remote foreground job, and the bridge leaves at the
+  prompt that comes back (the sentinel firing -- no further queued
+  command is typed), or after `INTR_WAIT_SEC` (5s) if none does. A
+  second `^C` leaves at once. Either way the bridge then re-raises
+  `SIGINT` after the usual cleanup, so the caller sees the run was
+  interrupted (exit status 130 in a shell). `SIGINT` is blocked like
+  `SIGWINCH` and delivered inside `ppoll()`, so the loop picks it up
+  race-free. A `^C` during the serial startup phase (before the
+  handlers are installed) still kills the bridge at once: no remote
+  command runs yet.
 
 Without commands the run never ends by itself, so a non-terminal stdin
 is refused as before.
@@ -583,7 +599,10 @@ and the self-exit still work), unattended runs (stdin a pipe at EOF:
 commands still run and the bridge exits 0 with no escape announced, a
 non-tty stdin without commands still refused, a serial channel with no
 terminal anywhere getting no push, and with stdout a terminal its size
-pushed on a serial channel and seeded into a pty channel), and the
+pushed on a serial channel and seeded into a pty channel; `^C` passed
+on to the remote job with the bridge leaving at the returning prompt
+and dying of `SIGINT`, leaving after the 5s wait when the remote end
+ignores it, and at once on a second `^C`), and the
 verbose trace (`-v`: parsed patterns,
 matching tail, matches and replies on stderr). The test
 compiles the binary itself if it is missing and exits non-zero on any

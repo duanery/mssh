@@ -1189,9 +1189,10 @@ os.close(pr3)
 #     read -- a pipe at EOF before the prompt even shows up must not end
 #     the run -- and with no terminal on stdout either there is no
 #     escape key to announce and no window to describe
-def run_unattended(argv, env=None, stdout_tty=False, timeout=5.0):
+def run_unattended(argv, env=None, stdout_tty=False, timeout=5.0, kills=()):
     """Run the bridge with a pipe at EOF on stdin. stdout goes to a pipe,
     or with stdout_tty to a pty of its own (whose window is 27x77).
+    kills: (seconds after the start, signal) pairs to send it.
     Returns (exit status, stdout bytes, stderr bytes)."""
     ir, iw = os.pipe()
     os.close(iw)                     # stdin: EOF from the start
@@ -1211,10 +1212,14 @@ def run_unattended(argv, env=None, stdout_tty=False, timeout=5.0):
     for fd in (ir, out_w, ew):
         os.close(fd)
     out = err = b''
-    end = time.time() + timeout
+    start = time.time()
+    end = start + timeout
+    kills = sorted(kills)
     fds = [out_r, er]
     while fds and time.time() < end:
-        r, _, _ = select.select(fds, [], [], 0.1)
+        while kills and time.time() - start >= kills[0][0]:
+            os.kill(p, kills.pop(0)[1])
+        r, _, _ = select.select(fds, [], [], 0.05)
         for fd in r:
             try:
                 d = os.read(fd, 4096)
@@ -1301,6 +1306,60 @@ ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('unattended pty, stdout a tty: size seeded from stdout',
       ok and b'27 77' in out and b'ran:echo one' in out,
       repr(status) + ' out=' + repr(out))
+
+# 37f) ^C in an unattended run: stdin is not read, so the key arrives as
+#      SIGINT -- and must end the remote command too, not just the
+#      bridge. A ^C byte is typed into the pty, the remote line
+#      discipline interrupts the running job, and the bridge leaves at
+#      the prompt that comes back (no further command typed), dying of
+#      SIGINT for its caller to see. The fake console runs each line as a
+#      foreground job and survives the interrupt itself (trap)
+INTR_CONSOLE = ('stty -icanon -echo min 1 time 0; '
+                'trap "printf \\"^C\\\\n\\"" INT; '
+                'while IFS= read -r line; do '
+                'printf "ran:%s\\n" "$line"; sh -c "$line"; printf "]# "; done')
+t0 = time.time()
+status, out, err = run_unattended(
+    ['pty-bridge', '-v', '--term', 'serial', '-p', ']# ',
+     '-s', 'sleep 30; echo NOT-KILLED', '-s', 'echo next', '--',
+     'sh', '-c', INTR_CONSOLE],
+    timeout=10.0, kills=[(1.0, signal.SIGINT)])
+took = time.time() - t0
+check('^C: the bridge dies of SIGINT',
+      status is not None and os.WIFSIGNALED(status) and
+      os.WTERMSIG(status) == signal.SIGINT, repr(status))
+check('^C: passed on, the remote job interrupted, no further command',
+      b'ran:sleep 30' in out and b'^C\n]# ' in out and
+      b'\nNOT-KILLED' not in out and b'ran:echo next' not in out, repr(out))
+check('^C: leaves at the prompt that comes back, not by the timeout',
+      took < 3.0 and b'back at the prompt after ^C' in err,
+      '%.1fs err=%r' % (took, err[-300:]))
+
+# 37g) the remote end ignores the ^C and no prompt comes back: the
+#      bridge gives it INTR_WAIT_SEC (5s), then leaves anyway
+t0 = time.time()
+status, out, err = run_unattended(
+    ['pty-bridge', '-v', '--term', 'serial', '-p', ']# ',
+     '-s', 'trap "" INT; sleep 30', '--', 'sh', '-c', INTR_CONSOLE],
+    timeout=12.0, kills=[(1.0, signal.SIGINT)])
+took = time.time() - t0
+check('^C ignored remotely: leaves after the wait, dying of SIGINT',
+      status is not None and os.WIFSIGNALED(status) and
+      os.WTERMSIG(status) == signal.SIGINT and 5.5 < took < 9.0 and
+      b'no prompt 5 s after ^C' in err,
+      '%r %.1fs err=%r' % (status, took, err[-300:]))
+
+# 37h) a second ^C does not wait for anything: the bridge leaves at once
+t0 = time.time()
+status, out, err = run_unattended(
+    ['pty-bridge', '--term', 'serial', '-p', ']# ',
+     '-s', 'trap "" INT; sleep 30', '--', 'sh', '-c', INTR_CONSOLE],
+    timeout=12.0, kills=[(1.0, signal.SIGINT), (1.5, signal.SIGINT)])
+took = time.time() - t0
+check('second ^C: leaves at once, dying of SIGINT',
+      status is not None and os.WIFSIGNALED(status) and
+      os.WTERMSIG(status) == signal.SIGINT and took < 3.0,
+      '%r %.1fs' % (status, took))
 
 print('---')
 print('FAILURES:', failures)

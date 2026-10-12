@@ -163,6 +163,23 @@ static int sentinel_seen = 0; /* currently sitting at the command prompt */
 static int quit_pending;
 
 /*
+ * ^C in an unattended run: stdin is not read, so the key never reaches
+ * the pty as a byte -- the terminal turns it into SIGINT for the bridge
+ * instead. Ending the bridge alone would leave the command running on
+ * the remote end (on a serial console nothing hangs up on the guest's
+ * side at all), so the interrupt is passed on: a ^C byte is typed into
+ * the pty -- the remote line discipline turns it into SIGINT for the
+ * remote foreground job -- and the bridge leaves at the prompt that
+ * comes back, or after INTR_WAIT_SEC if none does. A second ^C leaves
+ * at once. Either way the bridge then dies of SIGINT, so its caller
+ * sees the run was interrupted.
+ */
+#define INTR_WAIT_SEC 5
+static volatile sig_atomic_t intr_count; /* SIGINTs received */
+static int intr_sent;                    /* the ^C byte has been typed */
+static struct timespec intr_at;          /* ... at this moment */
+
+/*
  * Terminal type of the channel (--term): what the channel can carry
  * to the remote end on its own. A "pty" channel (ssh -tt) allocates
  * its pty out of band -- it relays window changes and exports TERM
@@ -242,6 +259,18 @@ static void on_winch(int sig)
     winch_pending = 1;
 }
 
+/*
+ * SIGINT handler of an unattended run: the first one only records the
+ * ^C for the main loop to pass on (blocked outside ppoll, like
+ * SIGWINCH); a second one leaves at once, as any other signal does.
+ */
+static void on_intr(int sig)
+{
+    if (intr_count++ == 0)
+        return;
+    on_signal(sig);
+}
+
 /* Install handlers for the signals that must restore the terminal. */
 static void setup_signals(void)
 {
@@ -253,6 +282,11 @@ static void setup_signals(void)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
+
+    if (unattended) {
+        sa.sa_handler = on_intr;
+        sigaction(SIGINT, &sa, NULL);
+    }
 
     /* no local terminal: no window to follow, SIGWINCH keeps its default */
     if (local_fd < 0)
@@ -376,7 +410,8 @@ static void usage(FILE *out)
         "                      prompt, in the order given; repeatable. The bridge exits\n"
         "                      by itself once every queued command has run. Such a\n"
         "                      run needs no terminal on stdin: without one it goes\n"
-        "                      unattended and never reads stdin.\n"
+        "                      unattended and never reads stdin; ^C then interrupts\n"
+        "                      the remote command too and leaves at its prompt.\n"
         "                      Needs a sentinel pattern (a -p with an empty reply)\n"
         "      --pty PATH      attach to an existing pty (e.g. /dev/pts/3) instead of\n"
         "                      running COMMAND on a new pty\n"
@@ -798,7 +833,10 @@ static void record_and_check(int pty_fd, const unsigned char *buf, size_t n)
                 max_mlen = p->mlen;
                 VLOG("  recording trimmed to the last %zu bytes", max_mlen);
             }
-            if (winch_pending) {
+            if (intr_sent) {
+                VLOG("  back at the prompt after ^C; exiting");
+                quit_pending = 1;
+            } else if (winch_pending) {
                 winch_pending = 0;
                 sync_winsize(pty_fd);
             } else if (cmd) {
@@ -1399,9 +1437,13 @@ int main(int argc, char **argv)
      * Block SIGWINCH for the whole session and let ppoll unblock it
      * only while waiting: the signal is then delivered inside ppoll,
      * which returns EINTR -- no missed-wakeup race around the wait.
+     * Unattended, SIGINT goes the same way: its ^C is passed on by the
+     * loop (see intr_count).
      */
     sigemptyset(&winch_set);
     sigaddset(&winch_set, SIGWINCH);
+    if (unattended)
+        sigaddset(&winch_set, SIGINT);
     sigprocmask(SIG_BLOCK, &winch_set, &orig_set);
 
     /* restore the terminal when killed by a signal */
@@ -1460,7 +1502,31 @@ int main(int argc, char **argv)
         };
         unsigned char buf[4096];
         ssize_t n;
+        struct timespec intr_left, *wait = NULL;
 
+        /*
+         * ^C in an unattended run: type it into the pty for the remote
+         * job, then give the prompt INTR_WAIT_SEC to come back -- the
+         * sentinel leaves when it does (record_and_check) -- and leave
+         * without it once the time is up.
+         */
+        if (intr_count && !intr_sent) {
+            intr_sent = 1;
+            clock_gettime(CLOCK_MONOTONIC, &intr_at);
+            VLOG("^C: typing it into the pty, leaving at the next prompt");
+            write_all(pty_fd, (const unsigned char *)"\x03", 1);
+        }
+        if (intr_sent) {
+            long left = INTR_WAIT_SEC * 1000L - ms_since(&intr_at);
+
+            if (left <= 0) {
+                VLOG("no prompt %d s after ^C; exiting", INTR_WAIT_SEC);
+                goto out;
+            }
+            intr_left.tv_sec = left / 1000;
+            intr_left.tv_nsec = left % 1000 * 1000000L;
+            wait = &intr_left;
+        }
         /*
          * Window changed. pty channel: push the new size into the pty
          * via TIOCSWINSZ right away -- the kernel delivers SIGWINCH to
@@ -1489,9 +1555,10 @@ int main(int argc, char **argv)
         /*
          * SIGWINCH delivers only inside ppoll: the wait runs under the
          * original mask (without SIGWINCH), so the signal always wakes
-         * it, and the blocked mask is back on return.
+         * it, and the blocked mask is back on return. The same holds
+         * for an unattended run's SIGINT.
          */
-        if (ppoll(pfd, 2, NULL, &orig_set) < 0) {
+        if (ppoll(pfd, 2, wait, &orig_set) < 0) {
             if (errno == EINTR || errno == EAGAIN)
                 continue;
             die_errno("ppoll");
@@ -1556,6 +1623,13 @@ out:
     if (child_pid > 0) {
         kill(child_pid, SIGHUP);
         waitpid(child_pid, NULL, 0);
+    }
+
+    /* interrupted (^C, unattended): die of it, for the caller to see */
+    if (intr_count) {
+        signal(SIGINT, SIG_DFL);
+        sigprocmask(SIG_SETMASK, &orig_set, NULL);
+        raise(SIGINT);
     }
     return 0;
 }
