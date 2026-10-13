@@ -4605,7 +4605,7 @@ def build_parser():
              "state persist between calls",
     )
     group.add_argument(
-        "--sessions", action="store_true", help="list live sessions and exit",
+        "--sessions", "--list", action="store_true", help="list live sessions and exit",
     )
     group.add_argument(
         "--stop", action="store_true",
