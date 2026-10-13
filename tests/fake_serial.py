@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""A serial-console channel for pty-bridge's transfer tests.
+"""A serial-console channel for pty-proxy's transfer tests.
 
 Usage: fake_serial.py COMMAND [ARG]...
 
-Plays "virsh console": the bridge's pty (stdin/stdout) goes raw, COMMAND
+Plays "virsh console": the proxy's pty (stdin/stdout) goes raw, COMMAND
 runs on a pty of its own -- the guest's console -- and bytes are relayed
 both ways. Like virsh it leaves at a raw ^] (0x1d) on stdin, printing
 "ESCAPED" on stderr. The environment shapes the line:
@@ -108,7 +108,7 @@ def main():
     if pid == 0:
         os.execvp(sys.argv[1], sys.argv[1:])
     if keep:
-        # the bridge hangs us up when it leaves: that must not end the
+        # the proxy hangs us up when it leaves: that must not end the
         # guest side, so the relay notices the closed pty and lingers
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGUSR1, lambda *_: stalled.append(1))
@@ -133,7 +133,7 @@ def main():
             try:
                 d = bytearray(os.read(0, chunk))
             except OSError:
-                break           # the bridge closed its end
+                break           # the proxy closed its end
             if not d:
                 break
             if 0x1d in d:

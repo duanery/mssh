@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Test pty-bridge: bidirectional pty forwarding, raw mode, escape exit.
+"""Test pty-proxy: bidirectional pty forwarding, raw mode, escape exit.
 
-Run: python3 tests/test_pty_bridge.py
+Run: python3 tests/test_pty_proxy.py
 """
 import fcntl
 import os
@@ -17,7 +17,7 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.path.join(HERE, '..', 'pty-bridge')
+BIN = os.path.join(HERE, '..', 'pty-proxy')
 
 TIOCSWINSZ = termios.TIOCSWINSZ
 
@@ -25,7 +25,7 @@ failures = 0
 
 
 def set_winsize(master_fd, rows, cols):
-    """Set the pty window size (the bridge child gets SIGWINCH)."""
+    """Set the pty window size (the proxy child gets SIGWINCH)."""
     fcntl.ioctl(master_fd, TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 
 
@@ -85,7 +85,7 @@ def wait_pid_exit(pid, timeout=3.0):
 
 
 def build():
-    """Compile pty_bridge if the binary is missing."""
+    """Compile pty_proxy if the binary is missing."""
     if os.path.exists(BIN):
         return
     subprocess.check_call(
@@ -94,14 +94,14 @@ def build():
 
 build()
 
-# --- the pty given to pty_bridge as its /dev/pts/N argument ---
+# --- the pty given to pty_proxy as its /dev/pts/N argument ---
 target_master, target_slave = open_target()
 target_name = os.ttyname(target_slave)
 
-# --- spawn pty_bridge under its own pty, so stdin is a controlling terminal ---
+# --- spawn pty_proxy under its own pty, so stdin is a controlling terminal ---
 pid, local_master = pty.fork()
 if pid == 0:
-    os.execv(BIN, ['pty-bridge', '-e', '^]', '--pty', target_name])
+    os.execv(BIN, ['pty-proxy', '-e', '^]', '--pty', target_name])
 
 banner = read_avail(local_master, 0.5)
 check('escape banner printed', b'Escape character is ^]' in banner, repr(banner))
@@ -142,7 +142,7 @@ if p2 == 0:
     os.dup2(w, 2)
     os.close(r)
     os.close(w)
-    os.execv(BIN, ['pty-bridge', '--pty', target_name])
+    os.execv(BIN, ['pty-proxy', '--pty', target_name])
 os.close(w)                      # parent reads the child's stderr from r
 status = wait_pid_exit(p2)
 err = read_avail(r, 0.5)
@@ -154,16 +154,16 @@ check('non-tty stdin message', b'not a terminal' in err, repr(err))
 # 7) non-tty argument -> refuse with exit code 2
 pid3, m3 = pty.fork()
 if pid3 == 0:
-    os.execv(BIN, ['pty-bridge', '--pty', '/etc/passwd'])
+    os.execv(BIN, ['pty-proxy', '--pty', '/etc/passwd'])
 out3 = read_avail(m3, 0.8)
 status = wait_pid_exit(pid3)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
 check('non-tty arg refused', ok, repr(status) + ' out=' + repr(out3))
 
-# 8) target pty closed by its master -> pty_bridge exits
+# 8) target pty closed by its master -> pty_proxy exits
 pid4, m4 = pty.fork()
 if pid4 == 0:
-    os.execv(BIN, ['pty-bridge', '-e', '^a', '--pty', target_name])
+    os.execv(BIN, ['pty-proxy', '-e', '^a', '--pty', target_name])
 time.sleep(0.3)
 read_avail(m4, 0.2)
 os.close(target_master)
@@ -174,7 +174,7 @@ check('pts closed -> exit', status is not None and os.WIFEXITED(status), repr(st
 tm2, ts2 = open_target()
 pid5, m5 = pty.fork()
 if pid5 == 0:
-    os.execv(BIN, ['pty-bridge', '-e', '^a', '--pty', os.ttyname(ts2)])
+    os.execv(BIN, ['pty-proxy', '-e', '^a', '--pty', os.ttyname(ts2)])
 time.sleep(0.3)
 read_avail(m5, 0.2)
 os.write(m5, b'\x01')
@@ -186,7 +186,7 @@ check('custom escape ^a exits', ok, repr(status))
 tm3, ts3 = open_target()
 pid6, m6 = pty.fork()
 if pid6 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', 'login: root', '--pty', os.ttyname(ts3)])
+    os.execv(BIN, ['pty-proxy', '-p', 'login: root', '--pty', os.ttyname(ts3)])
 time.sleep(0.3)
 read_avail(m6, 0.3)
 read_avail(tm3, 0.3)    # drain the simulated startup Enter
@@ -203,7 +203,7 @@ check('pattern used only once', got == b'', repr(got))
 tm5, ts5 = open_target()
 pid9, m9 = pty.fork()
 if pid9 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', 'login: root', '--pty', os.ttyname(ts5)])
+    os.execv(BIN, ['pty-proxy', '-p', 'login: root', '--pty', os.ttyname(ts5)])
 time.sleep(0.3)
 read_avail(m9, 0.3)
 read_avail(tm5, 0.3)    # drain the simulated startup Enter
@@ -233,7 +233,7 @@ check('escape exits after pattern fire', ok, repr(status))
 tm4, ts4 = open_target()
 pid7, m7 = pty.fork()
 if pid7 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', 'login: root', '-p', 'Password: secret',
+    os.execv(BIN, ['pty-proxy', '-p', 'login: root', '-p', 'Password: secret',
                    '--pty', os.ttyname(ts4)])
 time.sleep(0.3)
 read_avail(m7, 0.3)
@@ -254,7 +254,7 @@ check('escape exits with patterns', ok, repr(status))
 tm9, ts9 = open_target()
 pid19, m19 = pty.fork()
 if pid19 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', ']# cd /tmp', '--pty', os.ttyname(ts9)])
+    os.execv(BIN, ['pty-proxy', '-p', ']# cd /tmp', '--pty', os.ttyname(ts9)])
 time.sleep(0.3)
 read_avail(m19, 0.3)
 read_avail(tm9, 0.3)    # drain the simulated startup Enter
@@ -271,7 +271,7 @@ pid8 = os.fork()
 if pid8 == 0:
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 2)
-    os.execv(BIN, ['pty-bridge', '-p', 'nospace', '--pty', '/dev/pts/1'])
+    os.execv(BIN, ['pty-proxy', '-p', 'nospace', '--pty', '/dev/pts/1'])
 status = wait_pid_exit(pid8)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
 check('malformed pattern refused', ok, repr(status))
@@ -281,7 +281,7 @@ pid12 = os.fork()
 if pid12 == 0:
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 2)
-    os.execv(BIN, ['pty-bridge', '-p', ']# ', '-p', '$ ',
+    os.execv(BIN, ['pty-proxy', '-p', ']# ', '-p', '$ ',
                    '--pty', '/dev/pts/1'])
 status = wait_pid_exit(pid12)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
@@ -294,7 +294,7 @@ check('second sentinel refused', ok, repr(status))
 tm6, ts6 = open_target()
 pid10, m10 = pty.fork()
 if pid10 == 0:
-    os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', 'login: root',
+    os.execve(BIN, ['pty-proxy', '--term', 'serial', '-p', 'login: root',
                     '-p', ']# ', '--pty', os.ttyname(ts6)],
               dict(os.environ, TERM='xterm-test'))
 set_winsize(m10, 40, 100)
@@ -343,7 +343,7 @@ check('escape exits after sentinel', ok, repr(status))
 tm7, ts7 = open_target()
 pid11, m11 = pty.fork()
 if pid11 == 0:
-    os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', 'login: root',
+    os.execve(BIN, ['pty-proxy', '--term', 'serial', '-p', 'login: root',
                     '-p', ']# ', '--pty', os.ttyname(ts7)],
               dict(os.environ, TERM='xterm-test'))
 set_winsize(m11, 30, 90)
@@ -370,7 +370,7 @@ check('escape exits after login+sentinel', ok, repr(status))
 #     forwarded and displayed just the same.
 pid13, m13 = pty.fork()
 if pid13 == 0:
-    os.execv(BIN, ['pty-bridge', '--',
+    os.execv(BIN, ['pty-proxy', '--',
                    'sh', '-c', 'printf "banner\n"; stty raw -echo; cat'])
 got = read_avail(m13, 1.0)
 check('early output forwarded before pty is raw',
@@ -389,7 +389,7 @@ check('command mode escape exits 0', ok, repr(status))
 #      (including the escape character) starts immediately
 pid13b, m13b = pty.fork()
 if pid13b == 0:
-    os.execv(BIN, ['pty-bridge', '--', 'cat'])
+    os.execv(BIN, ['pty-proxy', '--', 'cat'])
 time.sleep(0.5)
 read_avail(m13b, 0.3)
 os.write(m13b, b'\x1d')
@@ -401,7 +401,7 @@ check('no startup wait for a pty channel', ok, repr(status))
 #     ssh -tt relays the right size to the remote pty from the start)
 pid14, m14 = pty.fork()
 if pid14 == 0:
-    os.execv(BIN, ['pty-bridge', '--', 'sh', '-c', 'sleep 0.5; stty size'])
+    os.execv(BIN, ['pty-proxy', '--', 'sh', '-c', 'sleep 0.5; stty size'])
 set_winsize(m14, 24, 80)
 got = read_avail(m14, 3.0)
 check('command starts with local winsize', b'24 80' in got, repr(got))
@@ -409,7 +409,7 @@ wait_pid_exit(pid14)
 
 # 19b) the new pty is seeded with the local terminal's termios, not
 #      with the driver defaults: ECHO is off on the terminal we hand
-#      to pty-bridge, so the channel command must see ECHO off too
+#      to pty-proxy, so the channel command must see ECHO off too
 lm, ls = pty.openpty()
 attrs = termios.tcgetattr(ls)
 attrs[3] &= ~termios.ECHO
@@ -423,7 +423,7 @@ if pid14b == 0:
     os.dup2(ls, 1)
     os.dup2(ls, 2)
     os.close(ls)
-    os.execv(BIN, ['pty-bridge', '--', 'sh', '-c', 'stty -a; sleep 5'])
+    os.execv(BIN, ['pty-proxy', '--', 'sh', '-c', 'stty -a; sleep 5'])
 os.close(ls)
 got = read_avail(lm, 4.5)
 check('command pty inherits local termios', b'-echo' in got, repr(got))
@@ -431,28 +431,28 @@ os.write(lm, b'\x1d')
 wait_pid_exit(pid14b)
 os.close(lm)
 
-# 20) the channel command exits -> pty-bridge exits by itself
+# 20) the channel command exits -> pty-proxy exits by itself
 #     (master read fails with EIO once the slave is closed)
 pid15, m15 = pty.fork()
 if pid15 == 0:
-    os.execv(BIN, ['pty-bridge', '--', 'true'])
+    os.execv(BIN, ['pty-proxy', '--', 'true'])
 status = wait_pid_exit(pid15)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-check('child exit closes the bridge', ok, repr(status))
+check('child exit closes the proxy', ok, repr(status))
 
-# 21) exec failure: the child prints the error and the bridge exits
+# 21) exec failure: the child prints the error and the proxy exits
 pid16, m16 = pty.fork()
 if pid16 == 0:
-    os.execv(BIN, ['pty-bridge', '--', 'no-such-command-xyz'])
+    os.execv(BIN, ['pty-proxy', '--', 'no-such-command-xyz'])
 got = read_avail(m16, 2.0)
 status = wait_pid_exit(pid16)
 ok = status is not None and os.WIFEXITED(status) and b'No such file' in got
-check('exec failure exits the bridge', ok, repr(status) + ' out=' + repr(got))
+check('exec failure exits the proxy', ok, repr(status) + ' out=' + repr(got))
 
 # 22) COMMAND combined with --pty -> refused with exit code 2
 pid17, m17 = pty.fork()
 if pid17 == 0:
-    os.execv(BIN, ['pty-bridge', '--pty', '/dev/pts/1', 'cat'])
+    os.execv(BIN, ['pty-proxy', '--pty', '/dev/pts/1', 'cat'])
 out = read_avail(m17, 0.8)
 status = wait_pid_exit(pid17)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
@@ -464,7 +464,7 @@ check('--pty with COMMAND refused', ok, repr(status) + ' out=' + repr(out))
 tm8, ts8 = open_target()
 pid18, m18 = pty.fork()
 if pid18 == 0:
-    os.execv(BIN, ['pty-bridge', '--pty', os.ttyname(ts8)])
+    os.execv(BIN, ['pty-proxy', '--pty', os.ttyname(ts8)])
 time.sleep(0.3)
 read_avail(m18, 0.3)
 read_avail(tm8, 0.3)    # drain the simulated startup Enter
@@ -486,7 +486,7 @@ check('no sentinel: escape still exits', ok, repr(status))
 tm10, ts10 = open_target()
 pid20, m20 = pty.fork()
 if pid20 == 0:
-    os.execv(BIN, ['pty-bridge', '--term', 'serial', '--pty', os.ttyname(ts10)])
+    os.execv(BIN, ['pty-proxy', '--term', 'serial', '--pty', os.ttyname(ts10)])
 time.sleep(0.3)
 early = read_avail(m20, 0.3)
 check('serial without sentinel warns', b'needs a sentinel pattern' in early,
@@ -521,7 +521,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     os.chmod(fake_virsh, 0o755)
     pid21, m21 = pty.fork()
     if pid21 == 0:
-        os.execve(BIN, ['pty-bridge', '-p', ']# ', '--',
+        os.execve(BIN, ['pty-proxy', '-p', ']# ', '--',
                         fake_virsh, 'console', 'vm7'],
                   dict(os.environ, TERM='xterm-test'))
     set_winsize(m21, 25, 75)
@@ -543,7 +543,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     os.chmod(fake_virsh2, 0o755)
     pid21b, m21b = pty.fork()
     if pid21b == 0:
-        os.execve(BIN, ['pty-bridge', '-p', ']# ', '--',
+        os.execve(BIN, ['pty-proxy', '-p', ']# ', '--',
                         fake_virsh2, 'console', 'vm7'],
                   dict(os.environ, TERM='xterm-test'))
     set_winsize(m21b, 25, 75)
@@ -560,7 +560,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     #      could be dropped by the very switch meant to deliver it.
     #      This fake console plays exactly that variant: it inspects
     #      its input queue right before switching (after a grace
-    #      period, so an overeager bridge has every chance to type),
+    #      period, so an overeager proxy has every chance to type),
     #      and nothing may be sitting there. The byte it reads right
     #      after the switch is the poke Enter, and the prompt it
     #      prints in answer completes the serial flow (sentinel fires
@@ -596,7 +596,7 @@ while True:                  # relay, the way a console would
 ''')
     pid21c, m21c = pty.fork()
     if pid21c == 0:
-        os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ', '--',
+        os.execve(BIN, ['pty-proxy', '--term', 'serial', '-p', ']# ', '--',
                         sys.executable, fake_console],
                   dict(os.environ, TERM='xterm-test'))
     set_winsize(m21c, 26, 76)
@@ -668,7 +668,7 @@ while True:
     for order in ('raw-first', 'banner-first'):
         pid21d, m21d = pty.fork()
         if pid21d == 0:
-            os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ',
+            os.execve(BIN, ['pty-proxy', '--term', 'serial', '-p', ']# ',
                             '-w', 'Escape character is ^]', '--',
                             sys.executable, fake_banner, order],
                       dict(os.environ, TERM='xterm-test'))
@@ -689,10 +689,10 @@ while True:
         check('-w %s: escape exits' % order, ok, repr(status))
 
 # 25e) -w only applies to a serial channel COMMAND: elsewhere it warns
-#      and goes unused, the bridge still works
+#      and goes unused, the proxy still works
 pid21e, m21e = pty.fork()
 if pid21e == 0:
-    os.execv(BIN, ['pty-bridge', '-w', 'ready', '--',
+    os.execv(BIN, ['pty-proxy', '-w', 'ready', '--',
                    'sh', '-c', 'stty raw -echo; printf "up> "; cat'])
 got = read_avail(m21e, 1.0)
 check('-w on a pty channel: warned', b'--wait-for ignored' in got, repr(got))
@@ -703,7 +703,7 @@ wait_pid_exit(pid21e)
 # 25f) an empty -w text is refused
 pid21f, m21f = pty.fork()
 if pid21f == 0:
-    os.execv(BIN, ['pty-bridge', '-w', '', '--', 'true'])
+    os.execv(BIN, ['pty-proxy', '-w', '', '--', 'true'])
 got = read_avail(m21f, 1.0)
 status = wait_pid_exit(pid21f)
 check('-w "": refused with exit 2',
@@ -712,7 +712,7 @@ check('-w "": refused with exit 2',
 #     types nothing, the size goes through TIOCSWINSZ
 pid22, m22 = pty.fork()
 if pid22 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', 'ready> ', '--',
+    os.execv(BIN, ['pty-proxy', '-p', 'ready> ', '--',
                    'sh', '-c', 'stty raw -echo; printf "ready> "; cat'])
 time.sleep(0.5)
 got = read_avail(m22, 0.5)
@@ -726,7 +726,7 @@ wait_pid_exit(pid22)
 tm11, ts11 = open_target()
 pid23, m23 = pty.fork()
 if pid23 == 0:
-    os.execv(BIN, ['pty-bridge', '--term', 'pty', '-p', ']# ',
+    os.execv(BIN, ['pty-proxy', '--term', 'pty', '-p', ']# ',
                    '--pty', os.ttyname(ts11)])
 time.sleep(0.3)
 read_avail(m23, 0.3)
@@ -749,7 +749,7 @@ pid24 = os.fork()
 if pid24 == 0:
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 2)
-    os.execv(BIN, ['pty-bridge', '--term', 'bogus', '--pty', '/dev/pts/1'])
+    os.execv(BIN, ['pty-proxy', '--term', 'bogus', '--pty', '/dev/pts/1'])
 status = wait_pid_exit(pid24)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
 check('invalid --term refused', ok, repr(status))
@@ -760,7 +760,7 @@ tm12, ts12 = open_target()
 pid25, m25 = pty.fork()
 if pid25 == 0:
     env = {k: v for k, v in os.environ.items() if k != 'TERM'}
-    os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ',
+    os.execve(BIN, ['pty-proxy', '--term', 'serial', '-p', ']# ',
                     '--pty', os.ttyname(ts12)], env)
 set_winsize(m25, 41, 111)
 time.sleep(0.3)
@@ -780,8 +780,8 @@ tm13, ts13 = open_target()
 set_winsize(tm13, 24, 80)   # stale size left behind by the last session
 pid26, m26 = pty.fork()
 if pid26 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', ']# ', '--pty', os.ttyname(ts13)])
-set_winsize(m26, 40, 100)   # local size, set before the bridge looks at it
+    os.execv(BIN, ['pty-proxy', '-p', ']# ', '--pty', os.ttyname(ts13)])
+set_winsize(m26, 40, 100)   # local size, set before the proxy looks at it
 time.sleep(0.5)
 read_avail(m26, 0.3)
 read_avail(tm13, 0.3)    # drain the simulated startup Enter
@@ -800,7 +800,7 @@ wait_pid_exit(pid26)
 tm14, ts14 = open_target()
 pid27, m27 = pty.fork()
 if pid27 == 0:
-    os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ',
+    os.execve(BIN, ['pty-proxy', '--term', 'serial', '-p', ']# ',
                     '--pty', os.ttyname(ts14)],
               dict(os.environ, TERM='x;ter>m'))
 set_winsize(m27, 33, 77)
@@ -822,7 +822,7 @@ wait_pid_exit(pid27)
 tm15, ts15 = open_target()
 pid28, m28 = pty.fork()
 if pid28 == 0:
-    os.execv(BIN, ['pty-bridge', '-v', '-p', 'login: root', '-p', ']# ',
+    os.execv(BIN, ['pty-proxy', '-v', '-p', 'login: root', '-p', ']# ',
                    '--pty', os.ttyname(ts15)])
 time.sleep(0.3)
 got = read_avail(m28, 0.5)
@@ -859,7 +859,7 @@ wait_pid_exit(pid28)
 #     sees
 pid29, m29 = pty.fork()
 if pid29 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', '(yes/no/[fingerprint])? yes', '--',
+    os.execv(BIN, ['pty-proxy', '-p', '(yes/no/[fingerprint])? yes', '--',
                    'sh', '-c',
                    'printf "Are you sure you want to continue connecting '
                    '(yes/no/[fingerprint])? "; read ans; '
@@ -886,7 +886,7 @@ check('escape exits after the match', ok, repr(status))
 #      before the switch happens
 pid29b, m29b = pty.fork()
 if pid29b == 0:
-    os.execve(BIN, ['pty-bridge', '--term', 'serial',
+    os.execve(BIN, ['pty-proxy', '--term', 'serial',
                     '-p', 'login: root', '-p', ']# ', '--',
                     'sh', '-c',
                     'printf "login: "; read ans; printf "[%s]" "$ans"; '
@@ -907,11 +907,11 @@ check('serial: escape exits after pre-raw match', ok, repr(status))
 #      -p argument starts with the sentinel's, so the split at the
 #      first space yields the same match) is a COMMAND. The sentinel
 #      runs one per prompt and the first prompt with none left exits
-#      the bridge -- here the user's own flow: log in, run ls at the
+#      the proxy -- here the user's own flow: log in, run ls at the
 #      first prompt, and leave without touching the keyboard
 pid29c, m29c = pty.fork()
 if pid29c == 0:
-    os.execv(BIN, ['pty-bridge', '-p', 'login: root', '-p', 'Password: xx',
+    os.execv(BIN, ['pty-proxy', '-p', 'login: root', '-p', 'Password: xx',
                    '-p', ']# ', '-p', ']# ls', '--',
                    'sh', '-c',
                    'printf "login: "; read u; printf "Password: "; read pw; '
@@ -930,7 +930,7 @@ check('command queue: exits by itself once the command ran', ok, repr(status))
 #      second command would mean both were typed into one prompt
 pid29d, m29d = pty.fork()
 if pid29d == 0:
-    os.execv(BIN, ['pty-bridge', '-p', ']# ', '-p', ']# echo one',
+    os.execv(BIN, ['pty-proxy', '-p', ']# ', '-p', ']# echo one',
                    '-p', ']# echo two', '--',
                    'sh', '-c',
                    'printf "]# "; while IFS= read -r line; do '
@@ -948,7 +948,7 @@ check('command queue: two commands, self-exit', ok, repr(status))
 #      as the -v trace of the parsed patterns shows
 pid29e, m29e = pty.fork()
 if pid29e == 0:
-    os.execv(BIN, ['pty-bridge', '-v', '-p', ']# echo one', '-p', ']# ', '--',
+    os.execv(BIN, ['pty-proxy', '-v', '-p', ']# echo one', '-p', ']# ', '--',
                    'sh', '-c',
                    'printf "]# "; while IFS= read -r line; do '
                    'printf "ran:%s\\n" "$line"; printf "]# "; done'])
@@ -969,7 +969,7 @@ check('command before sentinel: self-exit', ok, repr(status))
 #      print), then it answers every line with ran:<line> and a prompt
 pid29f, m29f = pty.fork()
 if pid29f == 0:
-    os.execve(BIN, ['pty-bridge', '--term', 'serial', '-p', ']# ',
+    os.execve(BIN, ['pty-proxy', '--term', 'serial', '-p', ']# ',
                     '-p', ']# echo one', '--',
                     'sh', '-c',
                     'stty -icanon -echo min 1 time 0; '
@@ -989,11 +989,11 @@ check('serial: command queue exits by itself', ok, repr(status))
 
 # 33g) --pty mode command queue: the startup Enter makes the prompt
 #      appear, the sentinel fires and types the command, and the prompt
-#      after the command exits the bridge
+#      after the command exits the proxy
 tm16, ts16 = open_target()
 pid31, m31 = pty.fork()
 if pid31 == 0:
-    os.execv(BIN, ['pty-bridge', '-p', ']# ', '-p', ']# ls',
+    os.execv(BIN, ['pty-proxy', '-p', ']# ', '-p', ']# ls',
                    '--pty', os.ttyname(ts16)])
 time.sleep(0.3)
 read_avail(m31, 0.3)
@@ -1008,11 +1008,11 @@ ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 check('--pty: command queue exits by itself', ok, repr(status))
 
 # 33h) -s/--send is the explicit spelling: no match of its own, queued
-#      for the sentinel prompt in the order given, and the bridge exits
+#      for the sentinel prompt in the order given, and the proxy exits
 #      once they all ran (the -v trace shows the parsed entries)
 pid32, m32 = pty.fork()
 if pid32 == 0:
-    os.execv(BIN, ['pty-bridge', '-v', '-p', ']# ', '-s', 'echo one',
+    os.execv(BIN, ['pty-proxy', '-v', '-p', ']# ', '-s', 'echo one',
                    '-s', 'echo two', '--',
                    'sh', '-c',
                    'printf "]# "; while IFS= read -r line; do '
@@ -1030,7 +1030,7 @@ check('--send: exits by itself once they all ran', ok, repr(status))
 #      is refused with exit code 2 and a message saying what is missing
 pid33, m33 = pty.fork()
 if pid33 == 0:
-    os.execv(BIN, ['pty-bridge', '-s', 'ls', '--pty', '/dev/pts/1'])
+    os.execv(BIN, ['pty-proxy', '-s', 'ls', '--pty', '/dev/pts/1'])
 out = read_avail(m33, 0.8)
 status = wait_pid_exit(pid33)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
@@ -1040,7 +1040,7 @@ check('--send without a sentinel message',
 
 # 34) --pty attaches to a working session and must leave the pty's
 #     settings alone: the session behind it owns them (a shell there
-#     would lose its echo and editing if the bridge forced raw mode
+#     would lose its echo and editing if the proxy forced raw mode
 #     onto the pty). Attach to a cooked pty and verify the settings
 #     survive the attach unchanged
 tma, tsa = pty.openpty()
@@ -1050,7 +1050,7 @@ termios.tcsetattr(tsa, termios.TCSANOW, attrs)
 before = termios.tcgetattr(tma)
 pid30, m30 = pty.fork()
 if pid30 == 0:
-    os.execv(BIN, ['pty-bridge', '--pty', os.ttyname(tsa)])
+    os.execv(BIN, ['pty-proxy', '--pty', os.ttyname(tsa)])
 time.sleep(0.5)
 read_avail(m30, 0.3)
 read_avail(tma, 0.3)    # the simulated Enter
@@ -1074,7 +1074,7 @@ if pid34 == 0:
     os.dup2(pw, 1)
     os.close(pw)
     os.close(pr)
-    os.execv(BIN, ['pty-bridge', '--', 'sleep', '5'])
+    os.execv(BIN, ['pty-proxy', '--', 'sleep', '5'])
 os.close(pw)
 attrs = termios.tcgetattr(m34)
 end = time.time() + 3.0
@@ -1095,10 +1095,10 @@ check('piped stdout: escape still exits', ok, repr(status))
 os.close(pr)
 
 # 35b) interactive: same invariant -- the output flags of the local
-#      terminal are the user's business, the bridge never touches them
+#      terminal are the user's business, the proxy never touches them
 pid35, m35 = pty.fork()
 if pid35 == 0:
-    os.execv(BIN, ['pty-bridge', '--', 'sleep', '5'])
+    os.execv(BIN, ['pty-proxy', '--', 'sleep', '5'])
 attrs = termios.tcgetattr(m35)
 end = time.time() + 3.0
 while time.time() < end and attrs[3] & termios.ICANON:
@@ -1127,7 +1127,7 @@ if pid36 == 0:
     os.dup2(pw2, 1)
     os.close(pw2)
     os.close(pr2)
-    os.execv(BIN, ['pty-bridge', '--', 'sh', '-c',
+    os.execv(BIN, ['pty-proxy', '--', 'sh', '-c',
                    'printf "a\\rX\\r\\n"; printf "b\\r"; sleep 0.4; '
                    'printf "\\nc\\r"'])
 os.close(pw2)
@@ -1145,7 +1145,7 @@ while time.time() < end:
         break
 status = wait_pid_exit(pid36)
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-check('piped: child exit closes the bridge', ok, repr(status))
+check('piped: child exit closes the proxy', ok, repr(status))
 check('piped: \\r\\n translated, lone \\r kept, held \\r flushed',
       out36.endswith(b'a\rX\nb\nc\r\n'), repr(out36))
 os.close(pr2)
@@ -1159,7 +1159,7 @@ if pid37 == 0:
     os.dup2(pw3, 1)
     os.close(pw3)
     os.close(pr3)
-    os.execv(BIN, ['pty-bridge', '-p', ']# ', '-s', 'echo hi', '--',
+    os.execv(BIN, ['pty-proxy', '-p', ']# ', '-s', 'echo hi', '--',
                    'sh', '-c',
                    'printf "]# "; while IFS= read -r line; do '
                    'printf "ran:%s\\r\\n" "$line"; printf "]# "; done'])
@@ -1190,7 +1190,7 @@ os.close(pr3)
 #     the run -- and with no terminal on stdout either there is no
 #     escape key to announce and no window to describe
 def run_unattended(argv, env=None, stdout_tty=False, timeout=5.0, kills=()):
-    """Run the bridge with a pipe at EOF on stdin. stdout goes to a pipe,
+    """Run the proxy with a pipe at EOF on stdin. stdout goes to a pipe,
     or with stdout_tty to a pty of its own (whose window is 27x77).
     kills: (seconds after the start, signal) pairs to send it.
     Returns (exit status, stdout bytes, stderr bytes)."""
@@ -1238,7 +1238,7 @@ def run_unattended(argv, env=None, stdout_tty=False, timeout=5.0, kills=()):
 
 
 status, out, err = run_unattended(
-    ['pty-bridge', '-p', ']# ', '-s', 'echo one', '-s', 'echo two', '--',
+    ['pty-proxy', '-p', ']# ', '-s', 'echo one', '-s', 'echo two', '--',
      'sh', '-c',
      'sleep 0.3; printf "]# "; while IFS= read -r line; do '
      'printf "ran:%s\\n" "$line"; printf "]# "; done'])
@@ -1254,7 +1254,7 @@ check('unattended: no escape key announced',
 
 # 37b) without commands there is nothing to finish by itself: a non-tty
 #      stdin is still refused, as before
-status, out, err = run_unattended(['pty-bridge', '-p', ']# ', '--', 'true'])
+status, out, err = run_unattended(['pty-proxy', '-p', ']# ', '--', 'true'])
 ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
 check('no commands: non-tty stdin still refused', ok, repr(status))
 check('no commands: refusal message', b'not a terminal' in err, repr(err))
@@ -1263,7 +1263,7 @@ check('no commands: refusal message', b'not a terminal' in err, repr(err))
 #      window to describe, so the first prompt goes to the command --
 #      no stty, no TERM export -- and the run still exits by itself
 status, out, err = run_unattended(
-    ['pty-bridge', '--term', 'serial', '-p', ']# ', '-s', 'echo one', '--',
+    ['pty-proxy', '--term', 'serial', '-p', ']# ', '-s', 'echo one', '--',
      'sh', '-c',
      'stty -icanon -echo min 1 time 0; '
      'while IFS= read -r line; do '
@@ -1280,7 +1280,7 @@ check('unattended serial, no terminal: the command takes the first prompt',
 #      output is watched, so it is the terminal the remote side is
 #      described by -- the serial push carries its size and TERM
 status, out, err = run_unattended(
-    ['pty-bridge', '--term', 'serial', '-p', ']# ', '-s', 'echo one', '--',
+    ['pty-proxy', '--term', 'serial', '-p', ']# ', '-s', 'echo one', '--',
      'sh', '-c',
      'stty -icanon -echo min 1 time 0; '
      'while IFS= read -r line; do '
@@ -1297,7 +1297,7 @@ check('unattended serial, stdout a tty: push from stdout, then the command',
 # 37e) the pty-channel counterpart: the new pty is seeded with the size
 #      of the stdout terminal
 status, out, err = run_unattended(
-    ['pty-bridge', '-p', ']# ', '-s', 'echo one', '--',
+    ['pty-proxy', '-p', ']# ', '-s', 'echo one', '--',
      'sh', '-c',
      'stty size; printf "]# "; while IFS= read -r line; do '
      'printf "ran:%s\\n" "$line"; printf "]# "; done'],
@@ -1309,8 +1309,8 @@ check('unattended pty, stdout a tty: size seeded from stdout',
 
 # 37f) ^C in an unattended run: stdin is not read, so the key arrives as
 #      SIGINT -- and must end the remote command too, not just the
-#      bridge. A ^C byte is typed into the pty, the remote line
-#      discipline interrupts the running job, and the bridge leaves at
+#      proxy. A ^C byte is typed into the pty, the remote line
+#      discipline interrupts the running job, and the proxy leaves at
 #      the prompt that comes back (no further command typed), dying of
 #      SIGINT for its caller to see. The fake console runs each line as a
 #      foreground job and survives the interrupt itself (trap)
@@ -1320,12 +1320,12 @@ INTR_CONSOLE = ('stty -icanon -echo min 1 time 0; '
                 'printf "ran:%s\\n" "$line"; sh -c "$line"; printf "]# "; done')
 t0 = time.time()
 status, out, err = run_unattended(
-    ['pty-bridge', '-v', '--term', 'serial', '-p', ']# ',
+    ['pty-proxy', '-v', '--term', 'serial', '-p', ']# ',
      '-s', 'sleep 30; echo NOT-KILLED', '-s', 'echo next', '--',
      'sh', '-c', INTR_CONSOLE],
     timeout=10.0, kills=[(1.0, signal.SIGINT)])
 took = time.time() - t0
-check('^C: the bridge dies of SIGINT',
+check('^C: the proxy dies of SIGINT',
       status is not None and os.WIFSIGNALED(status) and
       os.WTERMSIG(status) == signal.SIGINT, repr(status))
 check('^C: passed on, the remote job interrupted, no further command',
@@ -1336,10 +1336,10 @@ check('^C: leaves at the prompt that comes back, not by the timeout',
       '%.1fs err=%r' % (took, err[-300:]))
 
 # 37g) the remote end ignores the ^C and no prompt comes back: the
-#      bridge gives it INTR_WAIT_SEC (5s), then leaves anyway
+#      proxy gives it INTR_WAIT_SEC (5s), then leaves anyway
 t0 = time.time()
 status, out, err = run_unattended(
-    ['pty-bridge', '-v', '--term', 'serial', '-p', ']# ',
+    ['pty-proxy', '-v', '--term', 'serial', '-p', ']# ',
      '-s', 'trap "" INT; sleep 30', '--', 'sh', '-c', INTR_CONSOLE],
     timeout=12.0, kills=[(1.0, signal.SIGINT)])
 took = time.time() - t0
@@ -1349,10 +1349,10 @@ check('^C ignored remotely: leaves after the wait, dying of SIGINT',
       b'no prompt 5 s after ^C' in err,
       '%r %.1fs err=%r' % (status, took, err[-300:]))
 
-# 37h) a second ^C does not wait for anything: the bridge leaves at once
+# 37h) a second ^C does not wait for anything: the proxy leaves at once
 t0 = time.time()
 status, out, err = run_unattended(
-    ['pty-bridge', '--term', 'serial', '-p', ']# ',
+    ['pty-proxy', '--term', 'serial', '-p', ']# ',
      '-s', 'trap "" INT; sleep 30', '--', 'sh', '-c', INTR_CONSOLE],
     timeout=12.0, kills=[(1.0, signal.SIGINT), (1.5, signal.SIGINT)])
 took = time.time() - t0
@@ -1361,7 +1361,7 @@ check('second ^C: leaves at once, dying of SIGINT',
       os.WTERMSIG(status) == signal.SIGINT and took < 3.0,
       '%r %.1fs' % (status, took))
 
-# 38) --put/--get: a queued rz/sz, and the bridge's ZMODEM end talking
+# 38) --put/--get: a queued rz/sz, and the proxy's ZMODEM end talking
 #     to it. Needs lrzsz here, as the remote end would. The fake console
 #     runs every line in REMOTE; the files are random data plus the bytes
 #     a channel may act on (^], "~." after a newline, CAN, XON/XOFF)
@@ -1377,7 +1377,7 @@ have_lrzsz = all(subprocess.call(['sh', '-c', 'command -v ' + c],
 if not have_lrzsz:
     print('SKIP --put/--get: no rz/sz (lrzsz) installed')
 else:
-    zdir = tempfile.mkdtemp(prefix='pty-bridge-zm-')
+    zdir = tempfile.mkdtemp(prefix='pty-proxy-zm-')
     zlocal, zremote = os.path.join(zdir, 'local'), os.path.join(zdir, 'remote')
     os.mkdir(zlocal)
     os.mkdir(zremote)
@@ -1406,7 +1406,7 @@ else:
 
     # 38a) up and down over a pty channel, in queue order with --send
     status, out, err = zcwd(
-        ['pty-bridge', '-p', ']# ', '--put', os.path.join(zlocal, 'up.bin'),
+        ['pty-proxy', '-p', ']# ', '--put', os.path.join(zlocal, 'up.bin'),
          '--get', "it's down.bin", '-s', 'echo AFTER-$((6*7))', '--',
          'sh', '-c', zm_console()], env=zenv, timeout=30.0)
     ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
@@ -1427,12 +1427,12 @@ else:
           b'**\x18B' not in out.replace(special, b''), repr(out[-300:]))
 
     # 38b) a serial channel that leaves at a raw ^] -- the file carries
-    #      one -- and flips a byte each way: the bridge escapes the ^],
+    #      one -- and flips a byte each way: the proxy escapes the ^],
     #      the damaged subpacket is asked for again (ZRPOS)
     for name in ('up.bin', "it's down.bin"):
         os.unlink(os.path.join(zremote if name == 'up.bin' else zlocal, name))
     status, out, err = zcwd(
-        ['pty-bridge', '-v', '--term', 'serial', '-p', ']# ',
+        ['pty-proxy', '-v', '--term', 'serial', '-p', ']# ',
          '--put', 'up.bin', '--get', "it's down.bin", '--',
          sys.executable, FAKE_SERIAL, 'sh', '-c', zm_console(False)],
         env=dict(zenv, FS_CORRUPT_IN='60000', FS_CORRUPT_OUT='90000'),
@@ -1461,7 +1461,7 @@ else:
         f.write(far)
     t0 = time.time()
     status, out, err = zcwd(
-        ['pty-bridge', '-v', '-p', ']# ', '--put', 'far.bin', '--',
+        ['pty-proxy', '-v', '-p', ']# ', '--put', 'far.bin', '--',
          sys.executable, FAKE_SERIAL, 'sh', '-c', zm_console()],
         env=dict(zenv, FS_DELAY='40', FS_CORRUPT_IN='1000000'),
         timeout=30.0)
@@ -1483,7 +1483,7 @@ else:
     #      rest of the queue untyped, nothing left behind locally
     before = sorted(os.listdir(zlocal))
     status, out, err = zcwd(
-        ['pty-bridge', '-p', ']# ', '--get', 'nope.bin', '-s', 'echo NEXT',
+        ['pty-proxy', '-p', ']# ', '--get', 'nope.bin', '-s', 'echo NEXT',
          '--', 'sh', '-c', zm_console()], env=zenv, timeout=30.0)
     ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
     check('zmodem: a missing remote file fails with status 1',
@@ -1495,7 +1495,7 @@ else:
     # 38d) no rz on the remote end: its prompt comes back, rz never spoke
     t0 = time.time()
     status, out, err = zcwd(
-        ['pty-bridge', '-p', ']# ', '--put', 'up.bin', '--',
+        ['pty-proxy', '-p', ']# ', '--put', 'up.bin', '--',
          '/bin/sh', '-c', zm_console(path_prefix='PATH=/nonexistent; ')],
         env=zenv, timeout=30.0)
     ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 1
@@ -1504,14 +1504,14 @@ else:
           repr(status) + ' err=' + repr(err))
 
     # 38e) a local file to put that is not there: refused up front
-    status, out, err = zcwd(['pty-bridge', '-p', ']# ', '--put', 'nope.bin',
+    status, out, err = zcwd(['pty-proxy', '-p', ']# ', '--put', 'nope.bin',
                              '--', 'true'])
     ok = status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2
     check('zmodem: --put of a missing local file refused', ok and
           b'nope.bin' in err, repr(status) + ' err=' + repr(err))
 
     def zm_interactive(argv, key, after=1.5, env=None):
-        """Run the bridge on a terminal of its own over a slow serial line,
+        """Run the proxy on a terminal of its own over a slow serial line,
         type key after a while -- or each of the (seconds, key) pairs a
         list holds; returns (status, seconds from the first key to the
         exit, output)."""
@@ -1549,7 +1549,7 @@ else:
         f.write(big)
 
     # 38f) the escape key in the middle of a put: rz cancelled, the
-    #      bridge leaves with status 1 -- once the cancel got there. The
+    #      proxy leaves with status 1 -- once the cancel got there. The
     #      channel leaves the way virsh does (FS_LINGER): the guest's
     #      console is not hung up, so nothing but the CANs can end rz;
     #      an rz still running a second later means they never arrived
@@ -1647,11 +1647,11 @@ else:
           sorted(os.listdir(zlocal)) == before and not zm_remote_left(),
           repr(os.listdir(zlocal)))
 
-    # 38h) unattended, ^C is SIGINT: the put is cancelled, the bridge
+    # 38h) unattended, ^C is SIGINT: the put is cancelled, the proxy
     #      dies of it -- without waiting for a prompt the cancel ate
     t0 = time.time()
     status, out, err = zcwd(
-        ['pty-bridge', '--term', 'serial', '-p', ']# ', '--put', 'big.bin',
+        ['pty-proxy', '--term', 'serial', '-p', ']# ', '--put', 'big.bin',
          '--', sys.executable, FAKE_SERIAL, 'sh', '-c', zm_console(False)],
         env=dict(zenv, FS_RATE='20000'), timeout=15.0,
         kills=[(1.5, signal.SIGINT)])

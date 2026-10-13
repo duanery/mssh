@@ -1,5 +1,5 @@
 /*
- * pty-bridge -- attach the local terminal to a pty, local or remote
+ * pty-proxy -- attach the local terminal to a pty, local or remote
  *
  * The terminal a user wants to work on is not always a local
  * /dev/pts/N. Very often it is a REMOTE pty: the shell of an ssh
@@ -8,7 +8,7 @@
  * reachable through a channel command that connects to it, such as
  * "ssh", "virsh console" or "telnet".
  *
- * pty-bridge bridges the local terminal and that pty:
+ * pty-proxy stands between the local terminal and that pty:
  *
  *   keyboard (stdin) --> pty      (local terminal: raw input,
  *   screen  (stdout) <-- pty       output flags untouched)
@@ -21,10 +21,10 @@
  * with a remote pty: -p patterns auto-type replies to login prompts,
  * commands -- queued with -s, or a -p pattern sharing the sentinel's
  * match -- run at the prompt, one per prompt, until the queue is empty
- * and the bridge exits by itself, and the remote side is kept in sync
+ * and the proxy exits by itself, and the remote side is kept in sync
  * with the local terminal -- the window size on every change, TERM
  * once on a serial console (--term). Files travel the same way: --put
- * and --get queue a remote rz or sz, and the bridge speaks ZMODEM to it
+ * and --get queue a remote rz or sz, and the proxy speaks ZMODEM to it
  * (zmodem.c) -- all a serial console needs to get a file in or out.
  *
  * Requires stdin to be the controlling terminal of this process,
@@ -36,9 +36,9 @@
  * the pty peer closes, or by itself once every queued command has
  * run.
  *
- * Build: gcc -Wall -O2 -o pty-bridge pty-bridge.c -lutil
+ * Build: gcc -Wall -O2 -o pty-proxy pty-proxy.c -lutil
  *        (zmodem.c is #included, not compiled on its own)
- * Usage: ./pty-bridge [-e CHAR|--escape CHAR] [-p "login: root"] \
+ * Usage: ./pty-proxy [-e CHAR|--escape CHAR] [-p "login: root"] \
  *                     [-s "uptime"] [--put FILE] [--get FILE] \
  *                     [--term pty|serial|auto] [-v] \
  *                     [-w "Escape character is ^]"] \
@@ -63,9 +63,9 @@
 #include <time.h>
 #include <unistd.h>
 
-static const char *prog = "pty-bridge";
+static const char *prog = "pty-proxy";
 
-/* -v: narrate what the bridge does, one line per event, on stderr */
+/* -v: narrate what the proxy does, one line per event, on stderr */
 static int verbose;
 
 static int tty_fd = -1;          /* local terminal (stdin) */
@@ -74,7 +74,7 @@ static int tio_saved = 0;
 
 /*
  * Unattended run: stdin is not the controlling terminal, but commands
- * are queued, so the bridge exits by itself once they ran and nobody
+ * are queued, so the proxy exits by itself once they ran and nobody
  * has to type anything. stdin is never read (an EOF on it must not end
  * the run early) and never switched to raw; the escape key is gone
  * with it.
@@ -141,7 +141,7 @@ static size_t max_mlen;   /* record window size, see record_and_check() */
  * sentinel could not tell the second from the completion of a command
  * that never ran. A firing with nothing left to type therefore means
  * every queued command has run to completion: the session is over,
- * and quit_pending has the bridge leave by itself, the same way the
+ * and quit_pending has the proxy leave by itself, the same way the
  * escape key leaves.
  *
  * The accounting rests on the sentinel's own premise: a prompt is the
@@ -172,14 +172,14 @@ static int quit_pending;
 
 /*
  * ^C in an unattended run: stdin is not read, so the key never reaches
- * the pty as a byte -- the terminal turns it into SIGINT for the bridge
- * instead. Ending the bridge alone would leave the command running on
+ * the pty as a byte -- the terminal turns it into SIGINT for the proxy
+ * instead. Ending the proxy alone would leave the command running on
  * the remote end (on a serial console nothing hangs up on the guest's
  * side at all), so the interrupt is passed on: a ^C byte is typed into
  * the pty -- the remote line discipline turns it into SIGINT for the
- * remote foreground job -- and the bridge leaves at the prompt that
+ * remote foreground job -- and the proxy leaves at the prompt that
  * comes back, or after INTR_WAIT_SEC if none does. A second ^C leaves
- * at once. Either way the bridge then dies of SIGINT, so its caller
+ * at once. Either way the proxy then dies of SIGINT, so its caller
  * sees the run was interrupted.
  */
 #define INTR_WAIT_SEC 5
@@ -199,7 +199,7 @@ static struct timespec intr_at;          /* ... at this moment */
  *
  * A failed transfer -- broken off by the user (^C, the escape key), by
  * the remote end, a timeout -- ends the run: the rest of the queue is
- * not typed, and the bridge exits with status 1 (xfer_failed).
+ * not typed, and the proxy exits with status 1 (xfer_failed).
  */
 static struct pattern *zm_job;
 static int zm_prompt;
@@ -209,7 +209,7 @@ static int xfer_failed;
  * Terminal type of the channel (--term): what the channel can carry
  * to the remote end on its own. A "pty" channel (ssh -tt) allocates
  * its pty out of band -- it relays window changes and exports TERM
- * itself, so the bridge only pushes TIOCSWINSZ and types nothing. A
+ * itself, so the proxy only pushes TIOCSWINSZ and types nothing. A
  * "serial" channel (virsh console) carries a serial console with no
  * out-of-band window-change and no environment: window size and TERM
  * must be typed into the guest as shell commands, which is only safe
@@ -446,7 +446,7 @@ static void usage(FILE *out)
         "                      own match (e.g. \"]# ls\" beside \"]# \") queues a command\n"
         "                      too -- see --send\n"
         "  -s, --send CMD      queue CMD to be typed at the sentinel prompt, one per\n"
-        "                      prompt, in the order given; repeatable. The bridge exits\n"
+        "                      prompt, in the order given; repeatable. The proxy exits\n"
         "                      by itself once every queued command has run. Such a\n"
         "                      run needs no terminal on stdin: without one it goes\n"
         "                      unattended and never reads stdin; ^C then interrupts\n"
@@ -558,7 +558,7 @@ static void write_all(int fd, const unsigned char *buf, size_t n)
 
 /*
  * Relay output for stdout. On the terminal the bytes go out verbatim:
- * the tty's own output flags -- which the bridge never touches -- do
+ * the tty's own output flags -- which the proxy never touches -- do
  * the display processing, and a relayed "\r\n" merely gains a second,
  * invisible "\r" through ONLCR. A pipe or a file has no line
  * discipline out there to hand the carriage returns to: downstream
@@ -952,7 +952,7 @@ static int zm_text(int fd, const unsigned char *buf, size_t n, int show)
  * pty it reaches -- sees the terminal the user is sitting at from the
  * very first byte. "ssh -tt" for instance relays that window size to
  * the remote pty right away, and the local line settings are what the
- * command would have seen without a bridge.
+ * command would have seen without a proxy.
  */
 static int open_command_pty(char **cmd, pid_t *pidp)
 {
@@ -1416,7 +1416,7 @@ int main(int argc, char **argv)
      * ("ls" after "]# "), so the split at the first space leaves both
      * with the same match -- the prompt -- and the reply is what to
      * run there. The sentinel types them one per prompt, in -p order,
-     * and exits the bridge once they all ran (see the sentinel comment
+     * and exits the proxy once they all ran (see the sentinel comment
      * above record_and_check()). A --send entry is already a command
      * and carries no match, so it takes no part in this.
      */
@@ -1462,7 +1462,7 @@ int main(int argc, char **argv)
     }
 
     /*
-     * stdin must be the controlling terminal: the bridge is an
+     * stdin must be the controlling terminal: the proxy is an
      * interactive attach console. A run with commands queued is the
      * exception -- it exits by itself once they ran, nobody needs to
      * type into it, so it goes ahead unattended (see local_fd). Decided
@@ -1501,7 +1501,7 @@ int main(int argc, char **argv)
      * "\r\n" to: translate it to "\n" on the way out (write_stdout),
      * so line-oriented tools downstream get clean line ends. On the
      * terminal itself the bytes go out verbatim -- its own output
-     * flags, which the bridge never touches, render them.
+     * flags, which the proxy never touches, render them.
      */
     stdout_lf = !isatty(STDOUT_FILENO);
 
@@ -1528,7 +1528,7 @@ int main(int argc, char **argv)
     fflush(stdout);
 
     /*
-     * Acquire the pty to bridge over. With --pty it is an existing
+     * Acquire the pty to proxy. With --pty it is an existing
      * device (O_NOCTTY: do not steal the controlling terminal);
      * otherwise a fresh pty is created and COMMAND runs on its slave
      * side (see open_command_pty).
@@ -1649,7 +1649,7 @@ int main(int argc, char **argv)
          * session is the remote shell's again, its prompt included.
          * A failed one ends the run here: the remote rz/sz has been
          * cancelled already (zm_abort), so a SIGINT has nothing left
-         * to pass on -- the bridge leaves at once, and dies of it.
+         * to pass on -- the proxy leaves at once, and dies of it.
          */
         if (zm_job) {
             struct zm_link link = {

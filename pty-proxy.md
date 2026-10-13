@@ -1,6 +1,6 @@
-# pty-bridge -- implementation notes
+# pty-proxy -- implementation notes
 
-`pty-bridge` attaches the local terminal to a pty -- local or remote.
+`pty-proxy` attaches the local terminal to a pty -- local or remote.
 What you type is written into the pty, and everything the pty produces
 is printed on your screen. The pty to attach is either an existing
 local one (`--pty /dev/pts/N`) or a *remote* one reached through a
@@ -10,14 +10,14 @@ command that connects to it. It is a small C program with no
 dependencies beyond libc (+ libutil for `openpty`), built with:
 
 ```sh
-gcc -Wall -Wextra -O2 -o pty-bridge pty-bridge.c -lutil
+gcc -Wall -Wextra -O2 -o pty-proxy pty-proxy.c -lutil
 ```
 
 The ZMODEM end of `--put`/`--get` lives in `zmodem.c`, which
-`pty-bridge.c` `#include`s -- it is not compiled on its own.
+`pty-proxy.c` `#include`s -- it is not compiled on its own.
 
 ```sh
-pty-bridge [-e CHAR|--escape CHAR] [-p "<match> <reply>"]... \
+pty-proxy [-e CHAR|--escape CHAR] [-p "<match> <reply>"]... \
            [-s "<command>"]... [--put FILE]... [--get FILE]... \
            [--term pty|serial|auto] \
            [-w "<text>"] [--pty /dev/pts/3] [command [arg ...]]
@@ -39,7 +39,7 @@ pty-bridge [-e CHAR|--escape CHAR] [-p "<match> <reply>"]... \
 
 Two ways to obtain "the pty":
 
-- **`--pty PATH`** -- an existing local pty. `pty-bridge` opens the
+- **`--pty PATH`** -- an existing local pty. `pty-proxy` opens the
   *slave* side (`/dev/pts/N`) and shuttles bytes both ways. It never
   touches the master side; whoever holds the master (an mssh session
   daemon, `screen`, a test harness, ...) keeps working unchanged --
@@ -52,20 +52,20 @@ Two ways to obtain "the pty":
   the child then `execvp()`s the command. The command -- e.g.
   `ssh -tt host` or `virsh console vm` -- is the *channel* that
   carries the remote pty: it draws the remote pty through our pty,
-  and `pty-bridge` (holding the master end) bridges the local
-  terminal onto it. Before any output, `pty-bridge` prints
+  and `pty-proxy` (holding the master end) bridges the local
+  terminal onto it. Before any output, `pty-proxy` prints
   `Running: <command>` and its own escape hint (`Escape character is
-  ^] (exits pty-bridge)`), so the escape hint the command itself may
+  ^] (exits pty-proxy)`), so the escape hint the command itself may
   print later (virsh console prints one for the virtual machine
   console) is not mistaken for ours. When the child exits (remote
   side closed, ssh dropped, ...), the slave is gone, the master read
-  fails with `EIO` and `pty-bridge` exits by itself. On the escape
+  fails with `EIO` and `pty-proxy` exits by itself. On the escape
   key the master is closed, the child is given `SIGHUP` and reaped,
   so no stray channel process survives the detach. The self-exit of
   the command queue (patterns below) leaves the same way.
 
 The rest of the machinery (raw mode, escape, patterns, window size)
-works identically on both modes: it only sees the one bridge fd.
+works identically on both modes: it only sees the one proxied fd.
 
 ## Startup checks
 
@@ -105,19 +105,19 @@ When stdin is not the controlling terminal and commands are queued:
   at all -- the first prompt goes straight to the first command.
 - **`^C` ends the remote command too.** With stdin unread the key
   never reaches the pty as a byte: the terminal turns it into `SIGINT`
-  for the bridge. Dying of it right away would leave the remote command
+  for the proxy. Dying of it right away would leave the remote command
   running -- on a serial console nothing hangs up on the guest's side
   at all. So the first `SIGINT` is passed on: a `^C` byte (0x03) is
   typed into the pty, the remote line discipline turns it into
-  `SIGINT` for the remote foreground job, and the bridge leaves at the
+  `SIGINT` for the remote foreground job, and the proxy leaves at the
   prompt that comes back (the sentinel firing -- no further queued
   command is typed), or after `INTR_WAIT_SEC` (5s) if none does. A
-  second `^C` leaves at once. Either way the bridge then re-raises
+  second `^C` leaves at once. Either way the proxy then re-raises
   `SIGINT` after the usual cleanup, so the caller sees the run was
   interrupted (exit status 130 in a shell). `SIGINT` is blocked like
   `SIGWINCH` and delivered inside `ppoll()`, so the loop picks it up
   race-free. A `^C` during the serial startup phase (before the
-  handlers are installed) still kills the bridge at once: no remote
+  handlers are installed) still kills the proxy at once: no remote
   command runs yet.
 
 Without commands the run never ends by itself, so a non-terminal stdin
@@ -145,7 +145,7 @@ Then:
 `getopt_long()` is called with a leading `+` in the optstring so
 option parsing stops at the first non-option argument: the command's
 own options (`ssh -tt`, `virsh console vm`) belong to the command,
-not to `pty-bridge`. Use `--` to separate them explicitly. COMMAND
+not to `pty-proxy`. Use `--` to separate them explicitly. COMMAND
 together with `--pty` is refused.
 
 ### Waking the serial console (`wake_serial_console()`)
@@ -286,7 +286,7 @@ re-raises the signal so the process dies with its true status.
 One `cfmakeraw()` side effect is undone: it clears `OPOST`, and the
 output flags of the local terminal are restored verbatim
 (`raw.c_oflag = saved_tio.c_oflag`). Raw applies to the input side
-only. The bytes the bridge relays are already display-ready -- a
+only. The bytes the proxy relays are already display-ready -- a
 serial console sends `\r\n` by itself, and the channel pty is created
 with `OPOST` off (`open_command_pty()`), so a cooked command's `\n`
 is not completed twice. The one line discipline that renders newlines
@@ -320,7 +320,7 @@ is not touched; whatever line endings it emits go through the same
   session behind the pty owns them entirely -- the pty was already
   configured for its own use, and forcing raw mode under a running
   shell would break its echo and line editing. Whatever settings the
-  owner chose are what the bridge works with.
+  owner chose are what the proxy works with.
 
 ## The forwarding loop
 
@@ -387,14 +387,14 @@ forwarding runs with zero matching overhead.
 
 Channels differ in what they can carry to the remote end on their own.
 An `ssh -tt` channel allocates its pty out of band: it relays window
-changes and exports TERM itself, so the bridge only pushes the size
+changes and exports TERM itself, so the proxy only pushes the size
 into its own pty and the channel does the rest. A `virsh console`
 channel carries a *serial console*: there is no out-of-band
 window-change and no environment -- the guest learns the window size
 and TERM only by being *told*, i.e. by typing shell commands into the
 session.
 
-`--term MODE` selects how the bridge syncs, so no command name is
+`--term MODE` selects how the proxy syncs, so no command name is
 special-cased:
 
 - **`pty`** -- the channel passes window changes through (ssh-like).
@@ -475,7 +475,7 @@ types them:
   sentinel typed a command into the same prompt.
 - when the sentinel fires with the queue empty, every command has run
   to completion -- that prompt is the last command's completion -- and
-  the bridge **exits by itself** (`quit_pending`), with the same
+  the proxy **exits by itself** (`quit_pending`), with the same
   cleanup as the escape key: `\r\n` printed, the terminal restored, the
   master closed, the channel child hung up and reaped.
 
@@ -554,11 +554,11 @@ channel. What it does carry is bytes, and lrzsz's `rz`/`sz` move files
 over exactly that. `--put FILE` and `--get FILE` are queued commands
 like `--send`, typed by the sentinel at their turn in the queue --
 `rz` to put, `sz -- 'FILE'` to get (single-quoted for the remote
-shell, a `'` in the name spelled `'\''`) -- and the bridge itself is
+shell, a `'` in the name spelled `'\''`) -- and the proxy itself is
 the other ZMODEM end:
 
 ```sh
-pty-bridge -p ']# ' --put app.tgz --get /var/log/messages \
+pty-proxy -p ']# ' --put app.tgz --get /var/log/messages \
            -s 'tar xzf app.tgz' -- virsh console vm1
 ```
 
@@ -592,7 +592,7 @@ completion and the queue goes on.
 
 What one file in one direction needs, as lrzsz speaks it:
 
-- **put**: rz opens with `ZRINIT` (its capabilities). The bridge sends
+- **put**: rz opens with `ZRINIT` (its capabilities). The proxy sends
   `ZFILE` (`name NUL "size mtime mode 0 1 size"`, the mode the whole
   `st_mode` -- rz applies permissions only to a mode that says regular
   file) and streams `ZDATA` from the `ZRPOS` rz answers with: 1 KiB
@@ -622,7 +622,7 @@ What one file in one direction needs, as lrzsz speaks it:
   window bounds what was on its way, and the cancel's trailing `^U`
   kills the line it left at the shell. (Not during a get: there the
   bytes skipped in a resync are sz's data, which may hold a prompt.)
-- **get**: sz opens with `ZRQINIT`; the bridge answers `ZRINIT`
+- **get**: sz opens with `ZRQINIT`; the proxy answers `ZRINIT`
   (full duplex, overlapped I/O, CRC-32), takes `ZFILE`, asks for the
   data from 0 (`ZRPOS`) and writes what arrives, acknowledging
   `ZCRCQ`/`ZCRCW`. A damaged subpacket (CRC, framing, overlong) is
@@ -636,8 +636,8 @@ What one file in one direction needs, as lrzsz speaks it:
   Retries are bounded (`ZM_RETRIES`, 10 in a row), every answer is
   waited for `ZM_TIMEOUT_SEC` (10s).
 
-The channel between the bridge and rz/sz is not assumed transparent:
-what the bridge sends passes the channel command first, and `virsh
+The channel between the proxy and rz/sz is not assumed transparent:
+what the proxy sends passes the channel command first, and `virsh
 console` leaves at a raw `^]`, `ssh -tt` at `~.` after a newline. So
 beyond what ZMODEM always escapes (ZDLE, XON, XOFF, DLE) `zm_putz()`
 also ZDLE-escapes `^]` and every CR and LF, with or without the high
@@ -650,11 +650,11 @@ asked for it or not.
 Nothing typed can go into the ZMODEM stream, so during a transfer the
 keyboard knows two keys and drops the rest:
 
-- the **escape key**: the transfer is cancelled, and the bridge leaves
+- the **escape key**: the transfer is cancelled, and the proxy leaves
   as soon as the cancel has arrived -- at most `ZM_ESC_WAIT_MS` (2s)
   later; a second press leaves at once.
 - **`^C`** (or, unattended, `SIGINT` -- see above): the transfer is
-  cancelled, the bridge leaves -- an unattended run dying of `SIGINT`
+  cancelled, the proxy leaves -- an unattended run dying of `SIGINT`
   as usual. Unlike a `^C` at a running command, no `^C` byte is typed:
   rz/sz has the remote tty in raw mode, where it would be just another
   byte of data. The cancel is what ends them -- and rz/sz was the
@@ -671,12 +671,12 @@ prompt again.
 
 Writing the CANs is not the end of it: they have only reached the
 local pty, the channel command still has to read them and pass them
-on. A bridge leaving right then -- closing the pty, hanging up the
+on. A proxy leaving right then -- closing the pty, hanging up the
 command -- may take them down with it. Over `ssh -tt` that does no
 harm, the hangup ends rz/sz all the same; over `virsh console` it
 does: nothing hangs up the guest's serial line, so rz/sz would sit on
 it until its own timeouts gave up, the console's shell out of reach
-meanwhile. So after the cancel the bridge waits for the **prompt** --
+meanwhile. So after the cancel the proxy waits for the **prompt** --
 the sentinel's -- which is proof rz/sz is gone. Merely hearing back
 from the other end is not: bytes sent before the cancel may still be
 on their way, a dead line has those too. What comes in meanwhile is
@@ -691,7 +691,7 @@ A failure from the other side -- the remote breaking off (five CANs:
 no cancel to send, the prompt still waited for), sz unable to open the
 file, the channel gone (nothing to wait for), a timeout, too many
 errors -- ends the same way. Either way the reason is printed on
-stderr, the rest of the queue is not typed, and the bridge exits with
+stderr, the rest of the queue is not typed, and the proxy exits with
 status **1**.
 
 Progress goes to stderr when it is a terminal, one line rewritten
@@ -700,7 +700,7 @@ rate), wherever stderr goes. `-v` traces every header but the ZACKs.
 
 ## Testing
 
-`tests/test_pty_bridge.py` drives the real binary through real ptys
+`tests/test_pty_proxy.py` drives the real binary through real ptys
 (no mocking of the terminal layer):
 
 - a target pty plays the remote session (`open_target()`: a pty
@@ -737,9 +737,9 @@ child, a prompt printed before the channel goes raw matched by the
 main loop, with the simulated Enter typed for `--pty` only and
 withheld from pty channels, the attached pty's settings left untouched
 in `--pty` mode, local window size inherited by the new pty, child
-exit closing the bridge, exec failure, escape detaching without
+exit closing the proxy, exec failure, escape detaching without
 strays), the command queue (a login flow ended by a command run at the
-prompt with the bridge exiting by itself, commands running in `-p`
+prompt with the proxy exiting by itself, commands running in `-p`
 order one per prompt, a command listed before the sentinel still
 queued -- traced by `-v` --, the serial ordering with the TERM+stty
 push taking the first prompt before any command, the `--pty`
@@ -751,11 +751,11 @@ created with `OPOST` off), the piped CRLF translation (an inline
 chunks merged, a trailing `\r` flushed at exit, and the whole piped
 stream -- the echoed command included -- free of `\r` while patterns
 and the self-exit still work), unattended runs (stdin a pipe at EOF:
-commands still run and the bridge exits 0 with no escape announced, a
+commands still run and the proxy exits 0 with no escape announced, a
 non-tty stdin without commands still refused, a serial channel with no
 terminal anywhere getting no push, and with stdout a terminal its size
 pushed on a serial channel and seeded into a pty channel; `^C` passed
-on to the remote job with the bridge leaving at the returning prompt
+on to the remote job with the proxy leaving at the returning prompt
 and dying of `SIGINT`, leaving after the 5s wait when the remote end
 ignores it, and at once on a second `^C`), file transfers against the
 real lrzsz (skipped without it: `--put` and `--get` byte for byte with
@@ -780,5 +780,5 @@ compiles the binary itself if it is missing and exits non-zero on any
 failure:
 
 ```sh
-python3 tests/test_pty_bridge.py
+python3 tests/test_pty_proxy.py
 ```

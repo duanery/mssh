@@ -1,7 +1,7 @@
 # virsh() -- source this file from an interactive bash (e.g. bashrc);
-# if pty-bridge is not in PATH, console runs as the plain command too.
+# if pty-proxy is not in PATH, console runs as the plain command too.
 #
-# Wrap "virsh ... console ..." in pty-bridge: the serial console gets the
+# Wrap "virsh ... console ..." in pty-proxy: the serial console gets the
 # startup wake, the TERM/window-size sync at the prompt, and clean line
 # endings when stdout is piped. Everything else runs as the plain command.
 # The scan finds the first non-option word: virsh's global options are
@@ -10,7 +10,7 @@
 # with values attached (--connect=URI) or separate (--connect URI), short
 # options grouped (-qrt) or with the value attached (-d1).
 #
-# pty-bridge execs a fresh child; /usr/bin/command PATH-executes the
+# pty-proxy execs a fresh child; /usr/bin/command PATH-executes the
 # real virsh there and skips shell functions by definition, so this
 # wrapper cannot re-trigger -- `command` in the other branch bypasses
 # it the same way.
@@ -52,8 +52,8 @@ virsh() {
         i=$((i + 1))
     done
 
-    if [ "$cmd" = console ] && command -v pty-bridge >/dev/null 2>&1; then
-        pty-bridge -p ']# ' --term serial -- command virsh "$@"
+    if [ "$cmd" = console ] && command -v pty-proxy >/dev/null 2>&1; then
+        pty-proxy -p ']# ' --term serial -- command virsh "$@"
     else
         command virsh "$@"
     fi

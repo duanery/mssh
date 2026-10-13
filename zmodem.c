@@ -1,11 +1,11 @@
 /*
- * zmodem.c -- the ZMODEM end of a pty-bridge file transfer
+ * zmodem.c -- the ZMODEM end of a pty-proxy file transfer
  *
- * Not a unit of its own: pty-bridge.c includes it, after its helpers
+ * Not a unit of its own: pty-proxy.c includes it, after its helpers
  * (prog, VLOG(), esc_bytes()), and drives one transfer at a time with
  * zm_transfer(). The remote end is lrzsz's rz or sz, started at the
  * prompt like any other queued command; this file plays the other
- * side over the bridged pty:
+ * side over the proxied pty:
  *
  *   --put FILE   remote "rz" receives, zm_send() sends FILE
  *   --get FILE   remote "sz FILE" sends, zm_recv() receives it
@@ -17,7 +17,7 @@
  * ZCOMMAND, no compression, no encryption, no resume.
  *
  * The channel is not assumed to be 8-bit transparent towards the
- * remote end: what the bridge sends goes through the channel command
+ * remote end: what the proxy sends goes through the channel command
  * first, and "virsh console" leaves at ^], "ssh -tt" at "~." after a
  * newline. Beyond the bytes ZMODEM always escapes (ZDLE, XON, XOFF,
  * DLE, CR after '@'), the escape key of virsh and every CR and LF are
@@ -93,13 +93,13 @@
 #define ZM_OK       0
 #define ZM_FAILED   1   /* refused, broken off by the remote, timed out */
 #define ZM_CANCEL   2   /* ^C, typed (raw) or as SIGINT (unattended) */
-#define ZM_ESCAPE   3   /* the escape key: the bridge leaves */
+#define ZM_ESCAPE   3   /* the escape key: the proxy leaves */
 
 /* directions */
 #define ZM_PUT  1
 #define ZM_GET  2
 
-/* what the bridge lends the transfer */
+/* what the proxy lends the transfer */
 struct zm_link {
     int fd;                         /* the pty rz/sz talks on */
     int key_fd;                     /* keyboard; -1: none (unattended) */
@@ -196,7 +196,7 @@ static void zm_err(const char *fmt, ...)
 }
 
 /*
- * The bridge's keyboard during a transfer: nothing typed can go into
+ * The proxy's keyboard during a transfer: nothing typed can go into
  * the ZMODEM stream, so keys are dropped -- except the escape key,
  * which leaves, and ^C, which cancels. Either one sticks: every wait
  * from here on returns it, so it cannot get lost between two reads.
@@ -228,7 +228,7 @@ static int zm_keys(void)
 /*
  * Wait up to ms (0: just look) for the pty to be ready for events.
  * Returns 0 when it is, else ZE_TIMEOUT, or what the keyboard or a
- * SIGINT says. ppoll() runs under the bridge's wait mask, so SIGINT
+ * SIGINT says. ppoll() runs under the proxy's wait mask, so SIGINT
  * and SIGWINCH are delivered in here.
  */
 static int zm_wait(short events, long ms)
@@ -812,7 +812,7 @@ static void zm_progress(off_t done, int final)
  * Then the wait for rz/sz to be gone -- the remote shell's prompt,
  * which the sentinel recognizes. Merely writing the CANs is not
  * enough: they have only reached the local pty, the channel command
- * still has to read them and pass them on, and if the bridge left now
+ * still has to read them and pass them on, and if the proxy left now
  * -- closing the pty, hanging up the command -- they might never get
  * there. Over ssh that does no harm, the hangup ends rz/sz all the
  * same; over "virsh console" it does: nothing hangs up the guest's
@@ -1336,7 +1336,7 @@ static int zm_recv(const char *dst)
  * -- is reported on stderr; then, if rz/sz may still be running, the
  * session is cancelled and the rest of its output swallowed, until the
  * other end has answered the cancel (zm_abort) -- for the escape key
- * too, if only for ZM_ESC_WAIT_MS: a bridge that leaves at once may
+ * too, if only for ZM_ESC_WAIT_MS: a proxy that leaves at once may
  * leave rz/sz running on the remote end, behind a cancel that never
  * got there. A second escape press leaves without waiting. Bytes
  * read past the end of a good session are the remote shell's again:
