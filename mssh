@@ -71,11 +71,18 @@ import stat as statmod
 import sys
 import threading
 import time
+import warnings
 
 __version__ = "1.0.0"
 
 try:
-    import paramiko
+    # Paramiko's cryptography dependency emits an import-time
+    # CryptographyDeprecationWarning on Pythons the core team no longer
+    # supports.  That is environmental noise the user cannot act on, not an
+    # mssh problem, so keep the console clean while it loads.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        import paramiko
 except ImportError:  # pragma: no cover
     sys.stderr.write(
         "mssh: paramiko is required.\n"
