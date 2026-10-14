@@ -131,6 +131,16 @@ SESSION_NAME_RE = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9._-]{0,63}\Z")
 DEFAULT_SESSION_WAIT = 30.0
 DEFAULT_SESSION_IDLE = 0.4
 
+# --reconnect waits longer after each failed attempt, up to this, so a run of
+# attempts covers a long outage without hammering a machine that is booting.
+# 2s, 4s, 8s, 16s, then 30s apart -- and apart is the word: this is the gap
+# between attempts, not a period, so an attempt that has to time out (up to
+# -o SEC per hop) adds its own cost rather than eating into the next wait.
+# Attempts never overlap and never pile up, and N of them span at least the
+# sum of the gaps -- eight minutes for N=20 -- plus however long N failures
+# take, which is the right way round for an outage.
+SESSION_RECONNECT_CAP = 30.0
+
 
 # --------------------------------------------------------------------------
 # endpoint parsing
@@ -380,6 +390,13 @@ def _can_prompt(opts):
         return False
 
 
+# Set the first time a password is typed at a prompt rather than coming from
+# the command line or a key.  A session daemon reads it to decide whether it
+# may reconnect: it detaches from the terminal, so a credential that only
+# exists because somebody was there to type it cannot be had a second time.
+_PROMPTED = {"password": False}
+
+
 def _prompt_password(endpoint, opts, label):
     if not _can_prompt(opts):
         raise SystemExit(
@@ -391,6 +408,8 @@ def _prompt_password(endpoint, opts, label):
         password = getpass.getpass("password for %s: " % endpoint)
     except (EOFError, KeyboardInterrupt):
         raise SystemExit("\nmssh: aborted")
+    if password:
+        _PROMPTED["password"] = True
     return password or None
 
 
@@ -882,6 +901,8 @@ class _RawTerminal(object):
             tty.setcbreak(self.fd)
         except Exception:
             self.saved = None
+        if self.saved is not None:
+            _RAW["depth"] += 1
         return self
 
     def __exit__(self, *_exc):
@@ -892,8 +913,15 @@ class _RawTerminal(object):
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
         except Exception:
             pass
+        _RAW["depth"] -= 1
         self.saved = None
         return False
+
+
+# Non-zero while the terminal above is raw, which anything mssh prints on its
+# own account has to know: with the line discipline gone, a '\n' moves down
+# without returning to the left margin.
+_RAW = {"depth": 0}
 
 
 class _WindowWatcher(object):
@@ -2439,6 +2467,27 @@ class _Session(object):
         # --interrupt has to be able to find them.
         self.execs = set()
         self.execs_lock = threading.Lock()
+        # Everything --reconnect needs, all of it inert until arm() fills it
+        # in: a session that was never armed behaves exactly as it did before
+        # the option existed.  state_lock guards this group alone -- it is
+        # taken for a moment at a time and never while the pty lock is held,
+        # so it cannot queue behind a command.
+        self.name = None
+        self.chain = []                   # the chain's clients, ours to close
+        self.jumps = []
+        self.reconnect_opts = None
+        self.setup_wait = DEFAULT_SESSION_WAIT
+        self.retries = 0                  # --reconnect N, 0 for not at all
+        self.prompted = False             # a password was typed, not given
+        self.state_lock = threading.Lock()
+        self.broken = None                # why the link is down, or None
+        self.reconnecting = False
+        self.attempt = 0
+        self.exhausted = False            # a whole run of attempts failed
+        self.reconnects = 0
+        self.last_error = ""              # what the last attempt died of
+        self.notice = None                # owed to the next command
+        self.stopping = threading.Event()
 
     @property
     def pending(self):
@@ -3163,6 +3212,247 @@ class _Session(object):
             )
         return b""
 
+    # -- reconnecting -----------------------------------------------------
+    #
+    # A chain can outlive its hops: a jump host reboots, the target reboots,
+    # a firewall drops the connection.  Until --reconnect the daemon had one
+    # answer for all of it -- say what happened and exit -- which is right
+    # when nobody asked for anything else, and wrong for the case this was
+    # written for: a target that is coming back in two minutes.
+    #
+    # What a reconnect can and cannot restore is the whole shape of this.
+    # The chain comes back; the shell does not.  A new shell starts in the
+    # home directory with an empty environment and none of the background
+    # jobs, so a session that silently reconnected would answer the next
+    # 'grep error messages' from the wrong directory and call it a success.
+    # That is why every reconnect is announced to the first command after it,
+    # on stderr, before that command runs.
+
+    def arm(self, name, jumps, clients, opts):
+        """Keep what a reconnect would need; harmless when it never happens."""
+        self.name = name
+        self.jumps = list(jumps)
+        self.chain = clients
+        self.retries = max(0, int(getattr(opts, "reconnect", 0) or 0))
+        self.prompted = _PROMPTED["password"]
+        self.setup_wait = opts.wait if opts.wait and opts.wait > 0 \
+            else DEFAULT_SESSION_WAIT
+        # The originals, minus the two things that must not happen again: a
+        # prompt (there is no terminal left to answer it, so an attempt that
+        # needed one must fail rather than hang) and --copy-id (the key went
+        # on at startup; a reconnect is not another install).
+        clone = argparse.Namespace(**vars(opts))
+        clone.no_prompt = True
+        clone.copy_id = None
+        self.reconnect_opts = clone
+
+    def link_down(self):
+        """True when the connection is gone, as against the program ending.
+
+        The two look alike from the channel -- it is closed either way -- and
+        they could not be more different: a shell that ran 'exit' is a session
+        that is over, and a transport that went away is one that may well come
+        back.  The transport is what tells them apart.
+        """
+        transport = self.transport
+        if transport is None:
+            return True
+        try:
+            return not transport.is_active()
+        except Exception:
+            return True
+
+    def refusal(self):
+        """Why this session may not reconnect, or None if it may."""
+        if self.retries <= 0:
+            return None                   # not asked for; not a refusal
+        if self.mode != "shell":
+            return ("it holds an interactive program (-c %s), whose state is "
+                    "the program itself -- a reconnect would start a new one "
+                    "that has none of it" % (self.command or ""))
+        if self.prompted:
+            return ("the chain was authenticated with a password typed at "
+                    "the prompt, and this daemon is detached from that "
+                    "terminal -- put the password in the endpoint "
+                    "(user:password@host) or install a key to let it "
+                    "reconnect")
+        return None
+
+    def failed(self, reason):
+        """The link gave out under a command.  True when that ends the session.
+
+        False means it is being dealt with instead: the session stays up,
+        broken, either with a run of attempts under way or waiting for the
+        next command to be told why it will not reconnect.
+        """
+        if not self.link_down():
+            return True                   # the program itself ended
+        if self.retries <= 0:
+            return True                   # no --reconnect: as it always was
+        self.note_broken(reason)
+        self.start_reconnect()            # a no-op if reconnection is refused
+        return False
+
+    def note_broken(self, reason):
+        with self.state_lock:
+            if self.broken is None:
+                self.broken = reason
+                self.attempt = 0
+
+    def check_link(self):
+        """Poll between requests.  True when the session is over for good."""
+        with self.state_lock:
+            if self.broken is not None:
+                return False              # known, and already being dealt with
+        try:
+            if not self.chan.exit_status_ready():
+                return False
+        except Exception:
+            pass
+        return self.failed("the connection to %s dropped" % self.target)
+
+    def take_notice(self):
+        with self.state_lock:
+            notice, self.notice = self.notice, None
+        return notice
+
+    def start_reconnect(self):
+        """Begin a run of attempts in the background, if one may run at all.
+
+        In the background because the alternative is worse in both
+        directions: the client that found the break is told at once rather
+        than held for the length of a reboot, and --status, --stop and the
+        next command keep being answered while the attempts go on.
+        """
+        with self.state_lock:
+            if self.reconnecting or self.broken is None:
+                return
+            if self.retries <= 0 or self.refusal():
+                return
+            self.reconnecting = True
+            # Counted here rather than in the thread: the client that found
+            # the break is answered immediately, and "attempt 0 of 20" would
+            # be a worse answer than the truth.
+            self.attempt = 1
+        worker = threading.Thread(target=self._reconnect_run)
+        worker.daemon = True
+        worker.start()
+
+    def _reconnect_run(self):
+        try:
+            for attempt in range(1, self.retries + 1):
+                with self.state_lock:
+                    self.attempt = attempt
+                # Wait first, always: whatever just went down is not back a
+                # millisecond later, and an immediate attempt would only burn
+                # one of the few we have on a machine that has not begun to
+                # boot.
+                if self.stopping.wait(self._backoff(attempt)):
+                    return
+                if self.rebuild():
+                    return
+        finally:
+            with self.state_lock:
+                self.reconnecting = False
+                if self.broken is not None:
+                    self.exhausted = True
+
+    @staticmethod
+    def _backoff(attempt):
+        return min(2.0 * (2 ** (attempt - 1)), SESSION_RECONNECT_CAP)
+
+    def rebuild(self):
+        """One attempt: a new chain, a new shell, swapped in.  True if it took.
+
+        The old chain is closed only once the new one is serving, so a failed
+        attempt leaves the session exactly as it was -- still broken, still
+        holding the descriptors it held, still able to answer --status.
+        """
+        opts = self.reconnect_opts
+        try:
+            clients, transport, chan, mark = _open_shell(
+                self.jumps, self.target, opts)
+        except BaseException as exc:
+            self.last_error = _one_line(exc)
+            return False
+
+        previous = (self.chain, self.chan, self.transport, self.mark)
+        with self.lock:
+            self.chain, self.chan = clients, chan
+            self.transport, self.mark = transport, mark.encode("utf-8")
+            self.outstanding = 0
+            self.abort.clear()
+            try:
+                self.setup(self.setup_wait)
+            except BaseException as exc:
+                # The hops answered but the shell behind them did not; put
+                # back what was there and let the next attempt try again.
+                self.last_error = _one_line(exc)
+                (self.chain, self.chan,
+                 self.transport, self.mark) = previous
+                close_all(clients)
+                return False
+
+        with self.state_lock:
+            was = self.broken
+            self.broken = None
+            self.exhausted = False
+            self.last_error = ""
+            self.reconnects += 1
+            self.notice = (
+                "mssh: session %s reconnected to %s after %s.  This is a new "
+                "shell: the working directory, the environment and any "
+                "background jobs of the old one are gone."
+                % (self.name, self.target, was or "a dropped connection"))
+        close_all(previous[0])
+        return True
+
+    def resolve(self):
+        """What a command arriving on a broken session is owed.
+
+        None when there is nothing to say and the command may run.  Otherwise
+        (message, fatal), where fatal ends the session: a refusal, or the last
+        attempt failing.  The run of attempts behind this is the one the break
+        started; this is the extra one the spec asks for, so that a session
+        that was down the whole time a script was asleep still gets a chance
+        before it is given up on.
+        """
+        with self.state_lock:
+            if self.broken is None:
+                return None
+            refusal = self.refusal()
+            if refusal:
+                return ("mssh: session %s ended: %s, and it cannot reconnect: "
+                        "%s" % (self.name, self.broken, refusal), True)
+            if self.reconnecting:
+                return ("mssh: session %s: %s; reconnecting (attempt %d of "
+                        "%d) -- try again in a moment, --status to watch it, "
+                        "--stop to give up"
+                        % (self.name, self.broken, self.attempt, self.retries),
+                        False)
+            # The run is over and the link is still down.  One more attempt
+            # now, because a command arriving is new information: something
+            # out there expects the target to be up.
+            self.reconnecting = True
+        try:
+            if self.rebuild():
+                return None
+        finally:
+            with self.state_lock:
+                self.reconnecting = False
+        return ("mssh: session %s ended: %s, and it could not be reconnected "
+                "in %d attempts (last error: %s)"
+                % (self.name, self.broken, self.retries + 1,
+                   self.last_error or "unknown"), True)
+
+    def link_state(self):
+        with self.state_lock:
+            if self.broken is None:
+                return "up", None, self.attempt
+            if self.reconnecting:
+                return "reconnecting", self.broken, self.attempt
+            return "down", self.broken, self.attempt
+
 
 # -- wire protocol ---------------------------------------------------------
 #
@@ -3230,6 +3520,18 @@ class _Session(object):
 # by the time the client reads the status its output is already complete at the
 # EOF on the pipe.
 #
+# One more line may come *before* that one, and only before it:
+#
+#     {"notice": "..."}\n
+#
+# which is mssh telling the user something about the session rather than about
+# this command -- today, that the chain was rebuilt under it by --reconnect and
+# the shell is therefore a new one.  It goes in front of the command instead of
+# after it because it changes how the output should be read.  A client reads
+# lines until one is not a notice; that line is the reply.  status, stop and
+# interrupt never carry one: they are a single line each way, and a client that
+# reads exactly one line is right about them.
+#
 # On a send the client does not half-close its end of the socket, and the
 # daemon does not read from it: the socket going readable can then only mean
 # the client has gone, which is how a command notices that nobody is listening
@@ -3244,6 +3546,39 @@ def _reply(conn, payload):
         conn.shutdown(socket.SHUT_WR)
     except (socket.error, OSError):
         pass
+
+
+def _notify(conn, payload):
+    """A line sent ahead of the reply, leaving the exchange open.
+
+    Only a send or an exec is told anything this way: their client already
+    reads lines until the status arrives, so one more in front of it is
+    something it can be handed.  status, stop and interrupt are one line each
+    in both directions and are left exactly as they were.
+    """
+    try:
+        conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+    except (socket.error, OSError):
+        pass
+
+
+def _reconnecting_message(session, exc):
+    """What a command that the link died under is told.
+
+    What happened to the command comes first, because that is what was
+    asked; what is being done about it comes second, so that a script
+    reading stderr can tell "run this again shortly" from "this session is
+    over".
+    """
+    link, _broken, attempt = session.link_state()
+    if link == "reconnecting":
+        return ("mssh: session %s: %s; the connection dropped and is being "
+                "rebuilt (attempt %d of %d) -- run the command again in a "
+                "moment, --status to watch it, --stop to give up"
+                % (session.name, _one_line(exc), attempt, session.retries))
+    return ("mssh: session %s: %s; the connection dropped and cannot be "
+            "rebuilt: %s" % (session.name, _one_line(exc),
+                             session.refusal() or "no reconnection is armed"))
 
 
 def _connect_session(name, timeout):
@@ -3273,6 +3608,26 @@ def _parse_reply(name, raw):
     except ValueError:
         raise SystemExit("mssh: session %s: malformed reply from the session "
                          "daemon" % name)
+
+
+def _is_notice(message):
+    """A line that says something happened, rather than ending the command."""
+    return isinstance(message, dict) and "notice" in message \
+        and "status" not in message and "error" not in message
+
+
+def _session_notice(text):
+    """One of the daemon's out-of-band lines, on stderr.
+
+    stderr because it is mssh talking, not the command: a notice mixed into
+    stdout would end up in the file a redirected command was writing.  And
+    \\r\\n while a login or an --exec -t holds this terminal raw, since with
+    the line discipline gone nothing else returns the carriage and the next
+    line would start under the end of this one.
+    """
+    end = "\r\n" if _RAW["depth"] > 0 else "\n"
+    sys.stderr.write(text.rstrip("\r\n").replace("\n", end) + end)
+    sys.stderr.flush()
 
 
 def session_request(name, payload, timeout=None):
@@ -3344,6 +3699,7 @@ def _session_pipes(name, payload, outputs, send_stdin=False, watcher=None):
     pipes = []                            # [(rfd, stream)], in request order
     wfds = []
     buf = b""
+    reply = None
     try:
         for stream in outputs:
             rfd, wfd = os.pipe()
@@ -3395,11 +3751,24 @@ def _session_pipes(name, payload, outputs, send_stdin=False, watcher=None):
                     data = conn.recv(65536)
                 except (socket.error, OSError):
                     data = b""
-                if data:
-                    buf += data
-                    if b"\n" in buf:
-                        watch.remove(conn)
-                else:
+                if not data:
+                    watch.remove(conn)
+                    continue
+                buf += data
+                # Usually one line, the status.  A daemon that reconnected
+                # puts a notice in front of it, which is not the end of
+                # anything: print it and keep waiting for the real reply.
+                while reply is None and b"\n" in buf:
+                    head, buf = buf.split(b"\n", 1)
+                    head = head.strip()
+                    if not head:
+                        continue
+                    message = _parse_reply(name, head)
+                    if _is_notice(message):
+                        _session_notice(message["notice"])
+                        continue
+                    reply = message
+                if reply is not None:
                     watch.remove(conn)
     finally:
         for wfd in wfds:
@@ -3408,11 +3777,10 @@ def _session_pipes(name, payload, outputs, send_stdin=False, watcher=None):
             os.close(rfd)
         conn.close()
 
-    line = buf.split(b"\n", 1)[0].strip()
-    if not line:
+    if reply is None:
         raise SystemExit("mssh: session %s: the session daemon closed the "
                          "connection without replying" % name)
-    return _parse_reply(name, line)
+    return reply
 
 
 def session_send(name, payload, send_stdin=False, watcher=None):
@@ -3560,8 +3928,13 @@ def _session_detach(name, opts):
         os.close(null)
 
 
-def _session_serve(session, srv, path, clients, opts):
-    """Answer requests until stopped, the program dies, or idle expires."""
+def _session_serve(session, srv, path, opts):
+    """Answer requests until stopped, the program dies, or idle expires.
+
+    The chain is the session's own (session.chain), not a local variable: a
+    --reconnect replaces it with a new one, and the clients closed on the way
+    out have to be whichever ones are serving by then.
+    """
     state = {"stop": False}
 
     def handle(conn):
@@ -3650,11 +4023,17 @@ def _session_serve(session, srv, path, clients, opts):
         if op not in ("send", "exec"):
             drop()
         if op == "status":
+            # Answered whatever state the link is in: a session whose target
+            # is rebooting is exactly when somebody wants to look at it.
+            link, broken, attempt = session.link_state()
             _reply(conn, {
                 "target": str(session.target), "command": session.command,
                 "mode": session.mode, "started": session.started,
                 "served": session.served, "pid": os.getpid(),
                 "dead": session.dead, "running": session.lock.locked(),
+                "link": link, "broken": broken, "attempt": attempt,
+                "retries": session.retries, "reconnects": session.reconnects,
+                "refusal": session.refusal(), "last_error": session.last_error,
             })
             return
         if op == "stop":
@@ -3669,12 +4048,31 @@ def _session_serve(session, srv, path, clients, opts):
             _reply(conn, {"error": "mssh: session ended: %s" % session.dead})
             return
 
+        # The link is down and this command is the first to arrive since.
+        # Either it is being reconnected (say so, and let the caller try
+        # again), or the run of attempts is over and this is the last one --
+        # which, if it fails, is where the session finally ends.
+        verdict = session.resolve()
+        if verdict is not None:
+            message, fatal = verdict
+            drop()
+            if fatal:
+                die(message)
+            _reply(conn, {"error": message})
+            return
+
         if op == "interrupt":
             try:
                 signalled = session.interrupt_running()
             except _SessionDead as exc:
-                die(str(exc))
-                _reply(conn, {"error": "mssh: session ended: %s" % exc})
+                # The Ctrl-C found the break rather than caused it, so it is
+                # the same decision as everywhere else: end the session, or
+                # start rebuilding it.
+                if session.failed(str(exc)):
+                    die(str(exc))
+                    _reply(conn, {"error": "mssh: session ended: %s" % exc})
+                else:
+                    _reply(conn, {"error": _reconnecting_message(session, exc)})
                 return
             # An --exec command has no pty to type a Ctrl-C into, so it is
             # stopped by closing its channel; either kind counts as a command
@@ -3692,6 +4090,14 @@ def _session_serve(session, srv, path, clients, opts):
         if wait <= 0:
             wait = float("inf")           # --wait 0: until it ends or Ctrl-C
         with_stdin = bool(req.get("stdin"))
+
+        # Before the command, not after: whoever sent it is about to act on
+        # its output, and that it came out of a shell that remembers nothing
+        # is the one thing they have to know first.  It goes to the first
+        # command only -- after that the new shell is simply the shell.
+        notice = session.take_notice()
+        if notice:
+            _notify(conn, {"notice": notice})
 
         if op == "exec":
             dispatch_exec(conn, req, take, wait, with_stdin, rest)
@@ -3753,8 +4159,16 @@ def _session_serve(session, srv, path, clients, opts):
                     req.get("line", ""), wait, sink, in_path=in_path,
                     in_fd=in_fd, in_chan=in_chan, conn=conn)
             except _SessionDead as exc:
-                die(str(exc))
-                _reply(conn, {"error": "mssh: session ended: %s" % exc})
+                # The command is lost either way, and its client is told so
+                # either way; what is decided here is whether the session
+                # goes with it.  A connection that dropped under a --reconnect
+                # session does not: the attempts start now, in the background,
+                # and this client is told to come back.
+                if session.failed(str(exc)):
+                    die(str(exc))
+                    _reply(conn, {"error": "mssh: session ended: %s" % exc})
+                else:
+                    _reply(conn, {"error": _reconnecting_message(session, exc)})
                 return
             except _ClientGone:
                 return                    # nobody left to tell
@@ -3839,7 +4253,12 @@ def _session_serve(session, srv, path, clients, opts):
                 # A channel that could not be opened says nothing about the
                 # session's own shell, which is a different channel and may
                 # well still be fine; do not take the session down for it.
-                _reply(conn, {"error": "mssh: --exec: %s" % exc})
+                # It does say something when the transport under both of them
+                # has gone, and then this is where a reconnect starts.
+                if session.failed(str(exc)):
+                    _reply(conn, {"error": "mssh: --exec: %s" % exc})
+                else:
+                    _reply(conn, {"error": _reconnecting_message(session, exc)})
                 return
             except _ClientGone:
                 return                    # nobody left to tell
@@ -3861,6 +4280,7 @@ def _session_serve(session, srv, path, clients, opts):
 
     def die(reason):
         session.dead = reason
+        session.stopping.set()
         state["stop"] = True
 
     srv.settimeout(1.0)
@@ -3869,7 +4289,13 @@ def _session_serve(session, srv, path, clients, opts):
             try:
                 conn, _addr = srv.accept()
             except socket.timeout:
-                if session.dead or session.chan.exit_status_ready():
+                if session.dead:
+                    break
+                # The one poll that finds a connection that died with nobody
+                # using it.  It is also where a reconnect starts, so the
+                # target is usually back before the next command arrives
+                # rather than after it.
+                if session.check_link():
                     break
                 if opts.session_idle > 0 and \
                         time.time() - session.last > opts.session_idle:
@@ -3891,11 +4317,43 @@ def _session_serve(session, srv, path, clients, opts):
             os.unlink(path)
         except OSError:
             pass
+        session.stopping.set()            # stop a reconnect run mid-backoff
         try:
             session.chan.close()
         except Exception:
             pass
+        close_all(session.chain)
+
+
+def _one_line(exc):
+    """An exception as a single line, for a message that travels on the wire."""
+    text = " ".join(str(exc).split())
+    return text or type(exc).__name__
+
+
+def _open_shell(jumps, target, opts):
+    """Build the chain and start the framed program on it.
+
+    The whole of a session's remote half, in one place because a reconnect
+    has to do it again exactly as the first call did -- same pty, same
+    'stty -echo', same 'exec' -- and a second copy of it would drift.
+    Returns (clients, transport, chan, mark); the caller owns the clients.
+    """
+    clients, tgt = build_chain(jumps, target, opts)
+    try:
+        transport = tgt.get_transport()
+        chan = transport.open_session(timeout=opts.timeout)
+        chan.get_pty(term=SESSION_TERM, width=SESSION_COLS,
+                     height=SESSION_ROWS)
+        # 'exec' makes the program the channel's process leader, so a Ctrl-C
+        # written into the pty reaches it; 'stty -echo' stops our own input
+        # from coming straight back as output.
+        chan.exec_command("stty -echo 2>/dev/null; exec "
+                          + (opts.command or SESSION_SHELL))
+    except BaseException:
         close_all(clients)
+        raise
+    return clients, transport, chan, "__MSSH_%s__" % os.urandom(8).hex()
 
 
 def serve_session(name, srv, path, readyfd, jumps, target, opts):
@@ -3907,22 +4365,13 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
     """
     clients = []
     try:
-        clients, tgt = build_chain(jumps, target, opts)
-        chan = tgt.get_transport().open_session(timeout=opts.timeout)
-        chan.get_pty(term=SESSION_TERM, width=SESSION_COLS,
-                     height=SESSION_ROWS)
-        program = opts.command or SESSION_SHELL
-        # 'exec' makes the program the channel's process leader, so a Ctrl-C
-        # written into the pty reaches it; 'stty -echo' stops our own input
-        # from coming straight back as output.
-        chan.exec_command("stty -echo 2>/dev/null; exec " + program)
-
-        mark = "__MSSH_%s__" % os.urandom(8).hex()
+        clients, transport, chan, mark = _open_shell(jumps, target, opts)
         prompt_re = re.compile(opts.prompt.encode("utf-8")) if opts.prompt else None
         session = _Session(chan, mark,
                            "interactive" if opts.command else "shell",
                            prompt_re, opts.idle, target, opts.command,
-                           tgt.get_transport(), opts.timeout)
+                           transport, opts.timeout)
+        session.arm(name, jumps, clients, opts)
         banner = session.setup(opts.wait)
     except SystemExit as exc:
         # A SystemExit carries its own message and nothing has printed it yet
@@ -3958,7 +4407,7 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
 
     verbose(opts, "session %s: serving on %s, everything below happened after "
                   "startup" % (name, path))
-    _session_serve(session, srv, path, clients, opts)
+    _session_serve(session, srv, path, opts)
     return 0
 
 
@@ -4214,6 +4663,26 @@ def run_session_status(name):
            "running a command" if info.get("running") else "idle",
            int(info.get("pid") or 0))
     )
+    link = info.get("link") or "up"
+    if link == "reconnecting":
+        sys.stdout.write("link:     down (%s) -- reconnecting, attempt %d "
+                         "of %d\n"
+                         % (info.get("broken") or "?",
+                            int(info.get("attempt") or 0),
+                            int(info.get("retries") or 0)))
+    elif link == "down":
+        sys.stdout.write(
+            "link:     down (%s); %s\n"
+            % (info.get("broken") or "?",
+               info.get("refusal")
+               or ("no reconnection left -- one more will be tried when the "
+                   "next command arrives" + (", last error: %s"
+                                             % info["last_error"]
+                                             if info.get("last_error")
+                                             else ""))))
+    if info.get("reconnects"):
+        sys.stdout.write("rebuilt:  %d time(s) since it started\n"
+                         % int(info["reconnects"]))
     if info.get("dead"):
         sys.stdout.write("state:    ended (%s)\n" % info["dead"])
     return 0
@@ -4353,6 +4822,10 @@ def run_session(parser, opts):
     if opts.recursive or opts.preserve:
         parser.error("-r/-p only apply to a file copy, not to --session")
         return 2
+    if opts.reconnect < 0:
+        parser.error("--reconnect takes a number of attempts, not %d"
+                     % opts.reconnect)
+        return 2
     if opts.prompt is not None and not opts.command:
         parser.error("--prompt marks the end of an interactive program's "
                      "reply, so it needs -c to say which program to run")
@@ -4373,7 +4846,7 @@ def run_session(parser, opts):
     # the one thing that is not a command, because it is not anything: that
     # is the login above.
     if session_alive(name):
-        if opts.jump or opts.command:
+        if opts.jump or opts.command or opts.reconnect:
             raise SystemExit(
                 "mssh: session %r is already running; --status to inspect "
                 "it, --stop to end it" % name
@@ -4526,9 +4999,29 @@ persistent session (keep one connection and one shell alive):
        -c 'gdb -q -ex "set pagination off" -p 1234'
   mssh --session g 'bt'                            # output, then exit 0
 
-  mssh --session s --status    # target, uptime, commands served
+  mssh --session s --status    # target, uptime, commands served, link
   mssh --session s --interrupt # Ctrl-C, to unstick a hung command
   mssh --session s --stop      # end it; --sessions lists live ones
+
+  A session dies with its connection: a jump host or the target rebooting
+  ends it, and the next call says so.  --reconnect N, on the call that
+  starts one, builds the chain again instead -- up to N times, 2s, 4s, 8s,
+  16s then 30s apart (a gap between attempts, not a period: one that has
+  to time out costs up to -o SEC per hop on top, so the window is longer
+  than the gaps and never shorter):
+  mssh --session s --reconnect 20 -j ops@10.0.0.1 root@10.0.0.9
+  The connection comes back; the shell does not.  A new shell starts in the
+  home directory with none of the old environment or background jobs, so
+  the first command after a reconnect is told so on stderr before it runs
+  -- a 'cd /var/log' from before the reboot is gone, and a script that
+  assumed otherwise would grep the wrong directory and call it a success.
+  It needs an authentication that works with nobody watching (a key, or a
+  password written into the endpoint): the daemon is detached, so a
+  password that was typed at the prompt cannot be typed again.  A -c
+  session is refused too -- its state is the program, and a reconnect
+  would start a new one that has none of it.  A session that will not
+  reconnect does not vanish: it stays until a command collects the reason,
+  and ends then.
 
   Output streams as the command produces it, so a long-running command
   (a poller, a tail, a build) prints as it goes.  --wait bounds how long
@@ -4722,7 +5215,8 @@ def build_parser():
     )
     group.add_argument(
         "--status", action="store_true",
-        help="print the session's target, uptime and command count",
+        help="print the session's target, uptime, command count and, when "
+             "the connection has dropped, what --reconnect is doing about it",
     )
     group.add_argument(
         "--prompt", metavar="REGEX",
@@ -4760,6 +5254,24 @@ def build_parser():
              "printing until you Ctrl-C it (default: %g, or 0 for a login and "
              "for --exec -t, where you are sitting at the program)"
              % DEFAULT_SESSION_WAIT,
+    )
+    group.add_argument(
+        "--reconnect", type=int, default=0, metavar="N",
+        help="on the call that starts the session: if the connection drops, "
+             "rebuild the whole chain, up to N times, leaving 2s, 4s, 8s, "
+             "16s then 30s BETWEEN attempts.  That is a gap, not a period: "
+             "an attempt that has to time out adds its own cost on top (up "
+             "to -o SEC per hop, three times over in the worst case), so N "
+             "attempts span at least 2+4+8+16+30*(N-4) seconds and usually "
+             "more -- --reconnect 20 is eight minutes of waiting plus "
+             "however long twenty failures take, which is the order of a "
+             "physical machine's reboot.  The remote SHELL cannot be "
+             "rebuilt, only the connection, so the first command after a "
+             "reconnect is told on stderr that the working directory, the "
+             "environment and any background jobs are gone.  Needs an "
+             "authentication that works with nobody watching -- a key, or a "
+             "password in the endpoint -- and is refused for a -c session, "
+             "whose state is the program itself (default: 0, off)",
     )
     group.add_argument(
         "--session-idle", type=float, default=0, metavar="SEC",
@@ -4822,6 +5334,12 @@ def main(argv=None):
             return 2
     if opts.prompt is not None:
         parser.error("--prompt only applies to --session -c")
+        return 2
+    if opts.reconnect:
+        parser.error("--reconnect keeps a session's chain alive across a "
+                     "reboot, so it belongs on the call that starts one: "
+                     "mssh --session NAME --reconnect %d [-j <jump>...] "
+                     "<target>" % opts.reconnect)
         return 2
     if opts.exec_channel:
         parser.error("--exec runs a command in a session's connection; name "

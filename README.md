@@ -207,6 +207,69 @@ mssh --session s --stop        # end it and close the connection
 mssh --sessions                # list every live session
 ```
 
+### Surviving a reboot
+
+A session is only as alive as its connection. A jump host restarting, the
+target restarting, a firewall dropping the flow — any of them ends it, and the
+next call reports it and exits 1. `--reconnect N`, on the call that *starts* a
+session, builds the whole chain again instead:
+
+```bash
+mssh --session s --reconnect 20 -j ops@10.0.0.1 root@10.0.0.9
+```
+
+Attempts are 2 s, 4 s, 8 s, 16 s and then 30 s *apart* — a gap between
+attempts, not a period. An attempt that has to time out adds its own cost on
+top (up to `-o SEC`, 20 s by default, per hop), so attempts never overlap and
+never pile up, and `--reconnect 20` spans at least the eight minutes of
+waiting plus however long twenty failures take. In a reboot that is usually
+one SYN timeout per attempt while the kernel is down and an instant
+`connection refused` once the host is up but sshd is not, so the real window
+is comfortably longer than the gaps alone — which is the right way round for
+a physical machine.
+
+They run in the background: `--status` shows the link and which attempt is
+running, and the session keeps answering while they go on. A command that
+arrives mid-attempt is told so and exits 1 rather than being held for the
+length of a reboot; a command that was *running* when the link went is told
+the same thing, since its output is lost either way.
+
+The clock starts when the drop is noticed, which for a host that went away
+without closing its TCP connection means when a write to it finally fails —
+that is what the 30 s keepalive is for. A reset (an sshd restarting, a hop
+rebooting) is noticed at once.
+
+**The connection comes back; the shell does not.** A reconnect starts a *new*
+shell, in the home directory, with none of the old environment and none of the
+background jobs — so a `cd /var/log` from before the reboot is gone. That is
+why it is never silent: the first command after a reconnect is told, on stderr,
+before it runs.
+
+```
+mssh: session s reconnected to root@10.0.0.9:22 after the connection to
+root@10.0.0.9:22 dropped.  This is a new shell: the working directory, the
+environment and any background jobs of the old one are gone.
+```
+
+Two things it will not do:
+
+- **Authenticate with a credential it does not have.** The daemon is detached
+  from your terminal, so a password you typed at the prompt cannot be typed
+  again. A key, an agent, or a password written into the endpoint
+  (`user:secret@host`) reconnects; anything else is refused.
+- **Rebuild a `-c` session.** There the state *is* the program — the gdb that
+  was attached to pid 1234 does not exist after a reboot — so a new one would
+  be a different thing wearing the same name.
+
+A session that cannot reconnect does not disappear quietly: it stays up,
+broken, until a command asks it for something, and that command gets the
+reason and exit 1 as the session ends. The same is true once the attempts run
+out — one more is tried when the next command arrives, since a command
+arriving is evidence that somebody expects the target to be back.
+
+Without `--reconnect` nothing changes: a dropped connection ends the session
+immediately, as it always has.
+
 ### Borrowing the connection without the shell
 
 Plenty of commands want the chain but nothing else: a `grep` over a log, a
@@ -388,7 +451,7 @@ points at a specific file.
 
 Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
 `--interrupt`, `--exec`, `--prompt REGEX`, `--stdin`, `--idle SEC`,
-`--wait SEC`, `--session-idle SEC`.
+`--wait SEC`, `--reconnect N`, `--session-idle SEC`.
 
 `mssh --help` carries the same detail plus worked examples.
 
@@ -409,7 +472,8 @@ Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
 A keepalive goes out every 30 s (`-k SEC`, `0` to disable), so an idle session
 survives NAT and firewall timeouts. It cannot override a server-side
 `ClientAliveInterval` or a shell `TMOUT` — those still apply, and a session
-that dies that way reports it on the next call.
+that dies that way reports it on the next call, or rebuilds itself if it was
+started with [`--reconnect`](#surviving-a-reboot).
 
 ## Legacy servers
 

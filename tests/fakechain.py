@@ -32,20 +32,58 @@ sys.path.insert(0, HERE)
 from test_session_unit import FakeChan          # noqa: E402
 
 
+# A link that can be taken away, which is what --reconnect is about.  While
+# the named file exists the chain cannot be built and every channel on an
+# existing one fails the way paramiko's do when its transport dies: reads
+# raise, and the channel reports itself finished.  Creating and removing the
+# file is a test standing in for a machine going down and coming back.
+DOWN = os.environ.get("MSSH_FAKE_DOWN")
+
+
+def link_up():
+    return not (DOWN and os.path.exists(DOWN))
+
+
 class FakeTransport(object):
+    def __init__(self, client):
+        self.client = client
+
     def open_session(self, timeout=None):
-        return _PtyChan()
+        if not link_up():
+            raise OSError("fake chain: the connection is down")
+        chan = _PtyChan()
+        self.client.channels.append(chan)
+        return chan
+
+    def is_active(self):
+        return link_up() and not self.client.shut
 
     def set_keepalive(self, interval):
         pass
 
 
 class FakeClient(object):
+    def __init__(self):
+        self.channels = []
+        self.shut = False
+
     def get_transport(self):
-        return FakeTransport()
+        return FakeTransport(self)
 
     def close(self):
-        pass
+        """Take the chain's channels with it, as closing a transport does.
+
+        A reconnect closes the chain it replaced, and without this the
+        program behind the old pty would outlive it: a stray /bin/sh per
+        attempt, still holding the fd the test is about to check.
+        """
+        self.shut = True
+        for chan in self.channels:
+            try:
+                chan.close()
+            except Exception:
+                pass
+        del self.channels[:]
 
 
 class _PtyChan(FakeChan):
@@ -129,6 +167,11 @@ class _PtyChan(FakeChan):
 
     # -- the pipe-backed half, used by the stdin writer channel -----------
 
+    def _link(self):
+        """Fail the way a channel does once its transport has gone."""
+        if not link_up():
+            raise OSError("fake chain: the connection is down")
+
     def fileno(self):
         """The fd to select on, which is where the program's output comes out.
 
@@ -141,9 +184,12 @@ class _PtyChan(FakeChan):
         return self.proc.stdout.fileno()
 
     def recv_ready(self):
+        if not link_up():
+            return True               # a dead channel is always "ready": EOF
         return bool(select.select([self.fileno()], [], [], 0)[0])
 
     def sendall(self, data):
+        self._link()
         if self.proc is None:
             return FakeChan.sendall(self, data)
         self.proc.stdin.write(data)
@@ -155,6 +201,7 @@ class _PtyChan(FakeChan):
         return len(data)
 
     def recv(self, size):
+        self._link()
         if self.proc is None:
             return FakeChan.recv(self, size)
         ready, _, _ = select.select([self.proc.stdout], [], [], self._timeout)
@@ -181,6 +228,10 @@ class _PtyChan(FakeChan):
             self.proc.stdin.close()
 
     def exit_status_ready(self):
+        if not link_up():
+            # paramiko sets the status event on every channel when the
+            # transport goes, so a dead link looks exactly like this.
+            return True
         if self.proc is not None:
             return self.proc.poll() is not None
         return FakeChan.exit_status_ready(self)
@@ -192,6 +243,8 @@ class _PtyChan(FakeChan):
         marker printed into its output, so the channel itself is what says how
         it ended.
         """
+        if not link_up():
+            return -1
         if self.proc is not None:
             return self.proc.wait()
         if self.pid is None:
@@ -223,6 +276,9 @@ class _PtyChan(FakeChan):
 
 
 def fake_build_chain(jumps, target, opts):
+    if not link_up():
+        raise SystemExit("mssh: hop 1/1: cannot reach %s: fake chain is down"
+                         % target)
     client = FakeClient()
     return [client], client
 
