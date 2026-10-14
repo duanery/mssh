@@ -318,6 +318,14 @@ mssh --session s --exec -t top
 mssh --session s --exec -t 'mysql -u root -p'
 ```
 
+When the session is named as the first word (`mssh s ...` rather than
+`--session s`), the first word after it that is not an option starts the command, and
+everything from there is the command's, options included: `mssh s ls -l` runs
+`ls -l`, `mssh s --exec -t top -d 1` runs `top -d 1`. Put mssh's own options
+before the command (`mssh s --wait 5 'sleep 3'`); after it they belong to the command.
+With `--session s` the options may still follow the command, and a command that
+starts with a dash needs `--` in front of it.
+
 With `-t`:
 
 - **Your terminal is forwarded as the program's input**, which is the one case

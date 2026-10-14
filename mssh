@@ -5287,9 +5287,99 @@ def build_parser():
     return parser
 
 
+def parse_cli(parser, argv):
+    """parse_args, except that words may come on either side of an option.
+
+    argparse takes the one positional list from the first run of plain words
+    and calls everything after the next option "unrecognized", so 'mssh host
+    --wait 5 cmd' and 'mssh host --exec -t -- ls -l' were refused although
+    each part is fine.  The words it set aside are the continuation of that
+    list, so they are put back after it; a '--' ends the options, as it does
+    everywhere else, and what follows is the command whatever it looks like.
+    """
+    opts, extras = parser.parse_known_args(argv)
+    words, literal = [], False
+    for index, item in enumerate(extras):
+        if literal or item == "-" or not item.startswith("-"):
+            words.append(item)
+        elif item == "--":
+            literal = True
+        else:
+            hint = ""
+            if opts.args or words:
+                hint = (" (to pass %s to the remote command, put -- before "
+                        "it: mssh NAME -- cmd %s)" % (item, item))
+            parser.error("unrecognized arguments: %s%s"
+                         % (" ".join(extras[index:]), hint))
+    opts.args = list(opts.args) + words
+    return opts
+
+
+def _takes_value(parser, token):
+    """Whether the option spelled `token` consumes the word after it.
+
+    Only to find where the words start, so anything it cannot place counts as
+    a flag; argparse still has the final say on what the options mean.
+    """
+    acts = parser._option_string_actions
+    if token.startswith("--"):
+        if "=" in token:
+            return False
+        action = acts.get(token)
+        if action is None:
+            hits = [a for o, a in acts.items() if o.startswith(token)]
+            action = hits[0] if len({id(a) for a in hits}) == 1 else None
+        return action is not None and action.nargs != 0
+    for pos in range(1, len(token)):
+        action = acts.get("-" + token[pos])
+        if action is None:
+            return False
+        if action.nargs != 0:
+            return pos == len(token) - 1
+    return False
+
+
+def _split_command(parser, argv):
+    """Cut 'mssh NAME [options] cmd ...' where the command begins.
+
+    Once the first word names a live session, the next word that is not an
+    option is the command and so is everything after it, whatever it looks
+    like: 'mssh vm1 ls -l' runs 'ls -l', as ssh would.  Options go before the
+    command ('mssh vm1 --wait 5 sleep 3'); after it they are the command's.
+    Returns (what mssh parses, the command's words).  A call that does not
+    name a session this way is left whole.
+    """
+    flags = ("--session", "--sessions", "--copy-id")
+    first = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            if first is not None:
+                return argv[:index + 1], argv[index + 1:]
+            return argv, []
+        if token.startswith("-") and token != "-":
+            if token.split("=")[0] in flags:
+                return argv, []
+            index += 2 if _takes_value(parser, token) else 1
+            continue
+        if first is None:
+            first = token
+            index += 1
+            continue
+        if _live_session_named(first):
+            return argv[:index], argv[index:]
+        return argv, []
+    return argv, []
+
+
 def main(argv=None):
     parser = build_parser()
-    opts = parser.parse_args(argv)
+    if argv is None:
+        argv = sys.argv[1:]
+    head, command = _split_command(parser, list(argv))
+    opts = parse_cli(parser, head)
+    opts.args = list(opts.args) + command
 
     # --session is optional once the session exists: a session's name is also
     # the name of the machine it reached, so 'mssh host', 'mssh host cmd' and
