@@ -159,6 +159,28 @@ mssh --session s 'grep -c error messages'      # exit code is grep's
 mssh --session s 'X=1'; mssh --session s 'echo $X'      # prints 1
 ```
 
+Once the session is live, `--session` can be left out: the name of a session
+is also the name of the machine it reached — the whole chain, under an alias.
+
+```bash
+mssh -j ops@10.0.0.1 -j dmz@10.1.0.4 root@192.168.1.10 --session web
+mssh web 'cd /var/log && ls'                   # = mssh --session web '...'
+mssh web --status                              # and --stop, --interrupt
+mssh web --exec -t 'vim /etc/nginx/nginx.conf'
+mssh web                                       # nothing to run: a login
+```
+
+A word that no live session answers to is read as a host, exactly as before,
+so `mssh 10.0.0.9` still logs in to `10.0.0.9` and every existing command line
+keeps working.
+
+That last line is the nearest thing to `ssh web`: it opens a shell on the
+target, on **a channel of its own** rather than in the session's shell, which
+is busy being a session — the framing around every command above is what makes
+it one. Your terminal drives that shell the way it drives an `--exec -t`
+program (forwarded as its input, raw until the shell ends, resized along with
+your window, no `--wait`), and `mssh` exits with the shell's own exit code.
+
 Separate processes, one shell: the working directory, the environment and any
 background jobs live on between calls. Output streams as it is produced, so a
 long-running command (a build, a poller, a `tail`) prints as it goes rather
@@ -292,7 +314,7 @@ can.
   a script being read from a pipe. `/dev/null` is never forwarded — it cannot be
   told apart from having no input, so a bare `cat` still ends instead of wedging
   the session.
-- **`--wait SEC`** (default 30, or 0 with `--exec -t`) bounds how long one
+- **`--wait SEC`** (default 30, or 0 for a login and with `--exec -t`) bounds how long one
   command is watched; `0` means indefinitely. A timeout exits 124 and leaves
   the session usable — the next command stops whatever was still running.
 - **Ctrl-C interrupts the remote command**, not your local process, so the

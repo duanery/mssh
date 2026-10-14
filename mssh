@@ -2757,7 +2757,7 @@ class _Session(object):
     # -- a command on a channel of its own --------------------------------
 
     def exec_run(self, line, wait, out_sink, err_sink, in_fd=None, conn=None,
-                 pty=None, control=b""):
+                 pty=None, control=b"", shell=False):
         """Run one command on a new channel, outside the session's shell.
 
         Nothing here touches the session's pty: a fresh channel is opened, the
@@ -2776,6 +2776,12 @@ class _Session(object):
         or inspects the bytes either way.  With a pty the server merges stderr
         into stdout, so the stderr sink stays empty; that is the terminal's
         doing, not ours.
+
+        shell asks for no command at all, which is a login: a shell is started
+        on this new channel instead, the way 'ssh host' with no command does
+        it.  It is a new channel for the same reason as everything else here --
+        the session's own shell cannot be borrowed, since the framing wrapped
+        around every command is what makes that shell a session.
 
         What is given up is the session itself: open_session starts a new
         process on the target, so the shell's working directory, variables,
@@ -2813,9 +2819,13 @@ class _Session(object):
                                        "the command: %s" % exc)
             chan.settimeout(0.0)
             try:
-                chan.exec_command(line)
+                if shell:
+                    chan.invoke_shell()
+                else:
+                    chan.exec_command(line)
             except Exception as exc:
-                raise _SessionDead("could not start the command: %s" % exc)
+                raise _SessionDead("could not start the %s: %s"
+                                   % ("shell" if shell else "command", exc))
             return self._pump_exec(job, out_sink, err_sink, time.time() + wait,
                                    in_fd=in_fd, conn=conn, control=control)
         finally:
@@ -3191,6 +3201,12 @@ class _Session(object):
 # that will not run without a terminal.  The size is the client's window and
 # the raw mode that goes with it is the client's own terminal: the daemon is
 # detached and has no terminal to set, so the request is all that crosses.
+#
+# It may also carry "shell": true, with an empty "line", which is a login --
+# 'mssh host' -- and starts the target's shell on that channel rather than a
+# command.  It is a key of its own rather than an empty command because an
+# empty command is a command: a daemon that did not know the key would run one
+# and exit, where this one starts a shell and holds the channel.
 #
 # That window can then be dragged while the command runs, and a resized one is
 # the single thing a client sends *after* its request:
@@ -3777,6 +3793,11 @@ def _session_serve(session, srv, path, clients, opts):
         no terminal at all -- it is a detached process whose standard
         descriptors are /dev/null -- so there is nothing here to put in raw
         mode and nothing to translate.
+
+        A "shell" in the request means there is no command: 'mssh host' is a
+        login, and what starts on the channel is the target's shell itself.
+        Nothing else about the exchange changes -- same descriptors, same
+        loop, same single status at the end, which is then the shell's own.
         """
         out_fd, err_fd = take(0), take(1)
         if out_fd is None or err_fd is None:
@@ -3812,7 +3833,8 @@ def _session_serve(session, srv, path, clients, opts):
             try:
                 status, timed_out = session.exec_run(
                     req.get("line", ""), wait, out_sink, err_sink,
-                    in_fd=in_fd, conn=conn, pty=pty, control=rest)
+                    in_fd=in_fd, conn=conn, pty=pty, control=rest,
+                    shell=bool(req.get("shell")))
             except _SessionDead as exc:
                 # A channel that could not be opened says nothing about the
                 # session's own shell, which is a different channel and may
@@ -4030,7 +4052,7 @@ def _no_session(name):
     )
 
 
-def run_session_send(name, line, opts):
+def run_session_send(name, line, opts, shell=False):
     """Stream one command's output to stdout, then exit with its status.
 
     With --exec the command runs on a channel of its own rather than in the
@@ -4046,12 +4068,20 @@ def run_session_send(name, line, opts):
     terminal -- with either one redirected there is nothing to put in raw mode
     and no size to send, so the pty is not requested at all.
 
+    shell is a login -- 'mssh host' -- which is the same exchange with no
+    command in it: the daemon starts a shell on a channel of its own rather
+    than a program, and everything --exec -t does for a full-screen program is
+    what a shell wants too.  The terminal goes down with it whether or not a
+    pty came back, because a shell reads its input either way; that is the one
+    place a login differs from a command, where a redirected stdout is reason
+    enough not to forward a terminal nobody is going to read.
+
     Ctrl-C here interrupts the remote command, the way it would in a terminal,
     rather than killing this process and leaving the command running: an agent
     or a script that gives up on a command needs the session left usable.
     """
-    use_exec = bool(getattr(opts, "exec_channel", False))
-    want_pty = use_exec and opts.force_tty and _both_ends_are_tty()
+    use_exec = shell or bool(getattr(opts, "exec_channel", False))
+    want_pty = use_exec and (shell or opts.force_tty) and _both_ends_are_tty()
     interrupted = {"count": 0}
 
     def on_sigint(_signum, _frame):
@@ -4067,7 +4097,7 @@ def run_session_send(name, line, opts):
         except (SessionGone, SystemExit, OSError):
             pass
 
-    with_stdin = want_stdin(opts, with_pty=want_pty)
+    with_stdin = want_stdin(opts, with_pty=want_pty or shell)
 
     previous = signal.getsignal(signal.SIGINT)
     try:
@@ -4077,6 +4107,8 @@ def run_session_send(name, line, opts):
 
     request = {"op": "exec" if use_exec else "send",
                "line": line, "wait": opts.wait}
+    if shell:
+        request["shell"] = True
     if with_stdin:
         request["stdin"] = True
     if want_pty:
@@ -4086,9 +4118,11 @@ def run_session_send(name, line, opts):
     call = session_exec if use_exec else session_send
 
     try:
-        verbose(opts, "session %s: %s %d byte(s)%s%s, waiting up to %s"
-                % (name, "running on its own channel:" if use_exec
-                   else "sending", len(line),
+        verbose(opts, "session %s: %s%s%s, waiting up to %s"
+                % (name,
+                   "logging in on a channel of its own" if shell
+                   else ("running %d byte(s) on its own channel" % len(line))
+                   if use_exec else "sending %d byte(s)" % len(line),
                    " with a terminal" if want_pty else "",
                    " and forwarding stdin (%s)" % stdin_kind()
                    if with_stdin else "",
@@ -4234,6 +4268,40 @@ def run_session_list():
     return 0
 
 
+def _live_session_named(name):
+    """True when name is a live session, for the bare 'mssh NAME' shorthand.
+
+    A probe, not a check: anything that goes wrong -- a word no session could
+    be called, an unusable session directory, a daemon that answers nothing --
+    means "not a session", and the argument goes on to be read as a host, which
+    is what it was before this shorthand existed.  'mssh 10.0.0.9' must not
+    start failing over the state of ~/.mssh, which only sessions care about.
+    """
+    if not SESSION_NAME_RE.match(name or ""):
+        return False
+    try:
+        return session_alive(name)
+    except (SystemExit, socket.error, OSError):
+        return False
+
+
+def _session_login_wanted(opts):
+    """True when a session invocation names no work at all, which is a login.
+
+    'mssh host' and 'mssh --session host' ask for nothing to be run, and the
+    only thing left to mean is the thing ssh means by the same words: a shell
+    on the target, with your terminal at it.  Anything that says what to do --
+    a command, a positional, a chain to build, a key to install -- is that
+    instead, and so are --status/--stop/--interrupt, which act on the session
+    rather than on the machine behind it.
+    """
+    if not opts.session:
+        return False
+    if opts.args or opts.command or opts.jump or opts.copy_id is not None:
+        return False
+    return not (opts.stop or opts.interrupt or opts.status)
+
+
 def run_session(parser, opts):
     """Dispatch every --session invocation."""
     name = opts.session
@@ -4268,15 +4336,19 @@ def run_session(parser, opts):
     if opts.copy_id:
         parser.error("--copy-id cannot be combined with --session")
         return 2
-    if opts.force_tty and not opts.exec_channel:
+    # Nothing to run: a login, and already implied by the absence of anything
+    # else, so -t is redundant rather than wrong on it.
+    login = _session_login_wanted(opts)
+    if opts.force_tty and not (opts.exec_channel or login):
         parser.error("-t only applies to --session --exec; the session's own "
                      "shell already runs behind a pty, and a command sent to "
                      "it reads a fifo rather than that terminal")
         return 2
-    if opts.force_tty and opts.no_stdin:
-        parser.error("-t and -n contradict each other: a command given a "
-                     "terminal is given one to read from, and -n is what says "
-                     "not to forward it any input")
+    if opts.no_stdin and (opts.force_tty or login):
+        parser.error("-n contradicts %s: a terminal is forwarded for the "
+                     "remote program to read from, and -n is what says not to "
+                     "forward anything"
+                     % ("a login" if login and not opts.force_tty else "-t"))
         return 2
     if opts.recursive or opts.preserve:
         parser.error("-r/-p only apply to a file copy, not to --session")
@@ -4297,18 +4369,22 @@ def run_session(parser, opts):
     # like a command or a host: against a live session every positional is a
     # command, so 'mssh --session s root@host' runs that word in the shell
     # and says "command not found" rather than being second-guessed here.
-    # Only the start-only flags are still refused.
+    # Only the start-only flags are still refused.  No positional at all is
+    # the one thing that is not a command, because it is not anything: that
+    # is the login above.
     if session_alive(name):
         if opts.jump or opts.command:
             raise SystemExit(
                 "mssh: session %r is already running; --status to inspect "
                 "it, --stop to end it" % name
             )
-        if not opts.args:
-            parser.error("--session %s: nothing to send -- pass a command, "
-                         "or --status/--stop/--interrupt" % name)
-            return 2
         try:
+            if login:
+                # A channel of its own, not the session's shell: that shell is
+                # busy being a session -- the framing around every command is
+                # what makes 'mssh host cmd' work at all -- so a login can no
+                # more borrow it than two people can share one keyboard.
+                return run_session_send(name, "", opts, shell=True)
             return run_session_send(name, " ".join(opts.args), opts)
         except SessionGone:
             # It answered a moment ago, so it ended in between -- usually
@@ -4415,6 +4491,22 @@ persistent session (keep one connection and one shell alive):
   and background jobs live on in the session, which a plain -c cannot do.
   Once a session is live every positional is a command, so a repeated
   start runs the endpoint as one; --status says whether one is live.
+
+  --session may then be left out, because the name of a session is also the
+  name of the machine it reached -- it is the whole path, under an alias:
+  mssh s 'cd /var/log && ls'          # = mssh --session s 'cd ...'
+  mssh s --status                     # and --stop, --interrupt
+  mssh s --exec -t 'vim /etc/hosts'
+  mssh s                              # nothing to run: a login
+  A word no live session answers to is read as a host, exactly as before,
+  so 'mssh 10.0.0.9' still logs in to 10.0.0.9.
+
+  That last line is 'ssh s' as nearly as this can be: a shell on the
+  target, on a channel of its own rather than the session's own shell,
+  which is busy being a session -- the framing around every command above
+  is what makes it one.  Your terminal drives the shell the way --exec -t
+  drives a program (forwarded as its input, raw until it ends, resized
+  with your window, no --wait), and the exit code is the shell's.
 
   stdin is forwarded when it is a pipe or a file, as it would be to ssh:
   echo hello | mssh --session s cat                # prints hello
@@ -4527,7 +4619,9 @@ def build_parser():
              "DEST in which the remote side carries that same endpoint with "
              "':' and a path appended: "
              "'./app.tar root@10.0.0.9:/tmp/' uploads, "
-             "'root@10.0.0.9:/var/log/syslog ./' downloads",
+             "'root@10.0.0.9:/var/log/syslog ./' downloads.  The name of a "
+             "live session stands in for a target here, and then anything "
+             "after it is a command for that session",
     )
     parser.add_argument(
         "-r", "--recursive", action="store_true",
@@ -4565,7 +4659,8 @@ def build_parser():
              "raw for the length of the command, resizing your window "
              "resizes the remote one, and --wait defaults to 0 since you are "
              "sitting at the program.  A session's own shell already has a "
-             "pty, so the flag has no meaning there",
+             "pty, so the flag has no meaning there, and a login ('mssh NAME' "
+             "with nothing to run) already does all of it",
     )
     parser.add_argument(
         "-n", "--no-stdin", action="store_true",
@@ -4607,9 +4702,12 @@ def build_parser():
         "--session", metavar="NAME",
         help="keep the connection alive under NAME.  The first call carries "
              "the chain and detaches a local daemon holding a remote shell; "
-             "every later 'mssh --session NAME CMD' runs CMD in that same "
-             "shell, so the working directory, variables and any loaded "
-             "state persist between calls",
+             "every later 'mssh NAME CMD' runs CMD in that same shell, so the "
+             "working directory, variables and any loaded state persist "
+             "between calls.  Once the session is live this flag may be left "
+             "out -- the name is the first word, as a host would be, since it "
+             "names the same machine -- and 'mssh NAME' with nothing to run "
+             "is a login on a channel of its own",
     )
     group.add_argument(
         "--sessions", "--list", action="store_true", help="list live sessions and exit",
@@ -4659,8 +4757,9 @@ def build_parser():
         help="how long to wait for a command to finish; its output streams "
              "as it arrives either way, and the session survives a timeout.  "
              "0 waits indefinitely, so a command that never ends keeps "
-             "printing until you Ctrl-C it (default: %g, or 0 with --exec -t, "
-             "where you are sitting at the program)" % DEFAULT_SESSION_WAIT,
+             "printing until you Ctrl-C it (default: %g, or 0 for a login and "
+             "for --exec -t, where you are sitting at the program)"
+             % DEFAULT_SESSION_WAIT,
     )
     group.add_argument(
         "--session-idle", type=float, default=0, metavar="SEC",
@@ -4680,14 +4779,27 @@ def main(argv=None):
     parser = build_parser()
     opts = parser.parse_args(argv)
 
+    # --session is optional once the session exists: a session's name is also
+    # the name of the machine it reached, so 'mssh host', 'mssh host cmd' and
+    # 'mssh host --stop' mean the same as spelling --session out.  Being live
+    # is the whole test and nothing is guessed from the shape of the word: a
+    # name no session answers to is read as a host, exactly as before, which is
+    # what keeps 'mssh 10.0.0.9' and every existing command line working.
+    # --copy-id is left out of it -- it builds a chain of its own, so its
+    # argument is a host by definition.
+    if not opts.session and not opts.sessions and opts.args \
+            and opts.copy_id is None and _live_session_named(opts.args[0]):
+        opts.session = opts.args.pop(0)
+
     if opts.wait is None:
-        # --exec -t is a login, not a command: somebody is sitting at the
-        # program, and the time they spend in an editor or a debugger is not
-        # evidence that anything is stuck.  A deadline that cut it off mid-use
-        # would be the opposite of what asking for a terminal meant, so that
-        # case waits as long as the program lives and every other case keeps
-        # the deadline that catches a command which never ends.
-        opts.wait = 0.0 if (opts.exec_channel and opts.force_tty) \
+        # A login is not a command: somebody is sitting at the program, and the
+        # time they spend in a shell, an editor or a debugger is not evidence
+        # that anything is stuck.  A deadline that cut it off mid-use would be
+        # the opposite of what asking for a terminal meant, so 'mssh host' and
+        # --exec -t wait as long as the program lives, and every other case
+        # keeps the deadline that catches a command which never ends.
+        opts.wait = 0.0 if (_session_login_wanted(opts)
+                            or (opts.exec_channel and opts.force_tty)) \
             else DEFAULT_SESSION_WAIT
 
     if opts.sessions:
@@ -4702,8 +4814,11 @@ def main(argv=None):
 
     for flag in ("stop", "interrupt", "status"):
         if getattr(opts, flag):
-            parser.error("--%s acts on a session; name it with --session NAME"
-                         % flag)
+            # Either no name was given or the one given is not live; both end
+            # here, so the message names the live ones rather than guessing
+            # which of the two happened.
+            parser.error("--%s acts on a live session: 'mssh NAME --%s' "
+                         "(--sessions lists them)" % (flag, flag))
             return 2
     if opts.prompt is not None:
         parser.error("--prompt only applies to --session -c")

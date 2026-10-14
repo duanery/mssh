@@ -105,6 +105,15 @@ class _PtyChan(FakeChan):
         except OSError:
             pass
 
+    def invoke_shell(self):
+        """A login: the shell itself, which is what 'mssh host' asks for.
+
+        Started the same way a command is, so the whole pty path below -- the
+        size, the window change, the exit status -- is the one path either
+        way; only the program differs, as it does on a real server.
+        """
+        self.exec_command("exec /bin/sh")
+
     def exec_command(self, command):
         if self.want_pty:
             self.pid, self.fd = os.forkpty()
