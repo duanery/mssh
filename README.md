@@ -90,9 +90,9 @@ force a pty for something that insists on one.
 
 ### Shell initialization
 
-`--rcfile FILE` reads a local shell script before connecting, uploads it into
-a private directory under the target's `/tmp`, loads it in the new shell with
-`.` (source), then removes the remote file and directory:
+`--rcfile FILE` reads a local shell script before connecting, uploads it to
+a private mode-0600 temporary file directly under the target's `/tmp`, and
+loads it in the new shell with `.` (source):
 
 ```bash
 mssh --rcfile ./init.sh -j ops@10.0.0.1 root@10.0.0.9
@@ -112,10 +112,10 @@ Initialization input echoes, markers and script stdout/stderr are hidden;
 the login banner and subsequent prompt are retained. The script reads
 `/dev/null`, so it must not prompt for input. A nonzero return or an
 initialization timeout (using `--timeout`) fails the new shell. Cleanup runs
-in that same shell immediately after the script returns, including a nonzero
-return; no additional cleanup channel is opened. If the script exits or
+in that same shell for direct logins immediately after the script returns,
+including a nonzero return; no additional cleanup channel is opened. If the script exits or
 replaces the shell, hangs, or the connection is lost, temporary files may remain.
-The target needs a sh-compatible shell, `mktemp`, `cat`, `rm` and `rmdir`;
+The target needs a sh-compatible shell, `mktemp`, `cat` and `rm`;
 SFTP is not required.
 
 On Bash, the initialization command removes only its own in-memory history
@@ -125,9 +125,15 @@ entries are not removed, and remote audit or custom logging hooks are unaffected
 
 Shell sessions start a login Bash, falling back to a login `/bin/sh`, so
 remote login profiles run before the local script. Reconnects rerun the
-original script snapshot, not a newly read local file. Fresh logins through
-an existing session also use that snapshot, unless an explicit `--rcfile`
-overrides it for that login. Ordinary commands in an existing session do not
+original script snapshot, not a newly read local file. A session retains its
+remote rc file: fresh logins source that existing path without uploading again.
+Each reconnect uploads a new copy. `--stop` removes the session's retained
+files, including earlier copies from reconnects; other normal session shutdowns
+also attempt cleanup. Cleanup cannot be guaranteed while the target is unreachable.
+`mssh NAME --status` displays the current remote path on the `rcfile:` line,
+or `none` when no rc file is configured.
+An explicit `--rcfile` overrides the retained file for that login only and
+is deleted after source. Ordinary commands in an existing session do not
 rerun initialization. `--rcfile` cannot be combined with `-c`, `--exec`, file
 copies or session control operations.
 

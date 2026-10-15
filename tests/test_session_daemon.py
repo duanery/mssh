@@ -90,7 +90,10 @@ class TestLifecycle(SessionTest):
             self.start("--rcfile", script)
             with open(remote_path) as record:
                 path = record.read().strip()
-            self.assertFalse(os.path.exists(path))
+            self.assertTrue(os.path.isfile(path))
+            status = run(self.name, "--status")
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertIn(("rcfile:   %s\n" % path).encode(), status.stdout)
             proc = self.send('echo "$MSSH_RC_VALUE"; rc_function; pwd')
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout,
@@ -100,6 +103,12 @@ class TestLifecycle(SessionTest):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn(b"initialized", proc.stdout)
             self.assertNotIn(b"hidden-init-output", proc.stdout)
+            with open(remote_path) as record:
+                self.assertEqual(record.read().strip(), path)
+            self.assertTrue(os.path.isfile(path))
+            stopped = run(self.name, "--stop")
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            self.assertFalse(os.path.exists(path))
 
     def test_session_runs_a_login_shell(self):
         self.start()
@@ -160,6 +169,7 @@ class TestLifecycle(SessionTest):
         self.assertIn("session:  %s" % self.name, out)
         self.assertIn("target:   root@10.0.0.1:22", out)
         self.assertIn("mode:     shell", out)
+        self.assertIn("rcfile:   none", out)
         # The setup probe counts too; what matters is that it moves.
         served = int([l for l in out.splitlines()
                       if l.startswith("commands:")][0].split()[-1])

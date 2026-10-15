@@ -1215,23 +1215,29 @@ def _rc_command(transport, command, timeout, data=b""):
         chan.close()
 
 
-def _source_rcfile(transport, chan, content, timeout, banner_sink=None):
-    """Upload a local snapshot, source it in this shell, and remove it."""
-    if content is None:
-        return b""
-    # The upload owns partial files; the destination shell cleans up after source.
+def _upload_rcfile(transport, content, timeout):
+    """Create one private temporary file, without a containing directory."""
     upload = (
-        'umask 077; d=$(mktemp -d /tmp/mssh-rc.XXXXXXXXXX) || exit 1; '
-        'trap \'rm -f "$d/rc"; rmdir "$d"\' 0; '
-        'cat > "$d/rc" || exit 1; printf "%s\\n" "$d"; trap - 0'
+        'umask 077; f=$(mktemp /tmp/mssh-rc.XXXXXXXXXX) || exit 1; '
+        'trap \'rm -f "$f"\' 0; '
+        'cat > "$f" || exit 1; printf "%s\\n" "$f"; trap - 0'
     )
+    out, status = _rc_command(transport, upload, timeout, content)
+    if status != 0 or not re.fullmatch(rb"/tmp/mssh-rc\.[A-Za-z0-9]+\n", out):
+        raise RuntimeError("could not upload --rcfile to a private temporary file")
+    return out.rstrip(b"\n").decode("ascii")
+
+
+def _source_rcfile(transport, chan, content, timeout, banner_sink=None,
+                   remote_path=None):
+    """Source a retained session file, or upload and remove a one-off script."""
+    if content is None and remote_path is None:
+        return b""
     old_timeout = chan.gettimeout() if hasattr(chan, "gettimeout") else None
     try:
-        out, status = _rc_command(transport, upload, timeout, content)
-        if status != 0 or not re.fullmatch(
-                rb"/tmp/mssh-rc\.[A-Za-z0-9]+\n", out):
-            raise RuntimeError("could not upload --rcfile to a private directory")
-        directory = out.rstrip(b"\n").decode("ascii")
+        retained = remote_path is not None
+        if not retained:
+            remote_path = _upload_rcfile(transport, content, timeout)
         token = os.urandom(16).hex()
         pattern = re.compile(
             b"\x1e" + token.encode("ascii") + rb":([0-9]+):([0-9]+)\x1f\r?\n")
@@ -1246,13 +1252,14 @@ def _source_rcfile(transport, chan, content, timeout, banner_sink=None):
         line = (
             " " + history + ". %s </dev/null >/dev/null 2>&1; "
             "__mssh_rc_status=$?; "
-            "command rm -f %s 2>/dev/null && command rmdir %s 2>/dev/null; "
+            "%s; "
             "__mssh_rc_cleanup=$?; "
             "command printf '\\036%%s:%%s:%%s\\037\\n' '%s' "
             "\"$__mssh_rc_status\" \"$__mssh_rc_cleanup\"; "
             "unset __mssh_rc_status __mssh_rc_cleanup\n"
-            % (shlex.quote(directory + "/rc"),
-               shlex.quote(directory + "/rc"), shlex.quote(directory), token)
+            % (shlex.quote(remote_path),
+               ":" if retained else
+               "command rm -f %s 2>/dev/null" % shlex.quote(remote_path), token)
         ).encode("ascii")
         deadline = time.monotonic() + max(timeout, 1.0)
         chan.settimeout(0.05)
@@ -2633,6 +2640,8 @@ class _Session(object):
         self.notice = None                # owed to the next command
         self.stopping = threading.Event()
         self.rcfile_data = None
+        self.rcfile_path = None
+        self.rcfile_paths = set()
 
     @property
     def pending(self):
@@ -3022,8 +3031,8 @@ class _Session(object):
 
                     initial = _source_rcfile(
                         self.transport, chan,
-                        self.rcfile_data if rcfile_data is None else rcfile_data,
-                        self.timeout, banner_sink=show_banner)
+                        rcfile_data, self.timeout, banner_sink=show_banner,
+                        remote_path=self.rcfile_path if rcfile_data is None else None)
                     out_sink.write(initial)
                 else:
                     chan.exec_command(line)
@@ -3402,6 +3411,34 @@ class _Session(object):
         clone.copy_id = None
         self.reconnect_opts = clone
 
+    def setup_rcfile(self):
+        """Upload once per new session shell; subsequent logins reuse its path."""
+        if self.rcfile_data is None:
+            return
+        path = _upload_rcfile(self.transport, self.rcfile_data, self.timeout)
+        self.rcfile_paths.add(path)
+        _source_rcfile(self.transport, self.chan, None, self.timeout,
+                       remote_path=path)
+        self.rcfile_path = path
+
+    def cleanup_rcfiles(self):
+        """Best-effort cleanup, including paths retained across reconnects."""
+        if not self.rcfile_paths:
+            return
+        try:
+            _, status = _rc_command(
+                self.transport,
+                "command rm -f -- " + " ".join(
+                    shlex.quote(path) for path in sorted(self.rcfile_paths)),
+                min(self.timeout, 5.0))
+            if status:
+                raise RuntimeError("remote rm returned exit status %d" % status)
+        except Exception as exc:
+            sys.stderr.write("mssh: could not clean up session rc files: %s\n" % exc)
+        else:
+            self.rcfile_paths.clear()
+            self.rcfile_path = None
+
     def link_down(self):
         """True when the connection is gone, as against the program ending.
 
@@ -3532,22 +3569,28 @@ class _Session(object):
             self.last_error = _one_line(exc)
             return False
 
-        previous = (self.chain, self.chan, self.transport, self.mark)
+        previous = (self.chain, self.chan, self.transport, self.mark,
+                    self.rcfile_path)
         with self.lock:
+            if self.stopping.is_set():
+                close_all(clients)
+                return False
             self.chain, self.chan = clients, chan
             self.transport, self.mark = transport, mark.encode("utf-8")
             self.outstanding = 0
             self.abort.clear()
             try:
                 self.setup(self.setup_wait)
-                _source_rcfile(self.transport, self.chan,
-                               self.rcfile_data, self.timeout)
+                self.setup_rcfile()
+                if self.stopping.is_set():
+                    self.cleanup_rcfiles()
+                    raise _SessionDead("session stopped during reconnect")
             except BaseException as exc:
                 # The hops answered but the shell behind them did not; put
                 # back what was there and let the next attempt try again.
                 self.last_error = _one_line(exc)
                 (self.chain, self.chan,
-                 self.transport, self.mark) = previous
+                 self.transport, self.mark, self.rcfile_path) = previous
                 close_all(clients)
                 return False
 
@@ -4192,9 +4235,12 @@ def _session_serve(session, srv, path, opts):
                 "link": link, "broken": broken, "attempt": attempt,
                 "retries": session.retries, "reconnects": session.reconnects,
                 "refusal": session.refusal(), "last_error": session.last_error,
+                "rcfile": session.rcfile_path,
             })
             return
         if op == "stop":
+            session.stopping.set()
+            session.cleanup_rcfiles()
             state["stop"] = True
             _reply(conn, {"ok": True})
             return
@@ -4479,6 +4525,7 @@ def _session_serve(session, srv, path, opts):
         except OSError:
             pass
         session.stopping.set()            # stop a reconnect run mid-backoff
+        session.cleanup_rcfiles()
         try:
             session.chan.close()
         except Exception:
@@ -4525,6 +4572,7 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
     once the session is up does this detach for good.
     """
     clients = []
+    session = None
     try:
         clients, transport, chan, mark = _open_shell(jumps, target, opts)
         prompt_re = re.compile(opts.prompt.encode("utf-8")) if opts.prompt else None
@@ -4534,9 +4582,8 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
                            transport, opts.timeout)
         session.arm(name, jumps, clients, opts)
         banner = session.setup(opts.wait)
-        _source_rcfile(transport, chan,
-                       session.rcfile_data if session.mode == "shell" else None,
-                       opts.timeout)
+        if session.mode == "shell":
+            session.setup_rcfile()
     except SystemExit as exc:
         # A SystemExit carries its own message and nothing has printed it yet
         # -- raising it is how mssh reports a failed hop -- so print it here,
@@ -4548,6 +4595,8 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
             sys.stderr.write(message + "\n")
             sys.stderr.flush()
         _ready(readyfd, {"ok": False})
+        if session is not None:
+            session.cleanup_rcfiles()
         close_all(clients)
         return 1
     except BaseException as exc:
@@ -4557,6 +4606,8 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
                          % (name, type(exc).__name__, exc))
         sys.stderr.flush()
         _ready(readyfd, {"ok": False})
+        if session is not None:
+            session.cleanup_rcfiles()
         close_all(clients)
         return 1
 
@@ -4818,12 +4869,14 @@ def run_session_status(name):
         "target:   %s\n"
         "mode:     %s\n"
         "program:  %s\n"
+        "rcfile:   %s\n"
         "uptime:   %s\n"
         "commands: %d\n"
         "state:    %s\n"
         "pid:      %d\n"
         % (name, info.get("target", "?"), info.get("mode", "?"),
            info.get("command") or "login shell",
+           info.get("rcfile") or "none",
            _uptime(time.time() - float(info.get("started") or time.time())),
            int(info.get("served") or 0),
            "running a command" if info.get("running") else "idle",
@@ -5301,9 +5354,9 @@ def build_parser():
     )
     parser.add_argument(
         "--rcfile", metavar="FILE",
-        help="upload a local shell script to a private target /tmp directory, "
-             "source it silently in each new shell, then delete it; applies "
-             "to logins and shell sessions, including reconnects",
+        help="upload a local shell script to a private target /tmp file and "
+             "source it silently; sessions retain it for logins, reupload on "
+             "reconnect and remove it on stop; direct logins remove it after source",
     )
     parser.add_argument(
         "-i", "--identity", action="append", metavar="KEYFILE",

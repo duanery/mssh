@@ -5,7 +5,6 @@ import io
 import os
 import re
 import shlex
-import shutil
 import socket
 import tempfile
 import unittest
@@ -52,9 +51,14 @@ class TestRcfile(unittest.TestCase):
     def tearDown(self):
         self.transport.close()
         for path in re.findall(
-                rb"\. (/tmp/mssh-rc\.[A-Za-z0-9]+)/rc",
+                rb"\. (/tmp/mssh-rc\.[A-Za-z0-9]+)",
                 b"".join(self.transport.sent)):
-            shutil.rmtree(path.decode("ascii"), ignore_errors=True)
+            try:
+                os.unlink(path.decode("ascii"))
+            except IsADirectoryError:
+                os.rmdir(path.decode("ascii"))
+            except FileNotFoundError:
+                pass
         self.temp.cleanup()
 
     def shell(self, pty=False):
@@ -79,7 +83,7 @@ class TestRcfile(unittest.TestCase):
         ).encode()
 
     def assert_cleaned(self):
-        paths = re.findall(rb"\. (/tmp/mssh-rc\.[A-Za-z0-9]+)/rc",
+        paths = re.findall(rb"\. (/tmp/mssh-rc\.[A-Za-z0-9]+)",
                            b"".join(self.transport.sent))
         self.assertTrue(paths)
         for directory in paths:
@@ -134,11 +138,44 @@ class TestRcfile(unittest.TestCase):
         self.assertEqual(len(self.transport.commands), 2)
 
     def test_cleanup_failure_is_reported(self):
-        script = b'command touch "$(dirname "${BASH_SOURCE}")/extra"\n'
+        script = (b'command rm -f "${BASH_SOURCE}"\n'
+                  b'command mkdir "${BASH_SOURCE}"\n')
         chan = self.transport.open_session()
         chan.exec_command("exec /bin/bash --noprofile --norc")
         with self.assertRaisesRegex(RuntimeError, "could not remove"):
             mssh._source_rcfile(self.transport, chan, script, 5)
+
+    def test_retained_file_sources_without_upload(self):
+        path = mssh._upload_rcfile(self.transport, b"export RC_VALUE=retained\n", 5)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        for _ in range(2):
+            chan = self.shell()
+            count = len(self.transport.commands)
+            mssh._source_rcfile(self.transport, chan, None, 5, remote_path=path)
+            self.assertEqual(len(self.transport.commands), count)
+            self.assertTrue(os.path.isfile(path))
+
+    def test_session_reupload_and_cleanup(self):
+        chan = self.shell()
+        session = mssh._Session(chan, "__test__", "shell", None, 0.4,
+                                "localhost", None, self.transport, 5)
+        session.rcfile_data = b"export RC_VALUE=retained\n"
+        session.setup_rcfile()
+        first = session.rcfile_path
+        replacement = self.shell()
+        with mock.patch.object(mssh, "_open_shell",
+                               return_value=([], self.transport, replacement,
+                                             "__test_reconnected__")):
+            self.assertTrue(session.rebuild(), session.last_error)
+        second = session.rcfile_path
+        self.assertNotEqual(first, second)
+        self.assertTrue(os.path.isfile(first))
+        self.assertTrue(os.path.isfile(second))
+        session.cleanup_rcfiles()
+        self.assertFalse(os.path.exists(first))
+        self.assertFalse(os.path.exists(second))
 
     def test_no_rcfile_opens_no_upload_channel(self):
         self.assertEqual(mssh._source_rcfile(
