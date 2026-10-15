@@ -2111,7 +2111,11 @@ SESSION_IN_PATH = "/tmp/.mssh-in-%s"
 # one-shot token instead of a status, so it cannot be confused with the frame
 # of the command that was abandoned, however late that one arrives.
 SESSION_RESYNC = 'printf \'\\n%%s%s\\n\' "$__M"\n'
-SESSION_SETUP = "unset PS1 PS2 PROMPT_COMMAND; __M='%s'\n"
+SESSION_SETUP = (
+    "unset PS1 PS2 PROMPT_COMMAND; "
+    "unset TMOUT 2>/dev/null || :; "
+    "__M='%s'\n"
+)
 
 # Only the tail of the buffer is tested against --prompt: a prompt is short,
 # and scanning megabytes of output on every poll would be quadratic.

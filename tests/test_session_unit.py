@@ -561,6 +561,32 @@ class TestShellSessionLive(unittest.TestCase):
     def tearDownClass(cls):
         cls.sess.chan.close()
 
+    def test_setup_unsets_tmout(self):
+        sess = make_session("env TMOUT=60 /bin/bash --noprofile --norc")
+        try:
+            out, status, timed_out = drain(
+                sess, 'printf "%s\\n" "${TMOUT-unset}"', 5.0)
+            self.assertEqual(out, b"unset\n")
+            self.assertEqual(status, 0)
+            self.assertFalse(timed_out)
+        finally:
+            sess.chan.close()
+
+    def test_setup_tolerates_readonly_tmout_with_errexit(self):
+        command = (
+            "PS1=prompt; PS2=continuation; PROMPT_COMMAND=true; "
+            "readonly TMOUT=60; set -e; "
+            + mssh.SESSION_SETUP % "__readonly_test__"
+            + 'printf "%s:%s:%s:%s:%s\\n" "${PS1-unset}" "${PS2-unset}" '
+            '"${PROMPT_COMMAND-unset}" "$TMOUT" "$__M"'
+        )
+        proc = subprocess.run(
+            ["/bin/bash", "--noprofile", "--norc", "-c", command],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"unset:unset:unset:60:__readonly_test__\n")
+        self.assertEqual(proc.stderr, b"")
+
     def test_awkward_inputs(self):
         for cmd, want_status, want_text in AWKWARD:
             out, status, timed_out = drain(self.sess, cmd, 10.0)
