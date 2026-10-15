@@ -99,6 +99,22 @@ mssh --rcfile ./init.sh -j ops@10.0.0.1 root@10.0.0.9
 mssh --session web --rcfile ./init.sh root@10.0.0.9
 ```
 
+The bundled `mssh.rc` provides a minimal default initialization script.
+It is opt-in, not automatically loaded:
+
+```bash
+mssh --rcfile ./mssh.rc root@10.0.0.9
+mssh --session web --rcfile ./mssh.rc root@10.0.0.9
+```
+
+It exports `MSSH=1` to identify an initialized mssh shell,
+`MSSH_RC_LOADED=1` to indicate the script was loaded, and
+`MSSH_RC_VERSION=1` to identify the bundled script format. These are
+informational markers, not authentication or proof of session identity.
+It also unsets writable `TMOUT`, silently tolerating a read-only variable.
+The script leaves PATH, prompts, history settings and working directory
+unchanged, and can be customized for the target environment.
+
 Variables, functions, shell options and working-directory changes remain in
 that shell. For example, `init.sh` can contain:
 

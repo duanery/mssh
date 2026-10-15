@@ -1,0 +1,8 @@
+# Optional remote shell initialization: mssh --rcfile ./mssh.rc HOST
+
+export MSSH=1
+export MSSH_RC_LOADED=1
+export MSSH_RC_VERSION=1
+
+# Read-only timeouts remain effective; do not interrupt shell initialization.
+unset TMOUT 2>/dev/null || :

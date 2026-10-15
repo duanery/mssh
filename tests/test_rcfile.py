@@ -6,11 +6,14 @@ import os
 import re
 import shlex
 import socket
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
 from fakechain import FakeClient, mssh
+
+DEFAULT_RC = os.path.join(os.path.dirname(os.path.dirname(__file__)), "mssh.rc")
 
 
 class RecordingTransport:
@@ -181,6 +184,48 @@ class TestRcfile(unittest.TestCase):
         self.assertEqual(mssh._source_rcfile(
             self.transport, None, None, 1), b"")
         self.assertEqual(self.transport.commands, [])
+
+    def test_bundled_rc_preserves_shell_settings(self):
+        for shell in ("/bin/sh", "/bin/bash"):
+            for readonly in (False, True):
+                with self.subTest(shell=shell, readonly=readonly):
+                    setup = (
+                        "TMOUT=60; PS1=prompt; HISTCONTROL=ignoredups; "
+                        + ("readonly TMOUT; " if readonly else "")
+                        + "set -e; . " + shlex.quote(DEFAULT_RC)
+                        + '; printf "%s:%s:%s:%s:%s:%s\\n" '
+                        '"$MSSH" "$MSSH_RC_LOADED" "$MSSH_RC_VERSION" '
+                        '"${TMOUT-unset}" "$PS1" "$HISTCONTROL"; '
+                        'test "$PATH" = "$original_path"; '
+                        'test "$PWD" = "$original_pwd"; '
+                        'test "$(sh -c \'printf "%s:%s:%s" "$MSSH" '
+                        '"$MSSH_RC_LOADED" "$MSSH_RC_VERSION"\')" = "1:1:1"'
+                    )
+                    proc = subprocess.run(
+                        [shell, "-c", "original_path=$PATH; original_pwd=$PWD; "
+                         + setup], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    expected = "1:1:1:%s:prompt:ignoredups\n" % (
+                        "60" if readonly else "unset")
+                    self.assertEqual(proc.stdout, expected.encode())
+                    self.assertEqual(proc.stderr, b"")
+
+    def test_bundled_rc_through_upload_and_source(self):
+        with open(DEFAULT_RC, "rb") as source:
+            script = source.read()
+        chan = self.shell()
+        mssh._source_rcfile(self.transport, chan, script, 5)
+        self.assert_cleaned()
+        chan.settimeout(2)
+        chan.sendall(b'printf "%s:%s:%s\\n" "$MSSH" "$MSSH_RC_LOADED" '
+                     b'"$MSSH_RC_VERSION"; exit\n')
+        output = b""
+        while True:
+            chunk = chan.recv(65536)
+            if not chunk:
+                break
+            output += chunk
+        self.assertEqual(output, b"1:1:1\n")
 
     def test_large_script_does_not_travel_through_pty(self):
         chan = self.shell(True)
