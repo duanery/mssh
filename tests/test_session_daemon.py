@@ -75,6 +75,37 @@ class SessionTest(unittest.TestCase):
 
 
 class TestLifecycle(SessionTest):
+    def test_rcfile_initialization_and_login(self):
+        with tempfile.TemporaryDirectory(prefix="mssh-init-") as directory:
+            script = os.path.join(directory, "init.sh")
+            remote_path = os.path.join(directory, "remote-path")
+            with open(script, "w") as source:
+                source.write(
+                    'printf "%%s\\n" "${BASH_SOURCE:-$_}" > "%s"\n'
+                    'export MSSH_RC_VALUE=initialized\n'
+                    'rc_function() { echo rc-function; }\n'
+                    'cd "%s"\n'
+                    'echo hidden-init-output\n'
+                    % (remote_path, directory))
+            self.start("--rcfile", script)
+            with open(remote_path) as record:
+                path = record.read().strip()
+            self.assertFalse(os.path.exists(path))
+            proc = self.send('echo "$MSSH_RC_VALUE"; rc_function; pwd')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout,
+                             ("initialized\nrc-function\n%s\n" % directory).encode())
+            # A fresh login inherits the session's initialization snapshot.
+            proc = run(self.name, input=b'echo "$MSSH_RC_VALUE"; exit\n')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(b"initialized", proc.stdout)
+            self.assertNotIn(b"hidden-init-output", proc.stdout)
+
+    def test_session_runs_a_login_shell(self):
+        self.start()
+        proc = self.send("shopt -q login_shell")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
     def test_start_send_stop(self):
         self.start()
         proc = self.send("echo hello")

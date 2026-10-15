@@ -88,6 +88,53 @@ mssh -j ops@10.0.0.1 root@10.0.0.9 -c 'uptime; df -h'
 `mssh host -c 'cat > /tmp/f' < local` works as you would expect. Add `-t` to
 force a pty for something that insists on one.
 
+### Shell initialization
+
+`--rcfile FILE` reads a local shell script before connecting, uploads it into
+a private directory under the target's `/tmp`, loads it in the new shell with
+`.` (source), then removes the remote file and directory:
+
+```bash
+mssh --rcfile ./init.sh -j ops@10.0.0.1 root@10.0.0.9
+mssh --session web --rcfile ./init.sh root@10.0.0.9
+```
+
+Variables, functions, shell options and working-directory changes remain in
+that shell. For example, `init.sh` can contain:
+
+```sh
+unset TMOUT || return 1
+export EDITOR=vi
+umask 027
+```
+
+Initialization input echoes, markers and script stdout/stderr are hidden;
+the login banner and subsequent prompt are retained. The script reads
+`/dev/null`, so it must not prompt for input. A nonzero return or an
+initialization timeout (using `--timeout`) fails the new shell. Cleanup runs
+in that same shell immediately after the script returns, including a nonzero
+return; no additional cleanup channel is opened. If the script exits or
+replaces the shell, hangs, or the connection is lost, temporary files may remain.
+The target needs a sh-compatible shell, `mktemp`, `cat`, `rm` and `rmdir`;
+SFTP is not required.
+
+On Bash, the initialization command removes only its own in-memory history
+entry before sourcing the script, without disabling subsequent user history.
+Other shells do not have this guarantee. Previously saved initialization
+entries are not removed, and remote audit or custom logging hooks are unaffected.
+
+Shell sessions start a login Bash, falling back to a login `/bin/sh`, so
+remote login profiles run before the local script. Reconnects rerun the
+original script snapshot, not a newly read local file. Fresh logins through
+an existing session also use that snapshot, unless an explicit `--rcfile`
+overrides it for that login. Ordinary commands in an existing session do not
+rerun initialization. `--rcfile` cannot be combined with `-c`, `--exec`, file
+copies or session control operations.
+
+Use only trusted scripts compatible with the target shell. This option does
+not bypass read-only variables or remote auditing. Relative references inside
+the script resolve on the target; neighboring local files are not uploaded.
+
 ## Copying files
 
 The same argument shape as `scp`: `SOURCE... DEST`, where the local side is a

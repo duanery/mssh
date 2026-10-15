@@ -65,6 +65,7 @@ import json
 import os
 import re
 import select
+import shlex
 import signal
 import socket
 import stat as statmod
@@ -1011,7 +1012,7 @@ class _WindowWatcher(object):
         return False
 
 
-def pump(chan, is_tty=False):
+def pump(chan, is_tty=False, initial=b""):
     """Bridge local stdin/stdout/stderr and the remote channel until it closes.
 
     Local stdin is forwarded to the channel, chan.recv() is written to stdout
@@ -1035,6 +1036,9 @@ def pump(chan, is_tty=False):
 
     out = sys.stdout.buffer
     err = sys.stderr.buffer
+    if initial:
+        out.write(initial)
+        out.flush()
     chan.settimeout(0.0)
     infd = stdin_fd()
     ttyfd = infd                      # infd is cleared at EOF; this is not
@@ -1166,6 +1170,136 @@ def pump(chan, is_tty=False):
                 pass
 
 
+def _rc_command(transport, command, timeout, data=b""):
+    """Run a bounded, private command channel, draining both output streams."""
+    chan = transport.open_session(timeout=timeout)
+    deadline = time.monotonic() + max(timeout, 1.0)
+    output = bytearray()
+    pending = memoryview(data)
+    eof = False
+    out_eof = err_eof = False
+    try:
+        chan.exec_command(command)
+        chan.settimeout(0.0)
+        while time.monotonic() < deadline:
+            if pending:
+                try:
+                    sent = chan.send(pending[:65536])
+                except socket.timeout:
+                    sent = None
+                if sent == 0:
+                    raise RuntimeError("the upload channel closed its input")
+                if sent:
+                    pending = pending[sent:]
+            elif not eof:
+                chan.shutdown_write()
+                eof = True
+            while not out_eof and chan.recv_ready():
+                chunk = chan.recv(65536)
+                if not chunk:
+                    out_eof = True
+                    break
+                output.extend(chunk)
+                if len(output) > 65536:
+                    raise RuntimeError("unexpected initialization channel output")
+            while not err_eof and chan.recv_stderr_ready():
+                if not chan.recv_stderr(65536):
+                    err_eof = True
+                    break
+            if chan.exit_status_ready() and (out_eof or not chan.recv_ready()) \
+                    and (err_eof or not chan.recv_stderr_ready()):
+                return bytes(output), chan.recv_exit_status()
+            time.sleep(0.01)
+        raise RuntimeError("initialization command timed out")
+    finally:
+        chan.close()
+
+
+def _source_rcfile(transport, chan, content, timeout, banner_sink=None):
+    """Upload a local snapshot, source it in this shell, and remove it."""
+    if content is None:
+        return b""
+    # The upload owns partial files; the destination shell cleans up after source.
+    upload = (
+        'umask 077; d=$(mktemp -d /tmp/mssh-rc.XXXXXXXXXX) || exit 1; '
+        'trap \'rm -f "$d/rc"; rmdir "$d"\' 0; '
+        'cat > "$d/rc" || exit 1; printf "%s\\n" "$d"; trap - 0'
+    )
+    old_timeout = chan.gettimeout() if hasattr(chan, "gettimeout") else None
+    try:
+        out, status = _rc_command(transport, upload, timeout, content)
+        if status != 0 or not re.fullmatch(
+                rb"/tmp/mssh-rc\.[A-Za-z0-9]+\n", out):
+            raise RuntimeError("could not upload --rcfile to a private directory")
+        directory = out.rstrip(b"\n").decode("ascii")
+        token = os.urandom(16).hex()
+        pattern = re.compile(
+            b"\x1e" + token.encode("ascii") + rb":([0-9]+):([0-9]+)\x1f\r?\n")
+        # Bash records a line before executing it.  Delete only our own entry,
+        # before sourced code or a prompt hook can flush it to HISTFILE.
+        history = (
+            'if [ -n "${BASH_VERSION-}" ]; then '
+            'case "$(builtin history 1 2>/dev/null)" in '
+            '*%s*) builtin history -d "$((HISTCMD - 1))" 2>/dev/null ;; '
+            'esac; fi; ' % token
+        )
+        line = (
+            " " + history + ". %s </dev/null >/dev/null 2>&1; "
+            "__mssh_rc_status=$?; "
+            "command rm -f %s 2>/dev/null && command rmdir %s 2>/dev/null; "
+            "__mssh_rc_cleanup=$?; "
+            "command printf '\\036%%s:%%s:%%s\\037\\n' '%s' "
+            "\"$__mssh_rc_status\" \"$__mssh_rc_cleanup\"; "
+            "unset __mssh_rc_status __mssh_rc_cleanup\n"
+            % (shlex.quote(directory + "/rc"),
+               shlex.quote(directory + "/rc"), shlex.quote(directory), token)
+        ).encode("ascii")
+        deadline = time.monotonic() + max(timeout, 1.0)
+        chan.settimeout(0.05)
+        while line:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("--rcfile initialization timed out")
+            try:
+                sent = chan.send(line)
+            except socket.timeout:
+                continue
+            if not sent:
+                raise RuntimeError("the shell closed during --rcfile initialization")
+            line = line[sent:]
+        tail = b""
+        while time.monotonic() < deadline:
+            if chan.recv_stderr_ready():
+                chan.recv_stderr(65536)
+            try:
+                chunk = chan.recv(65536)
+            except socket.timeout:
+                continue
+            if not chunk:
+                raise RuntimeError("the shell exited during --rcfile initialization")
+            tail += chunk
+            match = pattern.search(tail)
+            if match:
+                status = int(match.group(1))
+                if status:
+                    raise RuntimeError("--rcfile returned exit status %d" % status)
+                if int(match.group(2)):
+                    raise RuntimeError("could not remove the remote --rcfile")
+                before = tail[:match.start()]
+                # Readline can redraw the echo with changed whitespace and
+                # terminal escapes.  The unique token still identifies it.
+                lines = [one for one in before.split(b"\n")
+                         if token.encode("ascii") not in one]
+                banner = b"\n".join(lines)
+                if banner_sink is not None and banner:
+                    banner_sink(banner)
+                    time.sleep(0.2)
+                    return tail[match.end():]
+                return banner + tail[match.end():]
+        raise RuntimeError("--rcfile initialization timed out")
+    finally:
+        chan.settimeout(old_timeout)
+
+
 def run_interactive(client, opts):
     transport = client.get_transport()
     chan = transport.open_session(timeout=opts.timeout)
@@ -1177,16 +1311,26 @@ def run_interactive(client, opts):
                      width=cols, height=rows)
     chan.invoke_shell()
 
-    pump(chan, is_tty=interactive)
+    def show_banner(data):
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
 
-    status = 0
     try:
-        if chan.exit_status_ready():
-            status = chan.recv_exit_status()
-    except Exception:
-        pass
-    chan.close()
-    return status
+        initial = _source_rcfile(transport, chan,
+                                 getattr(opts, "rcfile_data", None), opts.timeout,
+                                 banner_sink=show_banner)
+        pump(chan, is_tty=interactive, initial=initial)
+        status = 0
+        try:
+            if chan.exit_status_ready():
+                status = chan.recv_exit_status()
+        except Exception:
+            pass
+        return status
+    except RuntimeError as exc:
+        raise SystemExit("mssh: %s" % exc)
+    finally:
+        chan.close()
 
 
 def run_command(client, command, opts):
@@ -1893,9 +2037,9 @@ SESSION_TERM = "dumb"
 SESSION_COLS = 200
 SESSION_ROWS = 50
 
-# Shell mode runs bash when the target has it, since the framing below wants
-# a POSIX shell and a login $SHELL could be anything, csh included.
-SESSION_SHELL = '"$(command -v bash 2>/dev/null || echo /bin/sh)"'
+# Shell mode uses a login bash (or sh) so profiles load before initialization.
+# The framing needs a POSIX shell; the account's $SHELL could be csh.
+SESSION_SHELL = '"$(command -v bash 2>/dev/null || echo /bin/sh)" -l'
 
 # How one command is framed in shell mode.  The naive form -- appending
 # "; printf ..." to the user's line -- is broken on ordinary input: 'sleep 1 &',
@@ -2488,6 +2632,7 @@ class _Session(object):
         self.last_error = ""              # what the last attempt died of
         self.notice = None                # owed to the next command
         self.stopping = threading.Event()
+        self.rcfile_data = None
 
     @property
     def pending(self):
@@ -2806,7 +2951,7 @@ class _Session(object):
     # -- a command on a channel of its own --------------------------------
 
     def exec_run(self, line, wait, out_sink, err_sink, in_fd=None, conn=None,
-                 pty=None, control=b"", shell=False):
+                 pty=None, control=b"", shell=False, rcfile_data=None):
         """Run one command on a new channel, outside the session's shell.
 
         Nothing here touches the session's pty: a fresh channel is opened, the
@@ -2870,6 +3015,16 @@ class _Session(object):
             try:
                 if shell:
                     chan.invoke_shell()
+
+                    def show_banner(data):
+                        out_sink.write(data)
+                        out_sink.drain()
+
+                    initial = _source_rcfile(
+                        self.transport, chan,
+                        self.rcfile_data if rcfile_data is None else rcfile_data,
+                        self.timeout, banner_sink=show_banner)
+                    out_sink.write(initial)
                 else:
                     chan.exec_command(line)
             except Exception as exc:
@@ -3231,6 +3386,7 @@ class _Session(object):
     def arm(self, name, jumps, clients, opts):
         """Keep what a reconnect would need; harmless when it never happens."""
         self.name = name
+        self.rcfile_data = getattr(opts, "rcfile_data", None)
         self.jumps = list(jumps)
         self.chain = clients
         self.retries = max(0, int(getattr(opts, "reconnect", 0) or 0))
@@ -3384,6 +3540,8 @@ class _Session(object):
             self.abort.clear()
             try:
                 self.setup(self.setup_wait)
+                _source_rcfile(self.transport, self.chan,
+                               self.rcfile_data, self.timeout)
             except BaseException as exc:
                 # The hops answered but the shell behind them did not; put
                 # back what was there and let the next attempt try again.
@@ -4245,10 +4403,13 @@ def _session_serve(session, srv, path, opts):
             if pty is not None and not isinstance(pty, dict):
                 pty = {}
             try:
+                rcfile_data = req.get("rcfile")
+                if rcfile_data is not None:
+                    rcfile_data = base64.b64decode(rcfile_data, validate=True)
                 status, timed_out = session.exec_run(
                     req.get("line", ""), wait, out_sink, err_sink,
                     in_fd=in_fd, conn=conn, pty=pty, control=rest,
-                    shell=bool(req.get("shell")))
+                    shell=bool(req.get("shell")), rcfile_data=rcfile_data)
             except _SessionDead as exc:
                 # A channel that could not be opened says nothing about the
                 # session's own shell, which is a different channel and may
@@ -4373,6 +4534,9 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
                            transport, opts.timeout)
         session.arm(name, jumps, clients, opts)
         banner = session.setup(opts.wait)
+        _source_rcfile(transport, chan,
+                       session.rcfile_data if session.mode == "shell" else None,
+                       opts.timeout)
     except SystemExit as exc:
         # A SystemExit carries its own message and nothing has printed it yet
         # -- raising it is how mssh reports a failed hop -- so print it here,
@@ -4558,6 +4722,8 @@ def run_session_send(name, line, opts, shell=False):
                "line": line, "wait": opts.wait}
     if shell:
         request["shell"] = True
+        if getattr(opts, "rcfile_data", None) is not None:
+            request["rcfile"] = base64.b64encode(opts.rcfile_data).decode("ascii")
     if with_stdin:
         request["stdin"] = True
     if want_pty:
@@ -4852,6 +5018,9 @@ def run_session(parser, opts):
                 "it, --stop to end it" % name
             )
         try:
+            if opts.rcfile and not login:
+                parser.error("--rcfile initializes a new shell, not a command "
+                             "in an existing session")
             if login:
                 # A channel of its own, not the session's shell: that shell is
                 # busy being a session -- the framing around every command is
@@ -5131,6 +5300,12 @@ def build_parser():
         help="run CMD on the target and exit instead of opening a shell",
     )
     parser.add_argument(
+        "--rcfile", metavar="FILE",
+        help="upload a local shell script to a private target /tmp directory, "
+             "source it silently in each new shell, then delete it; applies "
+             "to logins and shell sessions, including reconnects",
+    )
+    parser.add_argument(
         "-i", "--identity", action="append", metavar="KEYFILE",
         help="private key file to authenticate with, e.g. ~/.ssh/id_rsa; "
              "repeat to offer several. Applies to every hop. Prompts once "
@@ -5380,6 +5555,16 @@ def main(argv=None):
     head, command = _split_command(parser, list(argv))
     opts = parse_cli(parser, head)
     opts.args = list(opts.args) + command
+    opts.rcfile_data = None
+    if opts.rcfile:
+        if opts.command or opts.copy_id is not None or opts.sessions \
+                or opts.stop or opts.interrupt or opts.status or opts.exec_channel:
+            parser.error("--rcfile only applies to logins and shell session creation")
+        try:
+            with open(os.path.expanduser(opts.rcfile), "rb") as source:
+                opts.rcfile_data = source.read()
+        except OSError as exc:
+            parser.error("cannot read --rcfile %r: %s" % (opts.rcfile, exc))
 
     # --session is optional once the session exists: a session's name is also
     # the name of the machine it reached, so 'mssh host', 'mssh host cmd' and
@@ -5445,6 +5630,8 @@ def main(argv=None):
     # One positional is a login target; several mean a copy, and then the
     # target is whichever host the remote paths name.
     opts.paths = opts.args if len(opts.args) > 1 else []
+    if opts.rcfile and opts.paths:
+        parser.error("--rcfile cannot be combined with a file copy")
     plan = None
 
     if not opts.paths:
