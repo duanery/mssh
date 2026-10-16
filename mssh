@@ -2562,6 +2562,42 @@ class _InteractiveFramer(object):
         return (130, False)
 
 
+def _close_session_channel(chan):
+    """Close a session channel without stranding its transport on EBADF.
+
+    Channel.fileno() creates an OS pipe for select() and installs its
+    notifications on both receive buffers. The transport thread calls
+    BufferedPipe.feed(), which signals that pipe when remote data arrives.
+
+    In affected Paramiko versions, Channel.close() calls PosixPipe.close(),
+    which closes the file descriptors before setting its _closed flag. During
+    that interval, a concurrent feed() can call PosixPipe.set(), observe
+    _closed as False, and write to an already closed descriptor. The resulting
+    OSError escapes into Transport.run(), ending the shared SSH connection,
+    not just the SFTP/exec channel being cancelled.
+
+    Replace both receive notifications before closing the channel. Each
+    BufferedPipe.set_event() holds the same buffer lock as feed()/read(),
+    so it waits for any existing notification to finish; future notifications
+    use an ordinary Event with no OS descriptor to close. This is a local
+    compatibility workaround, not a global Paramiko patch or error suppression.
+    It does not address the client's separate SFTP prefetch cancellation.
+    """
+    if isinstance(chan, paramiko.Channel):
+        # Match fileno()/_set_closed(): channel lock, then buffer locks.
+        # Both stdout and stderr can signal the same pipe, so detach both.
+        # Use real Events: set_event(None) is not supported by Paramiko.
+        with chan.lock:
+            chan.in_buffer.set_event(threading.Event())
+            chan.in_stderr_buffer.set_event(threading.Event())
+        # Channel.close() acquires the non-reentrant channel lock itself.
+        # Keep its normal EOF/CLOSE packets, waiter notifications and pipe
+        # cleanup; only the buffers' notification destinations have changed.
+        # The caller must not resume polling/using this channel after closing.
+    # Test channels and other adapters retain their own close semantics.
+    chan.close()
+
+
 class _ExecJob(object):
     """One command running on a channel of its own, outside the session shell.
 
@@ -2578,7 +2614,7 @@ class _ExecJob(object):
         self.aborted = True
         _session_log("channel.abort", chan=self.chan)
         try:
-            self.chan.close()
+            _close_session_channel(self.chan)
         except Exception as exc:
             _session_log("channel.abort_failed", logging.ERROR,
                          chan=self.chan, exc=exc)
@@ -3046,7 +3082,7 @@ class _Session(object):
             except Exception as exc:
                 _session_log("stdin.channel_failed", logging.ERROR,
                              self, chan, exc)
-                chan.close()
+                _close_session_channel(chan)
                 raise _SessionDead("stdin channel failed: %s" % exc)
             if not data:
                 break
@@ -3061,7 +3097,7 @@ class _Session(object):
                     err = chan.recv_stderr(200)
             except Exception as exc:
                 _session_log("stdin.stderr_failed", logging.DEBUG, self, chan, exc)
-            chan.close()
+            _close_session_channel(chan)
             raise _SessionDead(
                 "could not set up a stdin channel on the target (mkfifo in "
                 "/tmp must work)%s" % (": %s" % err.decode("utf-8", "replace").strip()
@@ -3079,7 +3115,7 @@ class _Session(object):
         except Exception as exc:
             _session_log("stdin.shutdown_failed", logging.DEBUG, chan=chan, exc=exc)
         try:
-            chan.close()
+            _close_session_channel(chan)
         except Exception as exc:
             _session_log("stdin.close_failed", logging.WARNING, chan=chan, exc=exc)
 
@@ -3177,7 +3213,7 @@ class _Session(object):
                 self.execs.discard(job)
             try:
                 _session_log("exec.closing", session=self, chan=chan)
-                chan.close()
+                _close_session_channel(chan)
             except Exception as exc:
                 _session_log("exec.close_failed", logging.ERROR, self, chan, exc)
             _session_log("exec.closed", session=self, chan=chan)
@@ -4553,7 +4589,7 @@ def _session_serve(session, srv, path, opts):
                 if chan is not None:
                     _session_log("sftp.closing", session=session, chan=chan)
                     try:
-                        chan.close()
+                        _close_session_channel(chan)
                     except Exception as exc:
                         _session_log("sftp.close_failed", logging.ERROR,
                                      session, chan, exc)
@@ -4853,7 +4889,7 @@ def _session_serve(session, srv, path, opts):
         session.stopping.set()            # stop a reconnect run mid-backoff
         session.cleanup_rcfiles()
         try:
-            session.chan.close()
+            _close_session_channel(session.chan)
         except Exception as exc:
             _session_log("daemon.shell_close_failed", logging.WARNING,
                          session, session.chan, exc)

@@ -367,9 +367,11 @@ variables and `~` are not expanded. The target must provide SFTP.
 Transfers use their own channel and can run alongside shell commands or
 other transfers, including in a session holding an interactive program.
 An interrupted download removes its partial local file. `--interrupt`
-also stops active transfer channels. Repeated cancellation can trigger
-a Paramiko channel-close race that disconnects the session; cancellation
-hardening is not included in this initial implementation.
+also stops active transfer channels. Session channels detach their receive
+notifications before closing, preventing late remote data from writing to
+a closed Paramiko event pipe and disconnecting the shared transport.
+Client-side prefetch cancellation hardening remains separate work; some
+Paramiko versions can still print a background-thread traceback on Ctrl-C.
 Connection failures are reported without automatically retrying transfers.
 `--timeout` bounds socket inactivity, not total transfer duration.
 
