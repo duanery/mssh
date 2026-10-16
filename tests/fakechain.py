@@ -152,6 +152,13 @@ class _PtyChan(FakeChan):
         """
         self.exec_command("exec /bin/sh")
 
+    def invoke_subsystem(self, name):
+        if name != "sftp":
+            raise ValueError("unknown subsystem")
+        if os.environ.get("MSSH_FAKE_NO_SFTP"):
+            raise RuntimeError("target has no sftp subsystem")
+        self.exec_command("exec /usr/libexec/openssh/sftp-server")
+
     def exec_command(self, command):
         if self.want_pty:
             self.pid, self.fd = os.forkpty()

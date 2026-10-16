@@ -346,6 +346,33 @@ immediately, as it always has.
 
 ### Borrowing the connection without the shell
 
+Files can also use the existing session's connection, without rebuilding
+the jump chain or authenticating again:
+
+```bash
+mssh web --put ./app.conf /tmp/app.conf
+mssh web --get /var/log/app.log ./app.log
+mssh web -r -p --put ./release /tmp/
+mssh --session web --get /tmp/app.conf ./app.conf
+```
+
+`--put LOCAL REMOTE` and `--get REMOTE LOCAL` transfer one file or tree.
+An existing destination directory receives the source's basename. `-r`
+allows directories and `-p` preserves permissions and timestamps, following
+the normal copy rules. Progress goes to stderr when it is a terminal.
+Remote paths are SFTP paths: relative paths start at the SFTP subsystem's
+initial directory, not the persistent shell's current directory; shell
+variables and `~` are not expanded. The target must provide SFTP.
+
+Transfers use their own channel and can run alongside shell commands or
+other transfers, including in a session holding an interactive program.
+An interrupted download removes its partial local file. `--interrupt`
+also stops active transfer channels. Repeated cancellation can trigger
+a Paramiko channel-close race that disconnects the session; cancellation
+hardening is not included in this initial implementation.
+Connection failures are reported without automatically retrying transfers.
+`--timeout` bounds socket inactivity, not total transfer duration.
+
 Plenty of commands want the chain but nothing else: a `grep` over a log, a
 `systemctl status`, a `cat` of a config. `--exec` runs those on a channel of
 their own instead of in the session's shell.

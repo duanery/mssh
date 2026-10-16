@@ -4032,6 +4032,75 @@ def session_exec(name, payload, send_stdin=False, watcher=None):
                           send_stdin=send_stdin, watcher=watcher)
 
 
+class _SessionSFTPChannel(object):
+    """A local duplex socket relayed to an SFTP channel on the held transport."""
+
+    def __init__(self, sock, control):
+        self.sock = sock
+        self.control = control
+
+    def send(self, data):
+        return self.sock.send(data)
+
+    def recv(self, size):
+        return self.sock.recv(size)
+
+    def settimeout(self, timeout):
+        self.sock.settimeout(timeout)
+
+    def get_name(self):
+        return "session-sftp"
+
+    def close(self):
+        self.sock.close()
+        self.control.close()
+
+
+def open_session_sftp(name, timeout):
+    control = _connect_session(name, timeout)
+    local, remote = socket.socketpair()
+    channel = _SessionSFTPChannel(local, control)
+    try:
+        request = b'{"op":"sftp"}\n'
+        sent = control.sendmsg(
+            [request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                         array.array("i", [remote.fileno()]).tobytes())])
+        control.sendall(request[sent:])
+        remote.close()
+        reply = b""
+        while b"\n" not in reply:
+            chunk = control.recv(65536)
+            if not chunk:
+                raise RuntimeError("session daemon closed the SFTP request")
+            reply += chunk
+        info = _parse_reply(name, reply.split(b"\n", 1)[0])
+        if info.get("error"):
+            raise RuntimeError(info["error"])
+        if not info.get("ok"):
+            raise RuntimeError("session daemon did not open an SFTP channel")
+        local.settimeout(timeout)
+        return paramiko.SFTPClient(channel)
+    except BaseException:
+        channel.close()
+        raise
+    finally:
+        remote.close()
+
+
+def run_session_copy(name, opts):
+    paths = opts.put if opts.put is not None else opts.get
+    direction = "up" if opts.put is not None else "down"
+
+    class Client:
+        def open_sftp(self):
+            return open_session_sftp(name, opts.timeout)
+
+    try:
+        return run_copy(Client(), (direction, [paths[0]], paths[1], None), opts)
+    except (RuntimeError, socket.error, OSError) as exc:
+        raise SystemExit("mssh: session %s: file transfer failed: %s" % (name, exc))
+
+
 def session_alive(name):
     try:
         session_request(name, {"op": "status"}, timeout=10.0)
@@ -4250,7 +4319,7 @@ def _session_serve(session, srv, path, opts):
                     os.close(fd)
 
         op = req.get("op")
-        if op not in ("send", "exec"):
+        if op not in ("send", "exec", "sftp"):
             drop()
         if op == "status":
             # Answered whatever state the link is in: a session whose target
@@ -4273,7 +4342,7 @@ def _session_serve(session, srv, path, opts):
             state["stop"] = True
             _reply(conn, {"ok": True})
             return
-        if op not in ("send", "exec", "interrupt"):
+        if op not in ("send", "exec", "interrupt", "sftp"):
             _reply(conn, {"error": "mssh: unknown request %r" % (op,)})
             return
         if session.dead:
@@ -4292,6 +4361,42 @@ def _session_serve(session, srv, path, opts):
             if fatal:
                 die(message)
             _reply(conn, {"error": message})
+            return
+
+        if op == "sftp":
+            fd = take(0)
+            if fd is None:
+                _reply(conn, {"error": "mssh: SFTP request needs a duplex socket"})
+                return
+            chan = None
+            job = None
+            try:
+                chan = session.transport.open_session(timeout=session.timeout)
+                chan.settimeout(session.timeout)
+                job = _ExecJob(chan)
+                with session.execs_lock:
+                    session.execs.add(job)
+                chan.invoke_subsystem("sftp")
+                os.set_blocking(fd, False)
+                sink = _FdSink(fd)
+                _notify(conn, {"ok": True})
+                session._pump_exec(job, sink, _BufSink(), float("inf"),
+                                   in_fd=fd, conn=conn)
+                sink.drain()
+            except _ClientGone:
+                pass
+            except Exception as exc:
+                if session.link_down():
+                    session.failed(str(exc))
+                _reply(conn, {"error": "mssh: cannot open or relay SFTP: %s" % exc})
+            finally:
+                if job is not None:
+                    with session.execs_lock:
+                        session.execs.discard(job)
+                if chan is not None:
+                    chan.close()
+                os.close(fd)
+                session.last = time.time()
             return
 
         if op == "interrupt":
@@ -5013,7 +5118,8 @@ def _session_login_wanted(opts):
     """
     if not opts.session:
         return False
-    if opts.args or opts.command or opts.jump or opts.copy_id is not None:
+    if opts.args or opts.command or opts.jump or opts.copy_id is not None \
+            or opts.put is not None or opts.get is not None:
         return False
     return not (opts.stop or opts.interrupt or opts.status)
 
@@ -5026,6 +5132,22 @@ def run_session(parser, opts):
                      "A-Z a-z 0-9 . _ - starting with a letter, digit or _"
                      % name)
         return 2
+
+    if opts.put is not None or opts.get is not None:
+        if opts.args or opts.command or opts.jump or opts.copy_id is not None \
+                or opts.rcfile or opts.exec_channel or opts.force_tty \
+                or opts.stop or opts.interrupt or opts.status or opts.reconnect \
+                or opts.prompt is not None:
+            parser.error("--put/--get only combine with file-copy options "
+                         "and an existing session name")
+        if not all(opts.put if opts.put is not None else opts.get):
+            parser.error("--put/--get require nonempty source and destination paths")
+        if not session_alive(name):
+            _no_session(name)
+        try:
+            return run_session_copy(name, opts)
+        except SessionGone:
+            _no_session(name)
 
     controls = [flag for flag in ("stop", "interrupt", "status")
                 if getattr(opts, flag)]
@@ -5497,6 +5619,17 @@ def build_parser():
              "commands can run at once.  Use it for the many commands that "
              "need the chain but no context",
     )
+    copies = group.add_mutually_exclusive_group()
+    copies.add_argument(
+        "--put", nargs=2, metavar=("LOCAL", "REMOTE"),
+        help="upload a local file or directory through an existing session; "
+             "supports -r and -p",
+    )
+    copies.add_argument(
+        "--get", nargs=2, metavar=("REMOTE", "LOCAL"),
+        help="download a remote file or directory through an existing session; "
+             "supports -r and -p",
+    )
     group.add_argument(
         "--idle", type=float, default=DEFAULT_SESSION_IDLE, metavar="SEC",
         help="without --prompt, how long output must pause before it counts "
@@ -5617,6 +5750,9 @@ def _split_command(parser, argv):
         if token.startswith("-") and token != "-":
             if token.split("=")[0] in flags:
                 return argv, []
+            if token in ("--put", "--get"):
+                index += 3
+                continue
             index += 2 if _takes_value(parser, token) else 1
             continue
         if first is None:
@@ -5671,6 +5807,8 @@ def main(argv=None):
             else DEFAULT_SESSION_WAIT
 
     if opts.sessions:
+        if opts.put is not None or opts.get is not None:
+            parser.error("--put/--get require an existing session")
         if opts.session or opts.args:
             parser.error("--sessions lists sessions and exits; it takes no "
                          "other arguments")
@@ -5679,6 +5817,10 @@ def main(argv=None):
 
     if opts.session:
         return run_session(parser, opts)
+
+    if opts.put is not None or opts.get is not None:
+        parser.error("--put/--get require an existing session: "
+                     "mssh NAME --put LOCAL REMOTE")
 
     for flag in ("stop", "interrupt", "status"):
         if getattr(opts, flag):
