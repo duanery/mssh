@@ -131,7 +131,12 @@ initialization timeout (using `--timeout`) fails the new shell. Cleanup runs
 in that same shell for direct logins immediately after the script returns,
 including a nonzero return; no additional cleanup channel is opened. If the script exits or
 replaces the shell, hangs, or the connection is lost, temporary files may remain.
-The target needs a sh-compatible shell, `mktemp`, `cat` and `rm`;
+Remote artifacts share the naming convention `/tmp/.mssh-<kind>-<random>`:
+`rc` for initialization files and `in` for stdin FIFOs. Names use locally
+generated 16-character suffixes using ASCII letters (both cases) and digits.
+Files and FIFOs are created exclusively with mode
+0600, so an existing path is not overwritten.
+The target needs a sh-compatible shell, `cat` and `rm`;
 SFTP is not required.
 
 On Bash, the initialization command removes only its own in-memory history

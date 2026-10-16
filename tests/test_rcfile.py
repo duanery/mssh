@@ -54,7 +54,7 @@ class TestRcfile(unittest.TestCase):
     def tearDown(self):
         self.transport.close()
         for path in re.findall(
-                rb"\. (/tmp/mssh-rc\.[A-Za-z0-9]+)",
+                rb"\. (/tmp/\.mssh-rc-[A-Za-z0-9]+)",
                 b"".join(self.transport.sent)):
             try:
                 os.unlink(path.decode("ascii"))
@@ -86,7 +86,7 @@ class TestRcfile(unittest.TestCase):
         ).encode()
 
     def assert_cleaned(self):
-        paths = re.findall(rb"\. (/tmp/mssh-rc\.[A-Za-z0-9]+)",
+        paths = re.findall(rb"\. (/tmp/\.mssh-rc-[A-Za-z0-9]+)",
                            b"".join(self.transport.sent))
         self.assertTrue(paths)
         for directory in paths:
@@ -185,6 +185,25 @@ class TestRcfile(unittest.TestCase):
             self.transport, None, None, 1), b"")
         self.assertEqual(self.transport.commands, [])
 
+    def test_remote_temp_paths_share_naming_and_randomness(self):
+        for kind in ("in", "rc"):
+            paths = [mssh._remote_temp_path(kind) for _ in range(10)]
+            self.assertEqual(len(set(paths)), len(paths))
+            for path in paths:
+                self.assertRegex(path, r"\A/tmp/\.mssh-%s-[A-Za-z0-9]{16}\Z" % kind)
+        with self.assertRaises(ValueError):
+            mssh._remote_temp_path("../escape")
+
+    def test_upload_collision_preserves_existing_file(self):
+        path = os.path.join(self.temp.name, "existing")
+        with open(path, "wb") as existing:
+            existing.write(b"keep-original")
+        with mock.patch.object(mssh, "_remote_temp_path", return_value=path):
+            with self.assertRaisesRegex(RuntimeError, "could not upload"):
+                mssh._upload_rcfile(self.transport, b"replacement", 5)
+        with open(path, "rb") as existing:
+            self.assertEqual(existing.read(), b"keep-original")
+
     def test_bundled_rc_preserves_shell_settings(self):
         for shell in ("/bin/sh", "/bin/bash"):
             for readonly in (False, True):
@@ -258,7 +277,7 @@ class TestRcfile(unittest.TestCase):
                 except socket.timeout:
                     self.fail("Up arrow did not recall the user command: %r"
                               % recalled)
-                self.assertNotIn(b"mssh-rc.", recalled)
+                self.assertNotIn(b".mssh-rc-", recalled)
                 chan.sendall(b"echo new-user-command; exit\n")
                 while chan.recv(65536):
                     pass
@@ -267,7 +286,7 @@ class TestRcfile(unittest.TestCase):
                     saved = history.read()
                 self.assertIn("echo old-user-command\n", saved)
                 self.assertIn("echo new-user-command; exit\n", saved)
-                self.assertNotIn("mssh-rc.", saved)
+                self.assertNotIn(".mssh-rc-", saved)
                 self.assertNotIn("builtin history -d", saved)
                 self.assertNotIn("builtin history -a", saved)
 
@@ -324,8 +343,8 @@ class TestRcfile(unittest.TestCase):
                         output, self.output = self.output, b""
                         return output
 
-                with mock.patch.object(mssh, "_rc_command", side_effect=[
-                        (b"/tmp/mssh-rc.abcdef1234\n", 0)]):
+                with mock.patch.object(mssh, "_upload_rcfile",
+                                       return_value="/tmp/.mssh-rc-abcdef1234"):
                     output = mssh._source_rcfile(
                         None, BufferedChan(), b"true\n", 1)
                 self.assertEqual(
@@ -355,8 +374,8 @@ class TestRcfile(unittest.TestCase):
             def recv(self, size):
                 return self.chunks.pop(0)
 
-        with mock.patch.object(mssh, "_rc_command", side_effect=[
-                (b"/tmp/mssh-rc.abcdef1234\n", 0)]):
+        with mock.patch.object(mssh, "_upload_rcfile",
+                               return_value="/tmp/.mssh-rc-abcdef1234"):
             output = mssh._source_rcfile(None, BufferedChan(), b"true\n", 1)
         self.assertEqual(
             output,
@@ -388,8 +407,8 @@ class TestRcfile(unittest.TestCase):
             def recv(self, size):
                 return self.chunks.pop(0)
 
-        with mock.patch.object(mssh, "_rc_command", side_effect=[
-                (b"/tmp/mssh-rc.abcdef1234\n", 0)]):
+        with mock.patch.object(mssh, "_upload_rcfile",
+                               return_value="/tmp/.mssh-rc-abcdef1234"):
             output = mssh._source_rcfile(None, BufferedChan(), b"true\n", 1)
         self.assertEqual(
             output, b"Last login: yesterday\r\nWelcome to tlinux\r\n")
@@ -414,8 +433,8 @@ class TestRcfile(unittest.TestCase):
                 output, self.output = self.output, b""
                 return output
 
-        with mock.patch.object(mssh, "_rc_command",
-                               return_value=(b"/tmp/mssh-rc.abcdef1234\n", 0)):
+        with mock.patch.object(mssh, "_upload_rcfile",
+                               return_value="/tmp/.mssh-rc-abcdef1234"):
             with mock.patch.object(mssh.time, "sleep",
                                    side_effect=lambda seconds:
                                    events.append(("sleep", seconds))):

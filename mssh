@@ -65,6 +65,7 @@ import json
 import os
 import re
 import select
+import secrets
 import shlex
 import signal
 import socket
@@ -1215,15 +1216,29 @@ def _rc_command(transport, command, timeout, data=b""):
         chan.close()
 
 
+def _remote_temp_path(kind):
+    """One naming and randomness policy for remote session artifacts."""
+    if kind not in ("in", "rc"):
+        raise ValueError("unknown remote temporary file kind: %s" % kind)
+    suffix = "".join(secrets.choice(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        for _ in range(16))
+    return "/tmp/.mssh-%s-%s" % (kind, suffix)
+
+
 def _upload_rcfile(transport, content, timeout):
     """Create one private temporary file, without a containing directory."""
+    path = _remote_temp_path("rc")
+    # Open exclusively before installing cleanup, so a collision is neither
+    # overwritten nor removed.  This command owns a shell separate from the user.
     upload = (
-        'umask 077; f=$(mktemp /tmp/mssh-rc.XXXXXXXXXX) || exit 1; '
+        'umask 077; set -C; f=%s; exec 3> "$f" || exit 1; '
         'trap \'rm -f "$f"\' 0; '
-        'cat > "$f" || exit 1; printf "%s\\n" "$f"; trap - 0'
+        'cat >&3 || exit 1; exec 3>&-; printf "%%s\\n" "$f"; trap - 0'
+        % shlex.quote(path)
     )
     out, status = _rc_command(transport, upload, timeout, content)
-    if status != 0 or not re.fullmatch(rb"/tmp/mssh-rc\.[A-Za-z0-9]+\n", out):
+    if status != 0 or out != path.encode("ascii") + b"\n":
         raise RuntimeError("could not upload --rcfile to a private temporary file")
     return out.rstrip(b"\n").decode("ascii")
 
@@ -2034,15 +2049,15 @@ def run_copy(client, plan, opts):
 # (error text detaches from the output it belongs to), and only a pty gives a
 # working Ctrl-C -- over pipes, signalling the foreground child leaves the
 # shell to run the *rest* of the command list, which is the wrong semantics.
-# The costs are that the pty turns '\n' into '\r\n' (stripped on the way out)
-# and merges stderr into stdout (the exit status, not the stream, is what
-# tells a caller whether a command failed).
+# The pty merges stderr into stdout; the exit status, not the stream, tells
+# a caller whether a command failed.  Disable newline expansion below.
 
 # A dumb terminal keeps programs from emitting colour and cursor escapes, but
 # column-aware ones (ls, ps) still format for the width we claim here.
 SESSION_TERM = "dumb"
 SESSION_COLS = 200
 SESSION_ROWS = 50
+SESSION_STTY = "stty -echo -icanon -onlcr isig intr '^C' min 1 time 0"
 
 # Shell mode uses a login bash (or sh) so profiles load before initialization.
 # The framing needs a POSIX shell; the account's $SHELL could be csh.
@@ -2055,10 +2070,10 @@ SESSION_SHELL = '"$(command -v bash 2>/dev/null || echo /bin/sh)" -l'
 # syntactic position as the command.  Sending the command base64-encoded and
 # unwrapping it remotely puts it inside an eval instead, where none of that can
 # happen.  '</dev/null' is what keeps a bare 'cat' from swallowing the next
-# control line, and $__M holds the marker so the literal marker string never
-# travels the channel and cannot be echoed back by accident.
-SESSION_FRAME = ('eval "$(echo %s | base64 -d)" </dev/null'
-                 ' ; printf \'\\n%%s%%s\\n\' "$__M" "$?"\n')
+# control line.  _Session encodes its local marker as printf escapes, so an
+# echoed control line cannot be mistaken for a completed frame.
+# Former SESSION_FRAME: implemented in _Session.session_frame() with
+# in_path=None, which redirects the command's stdin from /dev/null.
 
 # The same frame, but with local stdin fed to the command:
 # 'echo aa | mssh --session s cat' should behave like 'echo aa | ssh host cat'.
@@ -2079,9 +2094,9 @@ SESSION_FRAME = ('eval "$(echo %s | base64 -d)" </dev/null'
 #     carries every byte as text for the remote shell to decode, measured at
 #     0.4 MiB/s against bash, and it cannot stream -- the command sees nothing
 #     until the last line arrives, so 'tail -f | mssh ...' could not work.
-#   * feeding the pty directly cannot work at all: canonical mode truncates a
-#     line at 4095 bytes and reads control bytes as signals -- measured, a 0x03
-#     in the data killed the program.
+#   * feeding the pty directly cannot work: input still reads control bytes
+#     as signals -- measured, a 0x03 in the
+#     data killed the program even though canonical mode is disabled.
 #
 # The fifo is created by the writer channel, which announces it ('echo R')
 # before blocking on the open; only then is the command framed.  That ordering
@@ -2091,8 +2106,9 @@ SESSION_FRAME = ('eval "$(echo %s | base64 -d)" </dev/null'
 # ends hold the inode: the name goes away at once while the pipe itself lives
 # until both sides close.  Nothing is left on the target even if the daemon is
 # killed mid-command.
-SESSION_FRAME_IN = ('eval "$(echo %s | base64 -d)" < "%s"'
-                    ' ; printf \'\\n%%s%%s\\n\' "$__M" "$?"\n')
+# Former SESSION_FRAME_IN: implemented in _Session.session_frame() with
+# in_path set to the remote fifo path.
+
 # The writer channel's program.  'mkfifo -m 600' before anything else, so the
 # path is never briefly world-writable; the readiness byte then tells the daemon
 # the fifo exists.  'exec cat' replaces the shell so the channel's EOF closes
@@ -2105,16 +2121,14 @@ SESSION_WRITER_READY = b"R"
 # so the *next* command's stdin was delivered to the abandoned reader instead --
 # cmd2's payload landed in cmd1's output file while cmd2 read nothing.  A unique
 # path per send makes that impossible.  mkfifo costs ~5ms.
-SESSION_IN_PATH = "/tmp/.mssh-in-%s"
 
 # Resynchronisation after an interrupt or a timeout: the marker carries a
 # one-shot token instead of a status, so it cannot be confused with the frame
 # of the command that was abandoned, however late that one arrives.
-SESSION_RESYNC = 'printf \'\\n%%s%s\\n\' "$__M"\n'
 SESSION_SETUP = (
     "unset PS1 PS2 PROMPT_COMMAND; "
     "unset TMOUT 2>/dev/null || :; "
-    "__M='%s'\n"
+    "\n"
 )
 
 # Only the tail of the buffer is tested against --prompt: a prompt is short,
@@ -2225,14 +2239,6 @@ def want_stdin(opts, with_pty=False):
     if kind == "tty":
         return bool(with_pty or opts.stdin)
     return kind in ("pipe", "file")
-
-
-def session_frame(line, in_path=None):
-    """The remote text that runs one command and prints its frame marker."""
-    blob = base64.b64encode(line.encode("utf-8")).decode("ascii")
-    if in_path is None:
-        return SESSION_FRAME % blob
-    return SESSION_FRAME_IN % (blob, in_path)
 
 
 def session_dir():
@@ -2696,6 +2702,19 @@ class _Session(object):
 
     # -- framing ----------------------------------------------------------
 
+    def _marker_command(self, token=None):
+        """Print a locally owned marker without exposing it in input echoes."""
+        escaped = "".join("\\%03o" % byte for byte in self.mark)
+        payload = '"$?"' if token is None else shlex.quote(token)
+        return "command printf '\\n%s%%s\\n' %s\n" % (escaped, payload)
+
+    def session_frame(self, line, in_path=None):
+        """Run a command in this shell and report its status with our marker."""
+        blob = base64.b64encode(line.encode("utf-8")).decode("ascii")
+        source = "/dev/null" if in_path is None else shlex.quote(in_path)
+        return ('eval "$(echo %s | base64 -d)" < %s; '
+                % (blob, source)) + self._marker_command()
+
     def _clean(self, line):
         """One line, as the caller should see it."""
         if line.endswith(b"\r"):
@@ -2864,7 +2883,7 @@ class _Session(object):
                 # that queue: measured, the resync line reached the shell as
                 # 'rintf ...', its first byte eaten.  Let the interrupt land.
                 time.sleep(0.3)
-            self._write(SESSION_RESYNC % token.decode("ascii"))
+            self._write(self._marker_command(token.decode("ascii")))
             if self._await_token(token, 20 if attempt == 0 else 10):
                 self.outstanding = 0
                 return
@@ -2912,7 +2931,7 @@ class _Session(object):
         """
         if self.transport is None:
             raise _SessionDead("no transport for a stdin channel")
-        path = SESSION_IN_PATH % os.urandom(8).hex()
+        path = _remote_temp_path("in")
         chan = self.transport.open_session(timeout=self.timeout)
         chan.exec_command(SESSION_WRITER % {"path": path})
 
@@ -3284,7 +3303,7 @@ class _Session(object):
                 # be mixed into ours and its marker would frame us early.
                 self._resync()
             if self.mode == "shell":
-                self._write(session_frame(line, in_path))
+                self._write(self.session_frame(line, in_path))
                 framer = _ShellFramer(self)
             else:
                 self._write(line.rstrip("\r\n") + "\n")
@@ -3360,9 +3379,8 @@ class _Session(object):
             self._pump(_InteractiveFramer(self), sink, time.time() + limit)
             return sink.value()
 
-        self._write(SESSION_SETUP % self.mark.decode("ascii"))
-        blob = base64.b64encode(b"echo ready").decode("ascii")
-        self._write(SESSION_FRAME % blob)
+        self._write(SESSION_SETUP)
+        self._write(self.session_frame("echo ready"))
         self.outstanding = 1
         status, timed_out = self._pump(_ShellFramer(self), sink,
                                        time.time() + wait)
@@ -4548,7 +4566,7 @@ def _open_shell(jumps, target, opts):
 
     The whole of a session's remote half, in one place because a reconnect
     has to do it again exactly as the first call did -- same pty, same
-    'stty -echo', same 'exec' -- and a second copy of it would drift.
+    terminal settings, same 'exec' -- and a second copy of it would drift.
     Returns (clients, transport, chan, mark); the caller owns the clients.
     """
     clients, tgt = build_chain(jumps, target, opts)
@@ -4557,10 +4575,9 @@ def _open_shell(jumps, target, opts):
         chan = transport.open_session(timeout=opts.timeout)
         chan.get_pty(term=SESSION_TERM, width=SESSION_COLS,
                      height=SESSION_ROWS)
-        # 'exec' makes the program the channel's process leader, so a Ctrl-C
-        # written into the pty reaches it; 'stty -echo' stops our own input
-        # from coming straight back as output.
-        chan.exec_command("stty -echo 2>/dev/null; exec "
+        # Keep signals enabled without echo, canonical buffering or CRLF
+        # expansion.  Ctrl-C targets the terminal's foreground process group.
+        chan.exec_command(SESSION_STTY + " 2>/dev/null; exec "
                           + (opts.command or SESSION_SHELL))
     except BaseException:
         close_all(clients)

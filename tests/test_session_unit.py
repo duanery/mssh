@@ -16,6 +16,7 @@ import select
 import socket
 import subprocess
 import sys
+import termios
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -41,7 +42,7 @@ class FakeChan(object):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.execvp("/bin/sh", ["/bin/sh", "-c",
-                                  "stty -echo 2>/dev/null; exec " + program])
+                                  mssh.SESSION_STTY + " 2>/dev/null; exec " + program])
         self._timeout = None
         self.eof = False
 
@@ -380,18 +381,31 @@ class TestStdinKind(unittest.TestCase):
 
 
 class TestFrameBuilder(unittest.TestCase):
+    def setUp(self):
+        self.sess = mssh._Session(None, "__MSSH_test__", "shell", None,
+                                  0.4, "localhost", None)
+
     def test_without_stdin_the_command_reads_devnull(self):
-        frame = mssh.session_frame("echo hi")
+        frame = self.sess.session_frame("echo hi")
         self.assertIn("/dev/null", frame)
         self.assertIn(base64.b64encode(b"echo hi").decode(), frame)
 
     def test_with_stdin_the_command_reads_the_fifo(self):
-        frame = mssh.session_frame("cat", "/tmp/.mssh-in-abc")
-        self.assertIn('< "/tmp/.mssh-in-abc"', frame)
+        frame = self.sess.session_frame("cat", "/tmp/.mssh-in-abc")
+        self.assertIn("< /tmp/.mssh-in-abc", frame)
         self.assertNotIn("/dev/null", frame)
         # The command still travels base64-encoded, so nothing in it can be
         # parsed as part of the framing.
         self.assertIn(base64.b64encode(b"cat").decode(), frame)
+
+    def test_marker_is_local_and_not_literal_in_echo(self):
+        frame = self.sess.session_frame("true")
+        self.assertNotIn("$__M", frame)
+        self.assertNotIn(self.sess.mark.decode(), frame)
+        self.assertIn("\\137", frame)
+        proc = subprocess.run(["/bin/sh", "-c", frame],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(proc.stdout, self.sess.mark.join([b"\n", b"0\n"]))
 
     def test_the_writer_program_creates_then_unlinks_the_fifo(self):
         prog = mssh.SESSION_WRITER % {"path": "/tmp/.mssh-in-xyz"}
@@ -576,16 +590,34 @@ class TestShellSessionLive(unittest.TestCase):
         command = (
             "PS1=prompt; PS2=continuation; PROMPT_COMMAND=true; "
             "readonly TMOUT=60; set -e; "
-            + mssh.SESSION_SETUP % "__readonly_test__"
-            + 'printf "%s:%s:%s:%s:%s\\n" "${PS1-unset}" "${PS2-unset}" '
-            '"${PROMPT_COMMAND-unset}" "$TMOUT" "$__M"'
+            + mssh.SESSION_SETUP
+            + 'printf "%s:%s:%s:%s\\n" "${PS1-unset}" "${PS2-unset}" '
+            '"${PROMPT_COMMAND-unset}" "$TMOUT"'
         )
         proc = subprocess.run(
             ["/bin/bash", "--noprofile", "--norc", "-c", command],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stdout, b"unset:unset:unset:60:__readonly_test__\n")
+        self.assertEqual(proc.stdout, b"unset:unset:unset:60\n")
         self.assertEqual(proc.stderr, b"")
+
+    def test_remote_marker_variable_cannot_break_framing(self):
+        sess = make_session("/bin/bash")
+        try:
+            for command in ("__M=modified; echo first",
+                            "unset __M; echo second",
+                            "readonly __M=locked; echo third"):
+                out, status, timed_out = drain(sess, command, 5.0)
+                self.assertEqual(status, 0)
+                self.assertFalse(timed_out)
+                self.assertIn(command.split("echo ")[-1].encode(), out)
+            sess._resync()
+            out, status, timed_out = drain(sess, "echo recovered", 5.0)
+            self.assertEqual(out, b"recovered\n")
+            self.assertEqual(status, 0)
+            self.assertFalse(timed_out)
+        finally:
+            sess.chan.close()
 
     def test_awkward_inputs(self):
         for cmd, want_status, want_text in AWKWARD:
@@ -781,6 +813,34 @@ class TestShellSessionLive(unittest.TestCase):
         for key, (out, status, want) in results.items():
             self.assertEqual(status, 0, key)
             self.assertEqual(out, want, "%s got %r" % (key, out))
+
+
+class TestSessionTerminal(unittest.TestCase):
+    def test_noncanonical_input_and_lf_output(self):
+        chan = FakeChan("/bin/sh -c 'printf \"ready\\n\"; exec cat'")
+        try:
+            chan.settimeout(2.0)
+            self.assertEqual(chan.recv(65536), b"ready\n")
+            attrs = termios.tcgetattr(chan.fd)
+            self.assertFalse(attrs[3] & termios.ECHO)
+            self.assertFalse(attrs[3] & termios.ICANON)
+            self.assertTrue(attrs[3] & termios.ISIG)
+            self.assertFalse(attrs[1] & termios.ONLCR)
+            self.assertEqual(attrs[6][termios.VINTR], b"\x03")
+            chan.send(b"without-newline")
+            self.assertEqual(chan.recv(65536), b"without-newline")
+        finally:
+            chan.close()
+
+    def test_large_interactive_line_is_not_truncated(self):
+        sess = make_session("cat", mode="interactive", idle=0.1)
+        try:
+            line = "x" * 10000
+            out, status, timed_out = drain(sess, line, 5.0)
+            self.assertEqual(out, line.encode() + b"\n")
+            self.assertFalse(timed_out)
+        finally:
+            sess.chan.close()
 
 
 class TestInteractiveSessionLive(unittest.TestCase):
