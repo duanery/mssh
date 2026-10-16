@@ -497,7 +497,7 @@ can.
 - **`--session-idle SEC`** ends a session after that much quiet, so a forgotten
   one does not hold a root channel open forever. Default `0`: never.
 - The first call keeps your terminal until the chain is up, so a hop that needs
-  a password can still ask for one and `-v` still shows each hop. Only then
+  a password can still ask for one and `-vv` shows each hop. Only then
   does it detach.
 
 Sessions live in `~/.mssh/sessions`, one socket each, mode `0600` inside a
@@ -505,6 +505,51 @@ Sessions live in `~/.mssh/sessions`, one socket each, mode `0600` inside a
 peer whose uid is not yours. **Holding one of those sockets is equivalent to
 being logged in on the target**, so it is guarded like a private key rather
 than like a temp file.
+
+### Daemon diagnostics
+
+Choose the log level when creating a session:
+
+```bash
+mssh --session web -v TARGET     # WARNING and above
+mssh --session web -vv TARGET    # INFO and above
+mssh --session web -vvv TARGET   # DEBUG and above
+```
+
+The same thresholds apply to structured mssh and Paramiko records. Without
+`-v`, logging is disabled. Daemon lifecycle events use INFO; request tracing
+and expected client disconnects use DEBUG. Existing connection progress
+notices are printed with any verbosity flag, independently of these levels.
+
+Startup logs remain on the terminal; after detaching, stderr is appended
+to `~/.mssh/sessions/web.log`, with mode `0600`. Restarting the same session
+appends to that file. Without `-v` at creation, the daemon's stderr goes to
+`/dev/null` and no log file is created. Later client verbosity does not
+change the running daemon's log level.
+
+With any verbosity flag, a stderr notice before detaching names the log
+file. After detaching, the file receives a timestamped service-started
+notice with the PID and configured log level, using the structured log
+format without repeating the path. This startup notice is always emitted,
+even with a single `-v`; its INFO severity does not change the threshold
+for subsequent records.
+
+Structured daemon and Paramiko records include timestamps, severity, PID,
+thread name and session name. Request workers also carry a request ID and
+operation; channel events include channel ID, EOF/closed flags and transport
+state. Events cover startup, requests, shell/exec/SFTP I/O, channel cleanup,
+rcfile cleanup, reconnect attempts and daemon exit.
+
+Failures preserve original exception tracebacks. Paramiko ERROR records
+capture the current exception, and link-failure events also report the
+transport's saved exception without consuming it. This distinguishes a TCP
+failure from an internal channel event-pipe error.
+
+Logging does not change command stdout/stderr forwarding or wire replies.
+Structured events omit command text, stdin and rcfile contents. Exception
+messages, filenames, remote errors and hop diagnostics can still contain
+sensitive information; treat these logs as private. Logs are not
+automatically rotated or deleted by `--stop`.
 
 ## Key setup
 
@@ -555,7 +600,7 @@ points at a specific file.
 | `--no-agent` | Do not use `ssh-agent` |
 | `--no-keys` | Do not look for keys in `~/.ssh` |
 | `--no-prompt` | Never prompt for a password; fail instead |
-| `-v, --verbose` | Log each hop to stderr |
+| `-v, --verbose` | Log to stderr: `-v` WARNING, `-vv` INFO, `-vvv` DEBUG |
 | `-V, --version` | Print the version |
 
 Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,

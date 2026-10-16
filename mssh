@@ -62,6 +62,7 @@ import base64
 import datetime
 import getpass
 import json
+import logging
 import os
 import re
 import select
@@ -817,8 +818,8 @@ def close_all(clients):
     for client in reversed(clients):
         try:
             client.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            _session_log("chain.close_failed", logging.WARNING, exc=exc)
 
 
 # --------------------------------------------------------------------------
@@ -2377,7 +2378,9 @@ class _FdSink(object):
                 sent = os.write(self.wfd, self.buf)
             except BlockingIOError:
                 break                     # the pipe is full; select on it
-            except OSError:
+            except OSError as exc:
+                _session_log("output.write_failed", logging.DEBUG,
+                             exc=exc, fd=self.wfd)
                 # The client died or closed its end.  Drop what is left: there
                 # is nobody to hand it to, and the command still frames on its
                 # own marker.
@@ -2406,7 +2409,9 @@ class _FdSink(object):
             try:
                 if not select.select([], [self.wfd], [], remaining)[1]:
                     break
-            except (select.error, InterruptedError):
+            except (select.error, InterruptedError) as exc:
+                _session_log("output.drain_select_failed", logging.DEBUG,
+                             exc=exc, fd=self.wfd)
                 continue
 
 
@@ -2571,10 +2576,84 @@ class _ExecJob(object):
 
     def abort(self):
         self.aborted = True
+        _session_log("channel.abort", chan=self.chan)
         try:
             self.chan.close()
+        except Exception as exc:
+            _session_log("channel.abort_failed", logging.ERROR,
+                         chan=self.chan, exc=exc)
+
+
+_SESSION_LOG_CONTEXT = threading.local()
+_SESSION_LOG_NAME = None
+_SESSION_LOG_ENABLED = False
+
+
+class _SessionLogFilter(logging.Filter):
+    """Attach daemon context to both mssh and third-party log records."""
+
+    def filter(self, record):
+        # Request context is thread-local; transport threads have only the
+        # session name, while concurrent request workers keep their own IDs.
+        fields = ["session=%s" % (_SESSION_LOG_NAME or "-")]
+        for key in ("request", "op", "channel"):
+            value = getattr(_SESSION_LOG_CONTEXT, key, None)
+            if value is not None:
+                fields.append("%s=%s" % (key, value))
+        # mssh events add state snapshots; Paramiko records lack this field.
+        details = getattr(record, "session_details", "")
+        if details:
+            fields.append(details)
+        record.context = " ".join(fields)
+        # Paramiko logs socket errors inside an except block without exc_info.
+        # Capture here, before Transport.run stores or clears the exception.
+        if record.name.startswith("paramiko") and record.levelno >= logging.ERROR \
+                and record.exc_info is None and sys.exc_info()[0] is not None:
+            record.exc_info = sys.exc_info()
+        return True
+
+
+def _session_log(event, level=logging.INFO, session=None, chan=None,
+                 exc=None, **fields):
+    """Daemon-only structured events; never log commands or protocol payloads."""
+    if not _SESSION_LOG_ENABLED:
+        return
+    logger = logging.getLogger("mssh.session")
+    # Skip state inspection and formatting for events below the threshold.
+    if not logger.isEnabledFor(level):
+        return
+    if chan is not None:
+        fields["channel"] = getattr(chan, "chanid", hex(id(chan)))
+        fields["closed"] = getattr(chan, "closed", None)
+        fields["eof_in"] = getattr(chan, "eof_received", None)
+        fields["eof_out"] = getattr(chan, "eof_sent", None)
+    saved = None
+    if session is not None:
+        transport = session.transport
+        fields["transport"] = hex(id(transport))
+        try:
+            fields["active"] = transport.is_active() if transport else False
+            sock = getattr(transport, "sock", None)
+            fields["transport_fd"] = sock.fileno() if sock else None
+            # get_exception() clears this value; diagnostics must not.
+            saved = getattr(transport, "saved_exception", None)
         except Exception:
-            pass
+            # State inspection can race with teardown. Keep logging the
+            # original failure even when the transport cannot be inspected.
+            fields["transport_state"] = "unavailable"
+    # Stable field ordering makes concurrent events easier to compare.
+    details = " ".join("%s=%r" % (key, value)
+                       for key, value in sorted(fields.items()))
+    # Use the supplied exception's traceback, not the caller's current
+    # except block; callers may report an exception after catching it.
+    info = (type(exc), exc, exc.__traceback__) if exc is not None else None
+    logger.log(level, event, exc_info=info, extra={"session_details": details})
+    # A transport-thread failure may be the cause of a later channel error.
+    # Report both, but do not print the same exception object twice.
+    if isinstance(saved, BaseException) and saved is not exc:
+        logger.log(level, "transport.saved_exception",
+                   exc_info=(type(saved), saved, saved.__traceback__),
+                   extra={"session_details": details})
 
 
 class _Session(object):
@@ -2691,6 +2770,8 @@ class _Session(object):
                 time.sleep(0.01)
                 continue
             except Exception as exc:
+                _session_log("shell.write_failed", logging.ERROR, self,
+                             self.chan, exc)
                 raise _SessionDead("write failed: %s" % exc)
             if sent == 0:
                 raise _SessionDead("the remote program closed its input")
@@ -2702,6 +2783,8 @@ class _Session(object):
         except socket.timeout:
             return None
         except Exception as exc:
+            _session_log("shell.read_failed", logging.ERROR, self,
+                         self.chan, exc)
             raise _SessionDead("read failed: %s" % exc)
         if data == b"":
             raise _SessionDead("the remote program exited")
@@ -2789,7 +2872,9 @@ class _Session(object):
                     sent = in_chan.send(pending_in)
                 except socket.timeout:
                     break
-                except Exception:
+                except Exception as exc:
+                    _session_log("stdin.send_failed", logging.DEBUG,
+                                 self, in_chan, exc)
                     # The remote reader is gone -- the command ignored its
                     # stdin, or ended early.  Drop the rest, as a pipe does.
                     pending_in, in_fd, in_done = b"", None, True
@@ -2803,8 +2888,9 @@ class _Session(object):
                 # channel's EOF is what the remote command's read() sees as 0.
                 try:
                     in_chan.shutdown_write()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _session_log("stdin.eof_failed", logging.DEBUG,
+                                 self, in_chan, exc)
                 in_chan = None
 
             rset = [] if sink.backlog >= SESSION_BACKLOG else [self.chan]
@@ -2819,7 +2905,9 @@ class _Session(object):
                 timeout = max(0.0, min(timeout, deadline - time.time()))
             try:
                 ready, _w, _x = select.select(rset, wset, [], timeout)
-            except (select.error, InterruptedError):
+            except (select.error, InterruptedError) as exc:
+                _session_log("shell.select_failed", logging.DEBUG,
+                             self, exc=exc)
                 ready = []
 
             if conn is not None and conn in ready:
@@ -2829,7 +2917,9 @@ class _Session(object):
                 # waiting on a descriptor that stays readable forever.
                 try:
                     alive = bool(conn.recv(65536))
-                except (socket.error, OSError):
+                except (socket.error, OSError) as exc:
+                    _session_log("shell.control_read_failed", logging.DEBUG,
+                                 exc=exc)
                     alive = False
                 if not alive:
                     raise _ClientGone("the client hung up")
@@ -2837,7 +2927,9 @@ class _Session(object):
             if in_fd is not None and in_fd in ready:
                 try:
                     data = os.read(in_fd, 65536)
-                except OSError:
+                except OSError as exc:
+                    _session_log("stdin.read_failed", logging.DEBUG,
+                                 exc=exc, fd=in_fd)
                     data = b""
                 if data:
                     pending_in += data
@@ -2905,7 +2997,9 @@ class _Session(object):
         while time.time() < deadline:
             try:
                 data = self._recv()
-            except _SessionDead:
+            except _SessionDead as exc:
+                _session_log("shell.resync_failed", logging.WARNING,
+                             self, self.chan, exc)
                 return False
             if not data:
                 continue
@@ -2950,6 +3044,8 @@ class _Session(object):
             except socket.timeout:
                 break
             except Exception as exc:
+                _session_log("stdin.channel_failed", logging.ERROR,
+                             self, chan, exc)
                 chan.close()
                 raise _SessionDead("stdin channel failed: %s" % exc)
             if not data:
@@ -2963,8 +3059,8 @@ class _Session(object):
             try:
                 if chan.recv_stderr_ready():
                     err = chan.recv_stderr(200)
-            except Exception:
-                pass
+            except Exception as exc:
+                _session_log("stdin.stderr_failed", logging.DEBUG, self, chan, exc)
             chan.close()
             raise _SessionDead(
                 "could not set up a stdin channel on the target (mkfifo in "
@@ -2980,12 +3076,12 @@ class _Session(object):
             return
         try:
             chan.shutdown_write()
-        except Exception:
-            pass
+        except Exception as exc:
+            _session_log("stdin.shutdown_failed", logging.DEBUG, chan=chan, exc=exc)
         try:
             chan.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            _session_log("stdin.close_failed", logging.WARNING, chan=chan, exc=exc)
 
     # -- a command on a channel of its own --------------------------------
 
@@ -3035,8 +3131,11 @@ class _Session(object):
         try:
             chan = self.transport.open_session(timeout=self.timeout)
         except Exception as exc:
+            _session_log("exec.open_failed", logging.ERROR, self, exc=exc)
             raise _SessionDead("could not open a channel: %s" % exc)
 
+        _SESSION_LOG_CONTEXT.channel = getattr(chan, "chanid", None)
+        _session_log("exec.opened", session=self, chan=chan)
         job = _ExecJob(chan)
         with self.execs_lock:
             self.execs.add(job)
@@ -3048,6 +3147,7 @@ class _Session(object):
                                  width=int(pty.get("cols") or 80),
                                  height=int(pty.get("rows") or 24))
                 except Exception as exc:
+                    _session_log("exec.pty_failed", logging.ERROR, self, chan, exc)
                     raise _SessionDead("the server refused a terminal for "
                                        "the command: %s" % exc)
             chan.settimeout(0.0)
@@ -3067,6 +3167,7 @@ class _Session(object):
                 else:
                     chan.exec_command(line)
             except Exception as exc:
+                _session_log("exec.start_failed", logging.ERROR, self, chan, exc)
                 raise _SessionDead("could not start the %s: %s"
                                    % ("shell" if shell else "command", exc))
             return self._pump_exec(job, out_sink, err_sink, time.time() + wait,
@@ -3075,9 +3176,11 @@ class _Session(object):
             with self.execs_lock:
                 self.execs.discard(job)
             try:
+                _session_log("exec.closing", session=self, chan=chan)
                 chan.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                _session_log("exec.close_failed", logging.ERROR, self, chan, exc)
+            _session_log("exec.closed", session=self, chan=chan)
             self.last = time.time()
 
     def _pump_exec(self, job, out_sink, err_sink, deadline, in_fd=None,
@@ -3125,7 +3228,9 @@ class _Session(object):
                     sent = chan.send(pending_in)
                 except socket.timeout:
                     break
-                except Exception:
+                except Exception as exc:
+                    _session_log("relay.send_failed", logging.DEBUG,
+                                 self, chan, exc)
                     pending_in, in_fd, in_done = b"", None, True
                     break
                 if sent == 0:
@@ -3138,8 +3243,9 @@ class _Session(object):
                 in_closed = True
                 try:
                     chan.shutdown_write()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _session_log("relay.eof_failed", logging.DEBUG,
+                                 self, chan, exc)
 
             backed_up = (out_sink.backlog >= SESSION_BACKLOG
                          or err_sink.backlog >= SESSION_BACKLOG)
@@ -3156,13 +3262,16 @@ class _Session(object):
                 timeout = max(0.0, min(timeout, deadline - time.time()))
             try:
                 ready, _w, _x = select.select(rset, wset, [], timeout)
-            except (select.error, InterruptedError):
+            except (select.error, InterruptedError) as exc:
+                _session_log("relay.select_failed", logging.DEBUG,
+                             self, chan, exc)
                 ready = []
 
             if conn is not None and conn in ready:
                 try:
                     data = conn.recv(65536)
-                except (socket.error, OSError):
+                except (socket.error, OSError) as exc:
+                    _session_log("relay.control_read_failed", logging.DEBUG, exc=exc)
                     data = b""
                 if not data:
                     raise _ClientGone("the client hung up")
@@ -3182,7 +3291,9 @@ class _Session(object):
             if in_fd is not None and in_fd in ready:
                 try:
                     data = os.read(in_fd, 65536)
-                except OSError:
+                except OSError as exc:
+                    _session_log("relay.input_read_failed", logging.DEBUG,
+                                 exc=exc, fd=in_fd)
                     data = b""
                 if data:
                     pending_in += data
@@ -3203,6 +3314,9 @@ class _Session(object):
                 except socket.timeout:
                     pass
                 except Exception as exc:
+                    _session_log("relay.read_failed",
+                                 logging.DEBUG if job.aborted else logging.ERROR,
+                                 self, chan, exc)
                     if not job.aborted:
                         raise _SessionDead("read failed: %s" % exc)
 
@@ -3220,7 +3334,9 @@ class _Session(object):
             if not backed_up and quiet and chan.exit_status_ready():
                 try:
                     status = chan.recv_exit_status()
-                except Exception:
+                except Exception as exc:
+                    _session_log("relay.exit_status_failed", logging.WARNING,
+                                 self, chan, exc)
                     status = -1
                 return (status if status is not None and status >= 0
                         else -1, False)
@@ -3258,15 +3374,16 @@ class _Session(object):
             return
         try:
             msg = json.loads(line.decode("utf-8"))
-        except Exception:
+        except Exception as exc:
+            _session_log("control.decode_failed", logging.DEBUG, chan=chan, exc=exc)
             return
         if not isinstance(msg, dict) or msg.get("op") != "resize":
             return
         try:
             chan.resize_pty(width=int(msg.get("cols") or 0),
                             height=int(msg.get("rows") or 0))
-        except Exception:
-            pass
+        except Exception as exc:
+            _session_log("control.resize_failed", logging.DEBUG, chan=chan, exc=exc)
 
     def interrupt_execs(self):
         """Stop every --exec command running on its own channel.
@@ -3366,7 +3483,9 @@ class _Session(object):
         while time.time() < deadline:
             try:
                 data = self._recv()
-            except _SessionDead:
+            except _SessionDead as exc:
+                _session_log("shell.interactive_drain_failed", logging.DEBUG,
+                             self, self.chan, exc)
                 break
             if data:
                 last_data = time.time()
@@ -3444,6 +3563,7 @@ class _Session(object):
         """Upload once per new session shell; subsequent logins reuse its path."""
         if self.rcfile_data is None:
             return
+        _session_log("rcfile.setup", session=self)
         path = _upload_rcfile(self.transport, self.rcfile_data, self.timeout)
         self.rcfile_paths.add(path)
         _source_rcfile(self.transport, self.chan, None, self.timeout,
@@ -3464,6 +3584,7 @@ class _Session(object):
                 raise RuntimeError("remote rm returned exit status %d" % status)
         except Exception as exc:
             sys.stderr.write("mssh: could not clean up session rc files: %s\n" % exc)
+            _session_log("rcfile.cleanup_failed", logging.WARNING, self, exc=exc)
         else:
             self.rcfile_paths.clear()
             self.rcfile_path = None
@@ -3481,7 +3602,8 @@ class _Session(object):
             return True
         try:
             return not transport.is_active()
-        except Exception:
+        except Exception as exc:
+            _session_log("transport.state_failed", logging.ERROR, self, exc=exc)
             return True
 
     def refusal(self):
@@ -3507,6 +3629,8 @@ class _Session(object):
         broken, either with a run of attempts under way or waiting for the
         next command to be told why it will not reconnect.
         """
+        _session_log("session.failed", logging.ERROR, self,
+                     self.chan, reason=reason)
         if not self.link_down():
             return True                   # the program itself ended
         if self.retries <= 0:
@@ -3529,8 +3653,9 @@ class _Session(object):
         try:
             if not self.chan.exit_status_ready():
                 return False
-        except Exception:
-            pass
+        except Exception as exc:
+            _session_log("shell.poll_failed", logging.ERROR, self,
+                         self.chan, exc)
         return self.failed("the connection to %s dropped" % self.target)
 
     def take_notice(self):
@@ -3571,8 +3696,12 @@ class _Session(object):
                 # boot.
                 if self.stopping.wait(self._backoff(attempt)):
                     return
+                _session_log("reconnect.attempt", session=self, attempt=attempt)
                 if self.rebuild():
                     return
+        except BaseException as exc:
+            _session_log("reconnect.worker_failed", logging.ERROR, self, exc=exc)
+            raise
         finally:
             with self.state_lock:
                 self.reconnecting = False
@@ -3595,6 +3724,8 @@ class _Session(object):
             clients, transport, chan, mark = _open_shell(
                 self.jumps, self.target, opts)
         except BaseException as exc:
+            _session_log("reconnect.connect_failed", logging.WARNING,
+                         self, exc=exc)
             self.last_error = _one_line(exc)
             return False
 
@@ -3615,6 +3746,8 @@ class _Session(object):
                     self.cleanup_rcfiles()
                     raise _SessionDead("session stopped during reconnect")
             except BaseException as exc:
+                _session_log("reconnect.setup_failed", logging.WARNING,
+                             self, self.chan, exc)
                 # The hops answered but the shell behind them did not; put
                 # back what was there and let the next attempt try again.
                 self.last_error = _one_line(exc)
@@ -3635,6 +3768,7 @@ class _Session(object):
                 "background jobs of the old one are gone."
                 % (self.name, self.target, was or "a dropped connection"))
         close_all(previous[0])
+        _session_log("reconnect.ready", session=self, chan=self.chan)
         return True
 
     def resolve(self):
@@ -3774,8 +3908,8 @@ def _reply(conn, payload):
     try:
         conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
         conn.shutdown(socket.SHUT_WR)
-    except (socket.error, OSError):
-        pass
+    except (socket.error, OSError) as exc:
+        _session_log("protocol.reply_failed", logging.DEBUG, exc=exc)
 
 
 def _notify(conn, payload):
@@ -3788,8 +3922,8 @@ def _notify(conn, payload):
     """
     try:
         conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
-    except (socket.error, OSError):
-        pass
+    except (socket.error, OSError) as exc:
+        _session_log("protocol.notify_failed", logging.DEBUG, exc=exc)
 
 
 def _reconnecting_message(session, exc):
@@ -4218,9 +4352,13 @@ def _session_detach(name, opts):
     os.dup2(null, 1)
     if opts.verbose:
         out = os.open(os.path.join(session_dir(), name + ".log"),
-                      os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        os.dup2(out, 2)
-        os.close(out)
+                      os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                      getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.fchmod(out, 0o600)
+            os.dup2(out, 2)
+        finally:
+            os.close(out)
     else:
         os.dup2(null, 2)
     if null > 2:
@@ -4237,6 +4375,8 @@ def _session_serve(session, srv, path, opts):
     state = {"stop": False}
 
     def handle(conn):
+        _SESSION_LOG_CONTEXT.request = secrets.token_hex(4)
+        _session_log("request.accepted", logging.DEBUG)
         held = []            # the descriptors sent with the request, while ours
         try:
             uid = _peer_uid(conn)
@@ -4272,6 +4412,8 @@ def _session_serve(session, srv, path, opts):
                 return
             head, rest = data.split(b"\n", 1)
             req = json.loads(head.decode("utf-8"))
+            _SESSION_LOG_CONTEXT.op = req.get("op")
+            _session_log("request.start", logging.DEBUG, descriptors=len(held))
             # Whatever came after the request line is not read here.  Only an
             # --exec -t sends anything more -- a resize, when the client's
             # window changed before this read drained the socket -- and that
@@ -4279,18 +4421,26 @@ def _session_serve(session, srv, path, opts):
             # rather than dropped.
             dispatch(conn, req, held, rest)
         except Exception as exc:                          # never kill the loop
+            _session_log("request.failed", logging.ERROR, session, exc=exc)
             _reply(conn, {"error": "mssh: session daemon: %s" % exc})
+        except BaseException as exc:
+            _session_log("request.worker_failed", logging.CRITICAL,
+                         session, exc=exc)
+            raise
         finally:
             for one in held:
                 if one is not None:
                     try:
                         os.close(one)     # never taken over: leak nothing
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        _session_log("request.fd_close_failed", logging.WARNING,
+                                     exc=exc, fd=one)
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                _session_log("request.close_failed", logging.WARNING, exc=exc)
+            _session_log("request.finished", logging.DEBUG)
+            _SESSION_LOG_CONTEXT.__dict__.clear()
 
     def dispatch(conn, req, held, rest=b""):
         """Handle one request.
@@ -4337,6 +4487,7 @@ def _session_serve(session, srv, path, opts):
             })
             return
         if op == "stop":
+            _session_log("daemon.stop_requested", session=session)
             session.stopping.set()
             session.cleanup_rcfiles()
             state["stop"] = True
@@ -4372,6 +4523,8 @@ def _session_serve(session, srv, path, opts):
             job = None
             try:
                 chan = session.transport.open_session(timeout=session.timeout)
+                _SESSION_LOG_CONTEXT.channel = getattr(chan, "chanid", None)
+                _session_log("sftp.opened", session=session, chan=chan, relay_fd=fd)
                 chan.settimeout(session.timeout)
                 job = _ExecJob(chan)
                 with session.execs_lock:
@@ -4380,12 +4533,16 @@ def _session_serve(session, srv, path, opts):
                 os.set_blocking(fd, False)
                 sink = _FdSink(fd)
                 _notify(conn, {"ok": True})
-                session._pump_exec(job, sink, _BufSink(), float("inf"),
-                                   in_fd=fd, conn=conn)
+                status, timed_out = session._pump_exec(
+                    job, sink, _BufSink(), float("inf"), in_fd=fd, conn=conn)
+                _session_log("sftp.finished", session=session, chan=chan,
+                             status=status, timed_out=timed_out)
                 sink.drain()
-            except _ClientGone:
-                pass
+            except _ClientGone as exc:
+                _session_log("sftp.client_gone", logging.DEBUG,
+                             session, chan, exc)
             except Exception as exc:
+                _session_log("sftp.failed", logging.ERROR, session, chan, exc)
                 if session.link_down():
                     session.failed(str(exc))
                 _reply(conn, {"error": "mssh: cannot open or relay SFTP: %s" % exc})
@@ -4394,8 +4551,18 @@ def _session_serve(session, srv, path, opts):
                     with session.execs_lock:
                         session.execs.discard(job)
                 if chan is not None:
-                    chan.close()
-                os.close(fd)
+                    _session_log("sftp.closing", session=session, chan=chan)
+                    try:
+                        chan.close()
+                    except Exception as exc:
+                        _session_log("sftp.close_failed", logging.ERROR,
+                                     session, chan, exc)
+                        raise
+                    finally:
+                        os.close(fd)
+                    _session_log("sftp.closed", session=session, chan=chan)
+                else:
+                    os.close(fd)
                 session.last = time.time()
             return
 
@@ -4403,6 +4570,8 @@ def _session_serve(session, srv, path, opts):
             try:
                 signalled = session.interrupt_running()
             except _SessionDead as exc:
+                _session_log("session.interrupt_failed", logging.ERROR,
+                             session, session.chan, exc)
                 # The Ctrl-C found the break rather than caused it, so it is
                 # the same decision as everywhere else: end the session, or
                 # start rebuilding it.
@@ -4483,6 +4652,8 @@ def _session_serve(session, srv, path, opts):
                 try:
                     in_chan, in_path = session.open_stdin_writer()
                 except _SessionDead as exc:
+                    _session_log("stdin.setup_failed", logging.ERROR,
+                                 session, exc=exc)
                     _reply(conn, {"error": "mssh: %s" % exc})
                     return
 
@@ -4497,6 +4668,8 @@ def _session_serve(session, srv, path, opts):
                     req.get("line", ""), wait, sink, in_path=in_path,
                     in_fd=in_fd, in_chan=in_chan, conn=conn)
             except _SessionDead as exc:
+                _session_log("shell.request_failed", logging.ERROR,
+                             session, session.chan, exc)
                 # The command is lost either way, and its client is told so
                 # either way; what is decided here is whether the session
                 # goes with it.  A connection that dropped under a --reconnect
@@ -4508,7 +4681,8 @@ def _session_serve(session, srv, path, opts):
                 else:
                     _reply(conn, {"error": _reconnecting_message(session, exc)})
                 return
-            except _ClientGone:
+            except _ClientGone as exc:
+                _session_log("shell.client_gone", logging.DEBUG, exc=exc)
                 return                    # nobody left to tell
             # Whatever the pipe was too full to take is still output: hand it
             # over before the descriptor goes, or a slow client loses the tail.
@@ -4523,11 +4697,14 @@ def _session_serve(session, srv, path, opts):
                 if fd is not None:
                     try:
                         os.close(fd)
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        _session_log("shell.fd_close_failed", logging.WARNING,
+                                     exc=exc, fd=fd)
 
         # The pipe is closed above, so the client has already seen the end of
         # the output by the time this arrives.
+        _session_log("shell.finished", session=session, status=status,
+                     timed_out=timed_out)
         _reply(conn, {"status": status, "timed_out": timed_out, "end": True})
 
     def dispatch_exec(conn, req, take, wait, with_stdin, rest=b""):
@@ -4591,6 +4768,8 @@ def _session_serve(session, srv, path, opts):
                     in_fd=in_fd, conn=conn, pty=pty, control=rest,
                     shell=bool(req.get("shell")), rcfile_data=rcfile_data)
             except _SessionDead as exc:
+                _session_log("exec.request_failed", logging.ERROR,
+                             session, exc=exc)
                 # A channel that could not be opened says nothing about the
                 # session's own shell, which is a different channel and may
                 # well still be fine; do not take the session down for it.
@@ -4601,7 +4780,8 @@ def _session_serve(session, srv, path, opts):
                 else:
                     _reply(conn, {"error": _reconnecting_message(session, exc)})
                 return
-            except _ClientGone:
+            except _ClientGone as exc:
+                _session_log("exec.client_gone", logging.DEBUG, exc=exc)
                 return                    # nobody left to tell
             # Whatever a pipe was too full to take is still output: hand it
             # over before the descriptor goes, or a slow client loses a tail.
@@ -4612,14 +4792,19 @@ def _session_serve(session, srv, path, opts):
                 if fd is not None:
                     try:
                         os.close(fd)
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        _session_log("exec.fd_close_failed", logging.WARNING,
+                                     exc=exc, fd=fd)
 
         # Both pipes are closed above, so the client has already seen the end
         # of each stream by the time this arrives.
+        _session_log("exec.finished", session=session, status=status,
+                     timed_out=timed_out)
         _reply(conn, {"status": status, "timed_out": timed_out, "end": True})
 
     def die(reason):
+        _session_log("daemon.ending", logging.ERROR, session,
+                     session.chan, reason=reason)
         session.dead = reason
         session.stopping.set()
         state["stop"] = True
@@ -4644,27 +4829,36 @@ def _session_serve(session, srv, path, opts):
                             % opts.session_idle)
                     break
                 continue
-            except OSError:
+            except OSError as exc:
+                _session_log("daemon.accept_failed", logging.ERROR,
+                             session, exc=exc)
                 break
             worker = threading.Thread(target=handle, args=(conn,))
             worker.daemon = True
             worker.start()
+    except BaseException as exc:
+        _session_log("daemon.loop_failed", logging.CRITICAL, session, exc=exc)
+        raise
     finally:
+        _session_log("daemon.exiting", session=session, chan=session.chan,
+                     dead=session.dead, stop=state["stop"])
         try:
             srv.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            _session_log("daemon.listener_close_failed", logging.WARNING, exc=exc)
         try:
             os.unlink(path)
-        except OSError:
-            pass
+        except OSError as exc:
+            _session_log("daemon.socket_unlink_failed", logging.WARNING, exc=exc)
         session.stopping.set()            # stop a reconnect run mid-backoff
         session.cleanup_rcfiles()
         try:
             session.chan.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            _session_log("daemon.shell_close_failed", logging.WARNING,
+                         session, session.chan, exc)
         close_all(session.chain)
+        _session_log("daemon.stopped")
 
 
 def _one_line(exc):
@@ -4701,9 +4895,14 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
     """The daemon: build the chain, detach, then serve.
 
     Runs in the forked child, which still has the terminal: build_chain may
-    need to ask for a password, and its -v trace belongs on the screen.  Only
+    need to ask for a password, and its -vv trace belongs on the screen.  Only
     once the session is up does this detach for good.
     """
+    global _SESSION_LOG_ENABLED, _SESSION_LOG_NAME
+    _SESSION_LOG_ENABLED = bool(opts.verbose)
+    _SESSION_LOG_NAME = name
+    _setup_logging(opts)
+    _session_log("daemon.start")
     clients = []
     session = None
     try:
@@ -4718,6 +4917,7 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
         if session.mode == "shell":
             session.setup_rcfile()
     except SystemExit as exc:
+        _session_log("daemon.start_failed", logging.ERROR, session, exc=exc)
         # A SystemExit carries its own message and nothing has printed it yet
         # -- raising it is how mssh reports a failed hop -- so print it here,
         # on the terminal we still hold.  The parent only needs to know that we
@@ -4733,6 +4933,7 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
         close_all(clients)
         return 1
     except BaseException as exc:
+        _session_log("daemon.start_failed", logging.ERROR, session, exc=exc)
         # Same reasoning: we still have the terminal, so report here.  The type
         # is included because an unexpected exception's str() is often empty.
         sys.stderr.write("mssh: session %s: %s: %s\n"
@@ -4745,16 +4946,36 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
         return 1
 
     verbose(opts, "session %s ready, pid %d" % (name, os.getpid()))
-    banner64 = base64.b64encode(banner).decode("ascii")
+    log_path = os.path.join(session_dir(), name + ".log")
+    verbose(opts, "session %s detaching, stderr "
+                    "will be written to %s" % (name, log_path))
 
     # Detach before signalling readiness, not after: the parent exits the
     # moment it hears, and its shell then prints a prompt.  Anything we wrote
     # to the terminal after that would land on top of it.
-    _session_detach(name, opts)
+    try:
+        _session_detach(name, opts)
+    except BaseException as exc:
+        _session_log("daemon.detach_failed", logging.CRITICAL, session, exc=exc)
+        _ready(readyfd, {"ok": False})
+        session.cleanup_rcfiles()
+        close_all(clients)
+        raise
+
+    if opts.verbose:
+        logger = logging.getLogger("mssh.session")
+        # The startup notice is always visible, even at the WARNING threshold.
+        record = logger.makeRecord(
+            logger.name, logging.INFO, __file__, 0,
+            "service started; log level: %s",
+            (logging.getLevelName(logger.level),), None)
+        for handler in logger.handlers:
+            handler.handle(record)
+    _session_log("daemon.ready", session=session, chan=session.chan)
+
+    banner64 = base64.b64encode(banner).decode("ascii")
     _ready(readyfd, {"ok": True, "banner": banner64})
 
-    verbose(opts, "session %s: serving on %s, everything below happened after "
-                  "startup" % (name, path))
     _session_serve(session, srv, path, opts)
     return 0
 
@@ -5255,7 +5476,7 @@ def run_session(parser, opts):
     except ValueError as exc:
         parser.error(str(exc))
         return 2
-    _setup_paramiko_logging(opts)
+    _setup_logging(opts)
     return run_session_spawn(name, jumps, target, opts)
 
 
@@ -5263,26 +5484,31 @@ def run_session(parser, opts):
 # cli
 # --------------------------------------------------------------------------
 
-def _setup_paramiko_logging(opts):
-    import logging
-    if opts.verbose:
-        # Match paramiko's own output to the mssh timestamp format so the
-        # two interleave readably on stderr.
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(logging.Formatter(
-            fmt="[%(asctime)s.%(msecs)03d] paramiko: %(message)s",
-            datefmt="%H:%M:%S",
-        ))
-        plog = logging.getLogger("paramiko")
-        plog.handlers = [handler]
-        plog.setLevel(logging.WARNING)
-        plog.propagate = False
-    else:
-        logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+def _setup_logging(opts):
+    # One shared handler serializes traceback output across daemon threads.
+    count = opts.verbose or 0
+    level = (logging.CRITICAL + 1 if count == 0 else
+             logging.WARNING if count == 1 else
+             logging.INFO if count == 2 else logging.DEBUG)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(level)
+    handler.addFilter(_SessionLogFilter())
+    handler.setFormatter(logging.Formatter(
+        fmt="[%(asctime)s.%(msecs)03d] %(levelname)s "
+            "pid=%(process)d thread=%(threadName)s %(context)s "
+            "%(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    for name in ("paramiko", "mssh.session"):
+        logger = logging.getLogger(name)
+        logger.handlers = [handler]
+        logger.setLevel(level)
+        logger.disabled = not opts.verbose
+        logger.propagate = False
 
 
 def verbose(opts, message):
-    if opts.verbose:
+    if (opts.verbose or 0) > 0:
         now = datetime.datetime.now()
         stamp = now.strftime("%H:%M:%S.") + "%03d" % (now.microsecond // 1000)
         elapsed = time.time() - _START_TIME
@@ -5437,7 +5663,7 @@ persistent session (keep one connection and one shell alive):
   one is equivalent to being logged in on the target.
 
   The first call keeps your terminal until the chain is up, so a hop that
-  needs a password still asks for one, and -v still shows each hop; only
+  needs a password still asks for one, and -vv shows each hop; only
   then does it detach.
 
 first-time key setup (then no more passwords):
@@ -5668,7 +5894,8 @@ def build_parser():
              "does not hold a connection open forever (default: 0, never)",
     )
     parser.add_argument(
-        "-v", "--verbose", action="store_true", help="log each hop to stderr",
+        "-v", "--verbose", action="count", default=0,
+        help="stderr logging: -v WARNING, -vv INFO, -vvv DEBUG",
     )
     parser.add_argument(
         "-V", "--version", action="version", version="mssh " + __version__,
@@ -5914,7 +6141,7 @@ def main(argv=None):
         parser.error("-r/-p only apply to a file copy; pass SOURCE and DEST")
         return 2
 
-    _setup_paramiko_logging(opts)
+    _setup_logging(opts)
 
     clients = []
     try:

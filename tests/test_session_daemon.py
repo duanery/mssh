@@ -370,10 +370,10 @@ def session_status(name):
 
 
 class TestVerbose(SessionTest):
-    """-v must show the chain being built, not just the final line."""
+    """Verbosity thresholds apply to startup and daemon stderr."""
 
     def test_startup_trace_reaches_the_terminal(self):
-        proc = run("--session", self.name, "root@10.0.0.1", "-v")
+        proc = run("--session", self.name, "root@10.0.0.1", "-vv")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lines = [l for l in proc.stderr.splitlines() if b"mssh:" in l]
         # The daemon used to redirect stderr before building the chain, so the
@@ -385,7 +385,7 @@ class TestVerbose(SessionTest):
 
     def test_send_reports_what_it_did(self):
         self.start()
-        proc = self.send("echo hi", "-v")
+        proc = self.send("echo hi", "-vv")
         self.assertEqual(proc.stdout, b"hi\n")
         self.assertIn(b"sending", proc.stderr)
         self.assertIn(b"exit 0", proc.stderr)
@@ -395,14 +395,75 @@ class TestVerbose(SessionTest):
         self.assertFalse(os.path.exists(
             os.path.join(SOCKDIR, self.name + ".log")))
         run("--session", self.name, "--stop")
-        run("--session", self.name, "root@10.0.0.1", "-v")
+        run("--session", self.name, "root@10.0.0.1", "-vvv")
         path = os.path.join(SOCKDIR, self.name + ".log")
         deadline = time.time() + 10
         while time.time() < deadline and not os.path.exists(path):
             time.sleep(0.1)
         self.assertTrue(os.path.exists(path))
         with open(path, "rb") as handle:
-            self.assertIn(b"after startup", handle.read())
+            self.assertIn(b"service started", handle.read())
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        proc = self.send("echo log-private-command")
+        self.assertEqual(proc.stdout, b"log-private-command\n")
+        self.assertEqual(proc.stderr, b"")
+        run("--session", self.name, "--stop")
+        with open(path, "rb") as handle:
+            text = handle.read()
+        for value in (b"daemon.ready", b"request.start", b"request=",
+                      b"op=send", b"daemon.stop_requested"):
+            self.assertIn(value, text)
+        self.assertNotIn(b"log-private-command", text)
+
+    def test_warning_level_creates_log_without_info_or_debug(self):
+        proc = self.start("-v")
+        path = os.path.join(SOCKDIR, self.name + ".log")
+        self.assertIn(b"detaching, stderr will be written to " +
+                      path.encode(), proc.stderr)
+        self.assertNotIn(b"service started", proc.stderr)
+        self.assertEqual(self.send("echo alive").stdout, b"alive\n")
+        self.assertTrue(os.path.exists(path))
+        with open(path, "rb") as handle:
+            text = handle.read()
+        self.assertIn(b"service started", text)
+        self.assertIn(b"log level: WARNING", text)
+        self.assertRegex(
+            text, rb"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] "
+                  rb"INFO pid=\d+ thread=\S+ session=\S+ "
+                  rb"mssh.session: service started; log level: WARNING")
+        self.assertNotIn(b"stderr log:", text)
+        self.assertNotIn(path.encode(), text)
+        self.assertNotIn(b"after detaching", text)
+        self.assertNotIn(b" DEBUG ", text)
+        self.assertNotIn(b"daemon.ready", text)
+        self.assertNotIn(b"request.start", text)
+
+    def test_info_level_excludes_request_debug(self):
+        self.start("-vv")
+        self.assertEqual(self.send("echo alive").stdout, b"alive\n")
+        with open(os.path.join(SOCKDIR, self.name + ".log"), "rb") as handle:
+            text = handle.read()
+        self.assertIn(b"daemon.ready", text)
+        self.assertIn(b"service started; log level: INFO", text)
+        self.assertIn(b"shell.finished", text)
+        self.assertNotIn(b"request.start", text)
+
+    def test_bad_request_logs_traceback_and_keeps_session_alive(self):
+        self.start("-v")
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            conn.settimeout(3)
+            conn.connect(os.path.join(SOCKDIR, self.name + ".sock"))
+            conn.sendall(b"not-json\n")
+            self.assertIn(b"error", conn.recv(65536))
+        finally:
+            conn.close()
+        self.assertEqual(self.send("echo alive").stdout, b"alive\n")
+        with open(os.path.join(SOCKDIR, self.name + ".log"), "rb") as handle:
+            text = handle.read()
+        self.assertIn(b"request.failed", text)
+        self.assertIn(b"Traceback", text)
+        self.assertIn(b"JSONDecodeError", text)
 
 
 class TestStreaming(SessionTest):
