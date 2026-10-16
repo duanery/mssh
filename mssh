@@ -1289,6 +1289,8 @@ def _source_rcfile(transport, chan, content, timeout, banner_sink=None,
                 raise RuntimeError("the shell closed during --rcfile initialization")
             line = line[sent:]
         tail = b""
+        banner = bytearray()
+        token_bytes = token.encode("ascii")
         while time.monotonic() < deadline:
             if chan.recv_stderr_ready():
                 chan.recv_stderr(65536)
@@ -1299,24 +1301,29 @@ def _source_rcfile(transport, chan, content, timeout, banner_sink=None,
             if not chunk:
                 raise RuntimeError("the shell exited during --rcfile initialization")
             tail += chunk
-            match = pattern.search(tail)
-            if match:
-                status = int(match.group(1))
-                if status:
-                    raise RuntimeError("--rcfile returned exit status %d" % status)
-                if int(match.group(2)):
-                    raise RuntimeError("could not remove the remote --rcfile")
-                before = tail[:match.start()]
-                # Readline can redraw the echo with changed whitespace and
-                # terminal escapes.  The unique token still identifies it.
-                lines = [one for one in before.split(b"\n")
-                         if token.encode("ascii") not in one]
-                banner = b"\n".join(lines)
-                if banner_sink is not None and banner:
-                    banner_sink(banner)
-                    time.sleep(0.2)
-                    return tail[match.end():]
-                return banner + tail[match.end():]
+            while b"\n" in tail:
+                raw, tail = tail.split(b"\n", 1)
+                raw += b"\n"
+                match = pattern.search(raw)
+                if match:
+                    status = int(match.group(1))
+                    if status:
+                        raise RuntimeError("--rcfile returned exit status %d" % status)
+                    if int(match.group(2)):
+                        raise RuntimeError("could not remove the remote --rcfile")
+                    before = raw[:match.start()]
+                    if before and token_bytes not in before:
+                        if banner_sink is not None:
+                            banner_sink(before)
+                        else:
+                            banner.extend(before)
+                    return bytes(banner) + tail
+                # Keep partial lines buffered so a split token cannot leak.
+                if token_bytes not in raw:
+                    if banner_sink is not None:
+                        banner_sink(raw)
+                    else:
+                        banner.extend(raw)
         raise RuntimeError("--rcfile initialization timed out")
     finally:
         chan.settimeout(old_timeout)

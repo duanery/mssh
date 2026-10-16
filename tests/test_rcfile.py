@@ -413,7 +413,7 @@ class TestRcfile(unittest.TestCase):
         self.assertEqual(
             output, b"Last login: yesterday\r\nWelcome to tlinux\r\n")
 
-    def test_banner_flushed_before_delay_and_prompt_return(self):
+    def test_banner_streamed_before_marker_without_sleep(self):
         events = []
 
         class BufferedChan:
@@ -422,16 +422,22 @@ class TestRcfile(unittest.TestCase):
 
             def send(self, line):
                 token = line.split(b"'")[-2]
-                self.output = (b"Welcome\r\n" + line.replace(b"\n", b"\r\n")
-                               + b"\x1e" + token + b":0:0\x1f\r\n$ ")
+                self.chunks = [
+                    b"Wel",
+                    b"come\r\n" + line[:90],
+                    line[90:].replace(b"\n", b"\r\n"),
+                    b"\x1e" + token + b":0:0\x1f\r",
+                    b"\n$ ",
+                ]
                 return len(line)
 
             def recv_stderr_ready(self):
                 return False
 
             def recv(self, size):
-                output, self.output = self.output, b""
-                return output
+                if len(self.chunks) == 2:
+                    assert events == [("banner", b"Welcome\r\n")]
+                return self.chunks.pop(0)
 
         with mock.patch.object(mssh, "_upload_rcfile",
                                return_value="/tmp/.mssh-rc-abcdef1234"):
@@ -441,7 +447,7 @@ class TestRcfile(unittest.TestCase):
                 prompt = mssh._source_rcfile(
                     None, BufferedChan(), b"true\n", 1,
                     banner_sink=lambda data: events.append(("banner", data)))
-        self.assertEqual(events, [("banner", b"Welcome\r\n"), ("sleep", 0.2)])
+        self.assertEqual(events, [("banner", b"Welcome\r\n")])
         self.assertEqual(prompt, b"$ ")
 
 
