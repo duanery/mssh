@@ -279,8 +279,12 @@ mssh --session s --status      # target, uptime, commands served, idle/running
 mssh --session s --jobs        # commands, exec/login channels and transfers
 mssh --session s --interrupt   # Ctrl-C into the session, to unstick something
 mssh --session s --stop        # end it and close the connection
-mssh --sessions                # list every live session
+mssh --sessions                # list every live session and its job count
 ```
+
+The `JOBS` column uses the same task snapshot as `--jobs`, including pending
+requests and persistent forwards but excluding the idle primary shell.
+It shows `?` when an older daemon does not provide a count or cannot respond.
 
 ### Surviving a reboot
 
@@ -353,6 +357,9 @@ or interactive requests, exec/login channels, SFTP transfers and local forwards.
 The idle persistent shell or `-c` program itself is not a job. Each request
 on its primary channel creates a default job, removed when the reply completes.
 A timed-out or detached request remains `pending` until resynchronized.
+If the SSH connection drops, its default job is removed rather than carried
+through reconnection. Internal shell initialization is not listed as a job;
+the replacement shell starts with no default job.
 This is a daemon snapshot, not a remote process list: background processes
 started by the shell are not tracked individually. Finished tasks disappear;
 jobs are not saved as history, and IDs restart when the daemon is recreated.
@@ -361,13 +368,17 @@ jobs are not saved as history, and IDs restart when the daemon is recreated.
 mssh web --interrupt          # only the default shell's task
 mssh web --jobs               # find the task's ID
 mssh web --interrupt --job 3  # interrupt one specific task
+mssh web --job 3 --stop       # same cancellation, keep the session alive
 ```
 
 `--interrupt` without `--job` leaves independent exec/login/SFTP tasks and
 local forwards alone.
 For a `-c` session it interrupts the current interactive request.
 With no default job, it reports that nothing is running.
-`--job ID` requires `--interrupt`; an unknown or completed ID reports an error.
+`--job ID` requires `--interrupt` or `--stop`; an unknown or completed ID
+reports an error. `--stop --job ID` uses the same targeted cancellation as
+`--interrupt --job ID`, leaving the session and other jobs alive.
+Only `--stop` without `--job` ends the entire session.
 Interrupting a default shell or interactive task keeps the primary channel
 alive; interrupting an exec/login/SFTP task closes only that task's channel.
 Client-side Ctrl-C
@@ -391,8 +402,9 @@ mssh web --interrupt --job 3
 The configuring client exits once all requested listeners are bound.
 Each forward appears as one `forward` job showing its listening address
 and destination; accepted connections do not create additional jobs.
-Use `--interrupt --job ID` to close that listener and its active connections.
-`--stop`, session exit and idle expiry close all forwards.
+Use `--interrupt --job ID` or `--stop --job ID` to close that listener and
+its active connections. `--stop` without `--job`, session exit and idle expiry
+close all forwards.
 
 Repeat `-L` to add several forwards in one request. If any listener cannot
 bind, the whole addition is rolled back; existing forwards are unchanged.
@@ -443,7 +455,8 @@ variables and `~` are not expanded. The target must provide SFTP.
 Transfers use their own channel and can run alongside shell commands or
 other transfers, including in a session holding an interactive program.
 An interrupted download removes its partial local file.
-`--interrupt --job ID` stops the selected transfer; plain `--interrupt`
+`--interrupt --job ID` or `--stop --job ID` stops the selected transfer;
+plain `--interrupt`
 does not stop transfers. Session channels detach their receive
 notifications before closing, preventing late remote data from writing to
 a closed Paramiko event pipe and disconnecting the shared transport.

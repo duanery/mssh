@@ -3860,6 +3860,10 @@ class _Session(object):
         with self.lock:
             if self.stopping.is_set():
                 raise _SessionDead("session is stopping")
+            # The request may have passed resolve() before waiting for this
+            # lock. Do not recreate a job on the old shell while reconnecting.
+            if self.transport is not None and self.link_down():
+                raise _SessionDead("the connection to %s dropped" % self.target)
             if self.pending:
                 # A previous command timed out and may still be running.  It
                 # has to be stopped before this one starts, or its output would
@@ -3885,6 +3889,14 @@ class _Session(object):
                     with self.execs_lock:
                         if self.default_job is job:
                             self.default_job = None
+            except _SessionDead:
+                # A fatal channel failure cannot leave work to resynchronize.
+                # Timeouts and abandoned clients on a live shell still can,
+                # so those paths deliberately retain their pending job.
+                with self.execs_lock:
+                    if self.default_job is job:
+                        self.default_job = None
+                raise
             finally:
                 self.last = time.time()
             return status, timed_out
@@ -3926,16 +3938,12 @@ class _Session(object):
             self._pump(_InteractiveFramer(self), sink, time.time() + limit)
             return sink.value()
 
+        # Initialization is not a client request. In particular, a failed
+        # reconnect must not leave an "echo ready" job on the restored channel.
         self._write(SESSION_SETUP)
-        job = self._new_job(self.chan, "shell", "echo ready", default=True)
-        with self.execs_lock:
-            self.default_job = job
         self._write(self.session_frame("echo ready"))
         status, timed_out = self._pump(_ShellFramer(self), sink,
-                                       time.time() + wait, job=job)
-        if not timed_out and not job.aborted:
-            with self.execs_lock:
-                self.default_job = None
+                                       time.time() + wait)
         out = sink.value()
         if timed_out or status is None:
             raise SystemExit(
@@ -4055,10 +4063,19 @@ class _Session(object):
         broken, either with a run of attempts under way or waiting for the
         next command to be told why it will not reconnect.
         """
+        chan = self.chan
         _session_log("session.failed", logging.ERROR, self,
-                     self.chan, reason=reason)
+                     chan, reason=reason)
         if not self.link_down():
             return True                   # the program itself ended
+        # The old transport cannot complete or resynchronize its request.
+        # Clear it before reconnect backoff, including pending commands whose
+        # client already left. Do not abort it: that would try Ctrl-C/resync on
+        # a dead channel. Match the channel so cleanup cannot remove a request
+        # belonging to a replacement shell.
+        with self.execs_lock:
+            if self.default_job is not None and self.default_job.chan is chan:
+                self.default_job = None
         if self.retries <= 0:
             return True                   # no --reconnect: as it always was
         self.note_broken(reason)
@@ -4310,6 +4327,8 @@ class _Session(object):
 # mode. Exec/login, SFTP channels and local forwards are included. Completed jobs
 # disappear; pending primary requests can outlive their client.
 # This is daemon metadata, not the remote shell's process/job table.
+# The status reply includes "jobs": N using the same snapshot rules, so
+# --sessions can show counts without making a second request to each daemon.
 #
 # "op": "forward" adds persistent local TCP listeners, with no descriptors:
 #
@@ -4326,6 +4345,9 @@ class _Session(object):
 #
 #     {"op": "interrupt"}\n
 #     {"op": "interrupt", "job": N}\n
+#
+# --stop --job ID uses the targeted interrupt request above, never the
+# session-wide stop request. This also works with existing job-aware daemons.
 #
 # Without a job ID only the current default job is interrupted; idle is a
 # no-op. Default shell/interactive jobs are created per request and retain
@@ -4904,6 +4926,7 @@ def _session_serve(session, srv, path, opts):
                 "retries": session.retries, "reconnects": session.reconnects,
                 "refusal": session.refusal(), "last_error": session.last_error,
                 "rcfile": session.rcfile_path,
+                "jobs": len(session.jobs_snapshot()),
             })
             return
         if op == "stop":
@@ -5843,7 +5866,11 @@ def run_session_jobs(name):
     return 0
 
 
-def run_session_stop(name):
+def run_session_stop(name, job_id=None):
+    if job_id is not None:
+        # Keep the daemon and other jobs alive; no session socket teardown
+        # wait is needed when only one task is being cancelled.
+        return run_session_interrupt(name, job_id)
     session_request(name, {"op": "stop"}, timeout=15.0)
     # The daemon acknowledges before it unwinds, so wait for the socket to go:
     # otherwise an immediate restart races the teardown.
@@ -5871,24 +5898,25 @@ def run_session_list():
         except SessionGone:
             continue                      # stale socket, a killed daemon
         except SystemExit:
-            rows.append((name, "?", "?", "?", 0))
+            rows.append((name, "?", "?", "?", 0, "?"))
             continue
         rows.append((name, info.get("target", "?"), info.get("mode", "?"),
                      _uptime(time.time() - float(info.get("started") or 0)),
-                     int(info.get("served") or 0)))
+                     int(info.get("served") or 0),
+                     info.get("jobs", "?")))
 
     if not rows:
         sys.stderr.write("mssh: no live sessions in %s\n" % directory)
         return 1
     width = max(len(r[0]) for r in rows + [("NAME",)])
     tgtw = max(len(r[1]) for r in rows) if rows else 6
-    sys.stdout.write("%-*s  %-*s  %-11s  %-9s  %s\n"
+    sys.stdout.write("%-*s  %-*s  %-11s  %-9s  %-5s  %s\n"
                      % (width, "NAME", tgtw, "TARGET", "MODE", "UPTIME",
-                        "SENT"))
+                        "SENT", "JOBS"))
     for row in rows:
-        sys.stdout.write("%-*s  %-*s  %-11s  %-9s  %d\n"
+        sys.stdout.write("%-*s  %-*s  %-11s  %-9s  %-5d  %s\n"
                          % (width, row[0], tgtw, row[1], row[2], row[3],
-                            row[4]))
+                            row[4], row[5]))
     return 0
 
 
@@ -5985,7 +6013,7 @@ def run_session(parser, opts):
             if controls[0] == "jobs":
                 return run_session_jobs(name)
             if controls[0] == "stop":
-                return run_session_stop(name)
+                return run_session_stop(name, opts.job)
             return run_session_interrupt(name, opts.job)
         except SessionGone:
             _no_session(name)
@@ -6224,12 +6252,13 @@ persistent session (keep one connection and one shell alive):
   mssh --session s --interrupt # Ctrl-C, to unstick a hung command
   mssh s --jobs               # list active tasks and their IDs
   mssh s --interrupt --job 3  # interrupt only this task
+  mssh s --job 3 --stop       # same targeted cancellation, keep session alive
   mssh --session s --stop      # end it; --sessions lists live ones
 
   --interrupt alone only reaches the current default shell/interactive
   request, not independent exec/login/SFTP jobs or forwards. Idle is a no-op.
-  --job ID selects one task from --jobs.
-  --stop closes the default channel and every job channel.
+  --job ID selects one task from --jobs with --interrupt or --stop.
+  --stop without --job closes the default channel and every job channel.
 
   A session dies with its connection: a jump host or the target rebooting
   ends it, and the next call says so.  --reconnect N, on the call that
@@ -6437,11 +6466,13 @@ def build_parser():
              "is a login on a channel of its own",
     )
     group.add_argument(
-        "--sessions", "--list", action="store_true", help="list live sessions and exit",
+        "--sessions", "--list", action="store_true",
+        help="list live sessions with their job counts and exit",
     )
     group.add_argument(
         "--stop", action="store_true",
-        help="end the --session named session and close its connection",
+        help="end the named session and close its connection; with --job ID, "
+             "cancel only that task and keep the session alive",
     )
     group.add_argument(
         "--interrupt", action="store_true",
@@ -6449,7 +6480,7 @@ def build_parser():
     )
     group.add_argument(
         "--job", type=int, metavar="ID",
-        help="with --interrupt, target a job ID from --jobs",
+        help="with --interrupt or --stop, target a job ID from --jobs",
     )
     group.add_argument(
         "--jobs", action="store_true",
@@ -6647,8 +6678,9 @@ def main(argv=None):
     opts = parse_cli(parser, head)
     opts.args = list(opts.args) + command
 
-    if opts.job is not None and (not opts.interrupt or opts.job < 0):
-        parser.error("--job requires --interrupt and a nonnegative job ID")
+    if opts.job is not None and (
+            not (opts.interrupt or opts.stop) or opts.job < 0):
+        parser.error("--job requires --interrupt or --stop and a nonnegative job ID")
 
     try:
         for spec in opts.local_forwards:

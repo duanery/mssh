@@ -270,10 +270,15 @@ class TestSessionForward(SessionTest):
         self.assertEqual(rows[0]["kind"], "forward")
         self.assertIn(str(port), rows[0]["command"])
         self.assertIsNone(rows[0]["channel"])
+        proc = run("--sessions")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        row = next(line.split() for line in proc.stdout.decode().splitlines()[1:]
+                   if line.split()[0] == self.name)
+        self.assertEqual(row[-1], "1")
         self.assertEqual(run(self.name, "--interrupt").returncode, 0)
         self.assertEqual(self.exchange(port), b"forwarded")
         self.assertIn(b"forward", run(self.name, "--jobs").stdout)
-        proc = run(self.name, "--interrupt", "--job", str(rows[0]["id"]))
+        proc = run(self.name, "--job", str(rows[0]["id"]), "--stop")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.jobs(), [])
         with self.assertRaises(OSError):
@@ -364,6 +369,7 @@ class TestSessionForward(SessionTest):
                             break
                         time.sleep(0.05)
                     self.assertNotEqual(info["link"], "up")
+                    self.assertEqual([row["id"] for row in self.jobs()], [original])
                     # A listener can be added while disconnected, and then
                     # stopped without resolve() waiting for an SSH reconnect.
                     added = free_port()
@@ -372,7 +378,7 @@ class TestSessionForward(SessionTest):
                     extra = next(row for row in self.jobs()
                                  if row["kind"] == "forward" and
                                  row["id"] != original)
-                    proc = run(self.name, "--interrupt", "--job", str(extra["id"]))
+                    proc = run(self.name, "--job", str(extra["id"]), "--stop")
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     os.unlink(down)
                     deadline = time.monotonic() + 10
@@ -383,7 +389,7 @@ class TestSessionForward(SessionTest):
                             break
                         time.sleep(0.05)
                     self.assertEqual(info["link"], "up")
-                self.assertEqual(self.jobs()[0]["id"], original)
+                self.assertEqual([row["id"] for row in self.jobs()], [original])
                 self.assertEqual(self.exchange(port), b"forwarded")
 
     def test_closed_connections_do_not_leak_daemon_descriptors(self):
@@ -452,7 +458,7 @@ class TestSessionForward(SessionTest):
 
     def test_cancel_and_stop_close_existing_connections(self):
         self.start()
-        for cancel in (True, False):
+        for cancel in ("interrupt", "stop_job", "stop_session"):
             port = free_port()
             proc = run(self.name, "-L", self.spec(port))
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -460,10 +466,14 @@ class TestSessionForward(SessionTest):
                 conn.sendall(b"open")
                 self.assertEqual(conn.recv(4), b"open")
                 rows = self.jobs()
-                proc = run(self.name, "--interrupt", "--job", str(rows[0]["id"])) \
-                    if cancel else run(self.name, "--stop")
+                options = ["--stop"] if cancel == "stop_session" else [
+                    "--job", str(rows[0]["id"]),
+                    "--interrupt" if cancel == "interrupt" else "--stop"]
+                proc = run(self.name, *options)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(conn.recv(1), b"")
+                if cancel != "stop_session":
+                    self.assertEqual(self.send("echo alive").stdout, b"alive\n")
             with socket.socket() as sock:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.bind(("127.0.0.1", port))
