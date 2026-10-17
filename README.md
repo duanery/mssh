@@ -349,7 +349,7 @@ immediately, as it always has.
 
 `mssh NAME --jobs` lists mssh-managed tasks with their ID, type, channel,
 state, elapsed time and command or transfer paths. It includes active shell
-or interactive requests, exec/login channels and SFTP transfers.
+or interactive requests, exec/login channels, SFTP transfers and local forwards.
 The idle persistent shell or `-c` program itself is not a job. Each request
 on its primary channel creates a default job, removed when the reply completes.
 A timed-out or detached request remains `pending` until resynchronized.
@@ -363,7 +363,8 @@ mssh web --jobs               # find the task's ID
 mssh web --interrupt --job 3  # interrupt one specific task
 ```
 
-`--interrupt` without `--job` leaves independent exec/login/SFTP tasks alone.
+`--interrupt` without `--job` leaves independent exec/login/SFTP tasks and
+local forwards alone.
 For a `-c` session it interrupts the current interactive request.
 With no default job, it reports that nothing is running.
 `--job ID` requires `--interrupt`; an unknown or completed ID reports an error.
@@ -373,6 +374,53 @@ Client-side Ctrl-C
 on an exec/login request targets its own task, not the default shell or
 other jobs. Stopping or exiting the session closes the default channel
 and all job channels.
+
+#### Local Port Forwarding
+
+`-L [BIND:]PORT:HOST:HOSTPORT` creates a local TCP listener owned by the
+session daemon, either when creating a session or afterward:
+
+```bash
+mssh --session web -L 8080:127.0.0.1:80 -j ops@jump root@target
+mssh web -L 15432:db.internal:5432
+mssh --session web -L 127.0.0.1:9090:127.0.0.1:9090
+mssh web --jobs
+mssh web --interrupt --job 3
+```
+
+The configuring client exits once all requested listeners are bound.
+Each forward appears as one `forward` job showing its listening address
+and destination; accepted connections do not create additional jobs.
+Use `--interrupt --job ID` to close that listener and its active connections.
+`--stop`, session exit and idle expiry close all forwards.
+
+Repeat `-L` to add several forwards in one request. If any listener cannot
+bind, the whole addition is rolled back; existing forwards are unchanged.
+An existing-session configuration takes no command, login or copy options.
+Forwarding requires a session, not a direct one-shot connection.
+
+By default, the daemon listens only on `localhost` (IPv4 and IPv6 when
+available). Specify `127.0.0.1` or `[::1]` to choose one family.
+An explicit `*` or empty bind address listens on all interfaces; use that
+only when exposing the forwarded service to other machines is intended.
+IPv6 addresses require brackets, for example
+`-L '[::1]:8080:[::1]:80'`. Both ports must be between 1 and 65535;
+Unix-domain forwarding and dynamically assigned local ports are not supported.
+
+The destination is reached through the target's SSH transport, so its host
+name is resolved from the target, not from the local machine or jump host.
+The SSH server must allow `direct-tcpip` forwarding. Configuration success
+confirms the local bind, not destination reachability: each incoming
+connection opens its own SSH channel, and a refused destination closes only
+that connection. Diagnostic failures go to the session log under `-v`.
+
+With `--reconnect`, listeners and job IDs remain in the daemon. Existing
+connections are lost when their SSH transport drops; new connections use
+the rebuilt transport. Connections received while the link is down are
+closed rather than queued or replayed. Forward traffic updates session
+activity; an unused listener alone does not prevent `--session-idle` expiry.
+
+#### File Transfers
 
 Files can also use the existing session's connection, without rebuilding
 the jump chain or authenticating again:
@@ -636,7 +684,8 @@ points at a specific file.
 | `-V, --version` | Print the version |
 
 Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
-`--interrupt`, `--job ID`, `--exec`, `--prompt REGEX`, `--stdin`, `--idle SEC`,
+`--interrupt`, `--job ID`, `-L [BIND:]PORT:HOST:HOSTPORT`, `--exec`,
+`--prompt REGEX`, `--stdin`, `--idle SEC`,
 `--wait SEC`, `--reconnect N`, `--session-idle SEC`.
 
 `mssh --help` carries the same detail plus worked examples.
@@ -674,12 +723,15 @@ order.
 python3 tests/test_session_unit.py     # framing, endpoints, flags     (61)
 python3 tests/test_session_daemon.py   # daemon, protocol, client      (62)
 python3 tests/test_copy_mode.py        # copy permissions vs real scp (51)
+python3 -m unittest discover -s tests -p test_session_forward.py
 ```
 
-No network and no sshd: the framing layer is driven against local `bash`,
+No external network and no sshd: the framing layer is driven against local `bash`,
 `gdb` and `python3` behind a real pty, the daemon tests run mssh as separate
 processes with only the SSH hops faked, and the copy tests talk to OpenSSH's
 own `sftp-server` over a pipe and compare every resulting mode against what
-`scp` itself produces for the same input. Some of the permission tests drop to
+`scp` itself produces for the same input. Forwarding tests use local TCP
+listeners and a real Paramiko client/server transport over a socketpair.
+Some of the permission tests drop to
 an unprivileged user, since root ignores permission bits and would pass either
 way.

@@ -61,6 +61,52 @@ class FakeTransport(object):
     def set_keepalive(self, interval):
         pass
 
+    def open_channel(self, kind, dest_addr, src_addr, timeout=None):
+        if kind != "direct-tcpip":
+            raise ValueError("unknown channel kind")
+        if not self.is_active():
+            raise OSError("fake chain: the connection is down")
+        chan = _TCPChan(socket.create_connection(dest_addr, timeout=timeout))
+        self.client.channels.append(chan)
+        return chan
+
+
+class _TCPChan(object):
+    """A channel-shaped TCP socket for local-forward integration tests."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.closed = False
+        self.eof_received = False
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def settimeout(self, timeout):
+        self.sock.settimeout(timeout)
+
+    def send(self, data):
+        try:
+            return self.sock.send(data)
+        except BlockingIOError:
+            raise socket.timeout()
+
+    def recv_ready(self):
+        return bool(select.select([self.sock], [], [], 0)[0])
+
+    def recv(self, size):
+        data = self.sock.recv(size)
+        if not data:
+            self.eof_received = True
+        return data
+
+    def shutdown_write(self):
+        self.sock.shutdown(socket.SHUT_WR)
+
+    def close(self):
+        self.closed = True
+        self.sock.close()
+
 
 class FakeClient(object):
     def __init__(self):
