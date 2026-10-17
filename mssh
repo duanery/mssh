@@ -2606,8 +2606,12 @@ class _ExecJob(object):
     command is to close the channel under it.
     """
 
-    def __init__(self, chan):
+    def __init__(self, chan, kind="exec", command=""):
         self.chan = chan
+        self.kind = kind
+        self.command = command
+        self.started = time.time()
+        self.id = None
         self.aborted = False
 
     def abort(self):
@@ -2750,6 +2754,8 @@ class _Session(object):
         # --interrupt has to be able to find them.
         self.execs = set()
         self.execs_lock = threading.Lock()
+        self.job_sequence = 0
+        self.shell_job = None
         # Everything --reconnect needs, all of it inert until arm() fills it
         # in: a session that was never armed behaves exactly as it did before
         # the option existed.  state_lock guards this group alone -- it is
@@ -2778,6 +2784,33 @@ class _Session(object):
     @property
     def pending(self):
         return self.outstanding > 0
+
+    def _new_job(self, chan, kind, command):
+        job = _ExecJob(chan, kind, command)
+        with self.execs_lock:
+            self.job_sequence += 1
+            job.id = self.job_sequence
+        return job
+
+    def jobs_snapshot(self):
+        """Copy job metadata without waiting for the persistent shell lock."""
+        with self.execs_lock:
+            jobs = list(self.execs)
+            if self.shell_job is not None:
+                jobs.append(self.shell_job)
+            rows = [
+                {"id": job.id, "kind": job.kind, "command": job.command,
+                 "channel": getattr(job.chan, "chanid", None),
+                 "started": job.started,
+                 "state": "stopping" if job.aborted else
+                          "pending" if job is self.shell_job and
+                          not self.lock.locked() else "running"}
+                for job in jobs if not getattr(job.chan, "closed", False)]
+        if self.mode == "interactive" and not getattr(self.chan, "closed", False):
+            rows.append({"id": 0, "kind": "program", "command": self.command,
+                         "channel": getattr(self.chan, "chanid", None),
+                         "started": self.started, "state": "running"})
+        return sorted(rows, key=lambda row: row["id"])
 
     # -- channel i/o ------------------------------------------------------
 
@@ -2978,6 +3011,8 @@ class _Session(object):
                     done = framer.feed(data, sink)
                     if done is not None:
                         self.outstanding = 0
+                        with self.execs_lock:
+                            self.shell_job = None
                         sink.flush()
                         return done
 
@@ -3021,6 +3056,8 @@ class _Session(object):
             self._write(self._marker_command(token.decode("ascii")))
             if self._await_token(token, 20 if attempt == 0 else 10):
                 self.outstanding = 0
+                with self.execs_lock:
+                    self.shell_job = None
                 return
         # The shell never answered.  Leave the count set so the next command
         # tries to resynchronise again rather than framing on a stale marker.
@@ -3172,7 +3209,8 @@ class _Session(object):
 
         _SESSION_LOG_CONTEXT.channel = getattr(chan, "chanid", None)
         _session_log("exec.opened", session=self, chan=chan)
-        job = _ExecJob(chan)
+        job = self._new_job(chan, "login" if shell else "exec",
+                            "login shell" if shell else line)
         with self.execs_lock:
             self.execs.add(job)
         self.served += 1
@@ -3470,6 +3508,10 @@ class _Session(object):
                 framer = _InteractiveFramer(self)
             self.outstanding = 1
             self.served += 1
+            if self.mode == "shell":
+                job = self._new_job(self.chan, "shell", line)
+                with self.execs_lock:
+                    self.shell_job = job
 
             try:
                 status, timed_out = self._pump(
@@ -3479,6 +3521,8 @@ class _Session(object):
                 self.last = time.time()
             if not timed_out:
                 self.outstanding = 0
+                with self.execs_lock:
+                    self.shell_job = None
             return status, timed_out
 
     def interrupt_running(self):
@@ -3775,6 +3819,8 @@ class _Session(object):
             self.transport, self.mark = transport, mark.encode("utf-8")
             self.outstanding = 0
             self.abort.clear()
+            with self.execs_lock:
+                self.shell_job = None
             try:
                 self.setup(self.setup_wait)
                 self.setup_rcfile()
@@ -3856,7 +3902,7 @@ class _Session(object):
 
 # -- wire protocol ---------------------------------------------------------
 #
-# One command per connection, so a wedged one cannot block the socket for
+# One request per connection, so a wedged one cannot block the socket for
 # everyone else.  The socket carries JSON and nothing else, in both directions:
 # the request is one line of it and the reply is exactly one more line, with
 # only --exec -t adding anything in between (the resize lines below).
@@ -3886,6 +3932,40 @@ class _Session(object):
 #
 # Its reply is the same single status message, and its stdin needs no fifo:
 # the command's own channel carries it natively, since no pty is in the way.
+#
+# "op": "sftp" borrows the transport for a dedicated SFTP subsystem channel:
+#
+#     fds[0]   the daemon end of a client's duplex socketpair   (always)
+#
+# The request may include display metadata for --jobs:
+#
+#     {"op": "sftp",
+#      "transfer": {"kind": "put" or "get",
+#                   "source": "...", "destination": "..."}}\n
+#
+# These fields label the job; they do not execute a copy on the daemon.
+# After opening the subsystem, the daemon sends {"ok": true}\n on the
+# control connection. The client then speaks binary SFTP over its socketpair
+# end, using a normal SFTPClient; the daemon relays bytes in both directions.
+# Neither file contents nor SFTP packets travel through the JSON connection.
+# The control connection stays open so a disconnected client ends the relay.
+# There is no final command-status reply on successful SFTP completion:
+# closing the duplex socket/channel ends the transfer. Setup/relay failures
+# may send {"error": "..."} on the control connection.
+#
+# "op": "jobs" needs no descriptors and returns a single snapshot:
+#
+#     {"op": "jobs"}\n
+#     {"jobs": [{"id": N, "kind": "...", "command": "...",
+#                "channel": N or null, "started": UNIX_SECONDS,
+#                "state": "running" or "pending" or "stopping"}, ...]}\n
+#
+# It is answered before link resolution, like status, without taking the
+# persistent shell lock or starting a reconnect. The default persistent
+# shell is excluded; its active command is a separate job. Exec/login and
+# SFTP channels are included, as is an interactive program started with -c.
+# Completed jobs disappear; pending shell commands can outlive their client.
+# This is daemon metadata, not the remote shell's process/job table.
 #
 # An exec may carry a "pty": {"term": ..., "cols": N, "rows": N} for a command
 # that will not run without a terminal.  The size is the client's window and
@@ -3928,14 +4008,14 @@ class _Session(object):
 # this command -- today, that the chain was rebuilt under it by --reconnect and
 # the shell is therefore a new one.  It goes in front of the command instead of
 # after it because it changes how the output should be read.  A client reads
-# lines until one is not a notice; that line is the reply.  status, stop and
+# lines until one is not a notice; that line is the reply.  status, jobs, stop and
 # interrupt never carry one: they are a single line each way, and a client that
 # reads exactly one line is right about them.
 #
 # On a send the client does not half-close its end of the socket, and the
 # daemon does not read from it: the socket going readable can then only mean
 # the client has gone, which is how a command notices that nobody is listening
-# any more.  status, stop and interrupt are a plain request, half-close, one
+# any more.  status, jobs, stop and interrupt are a plain request, half-close, one
 # reply.
 
 
@@ -3951,10 +4031,10 @@ def _reply(conn, payload):
 def _notify(conn, payload):
     """A line sent ahead of the reply, leaving the exchange open.
 
-    Only a send or an exec is told anything this way: their client already
-    reads lines until the status arrives, so one more in front of it is
-    something it can be handed.  status, stop and interrupt are one line each
-    in both directions and are left exactly as they were.
+    Send/exec clients read notices until their final status arrives. SFTP
+    uses this helper for its initial {"ok": true} while keeping the control
+    connection open. Status, jobs, stop and interrupt are one line each in
+    both directions and are left exactly as they were.
     """
     try:
         conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
@@ -4226,12 +4306,15 @@ class _SessionSFTPChannel(object):
         self.control.close()
 
 
-def open_session_sftp(name, timeout):
+def open_session_sftp(name, timeout, transfer=None):
     control = _connect_session(name, timeout)
     local, remote = socket.socketpair()
     channel = _SessionSFTPChannel(local, control)
     try:
-        request = b'{"op":"sftp"}\n'
+        payload = {"op": "sftp"}
+        if transfer is not None:
+            payload["transfer"] = transfer
+        request = json.dumps(payload).encode("utf-8") + b"\n"
         sent = control.sendmsg(
             [request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                          array.array("i", [remote.fileno()]).tobytes())])
@@ -4263,7 +4346,10 @@ def run_session_copy(name, opts):
 
     class Client:
         def open_sftp(self):
-            return open_session_sftp(name, opts.timeout)
+            return open_session_sftp(
+                name, opts.timeout,
+                {"kind": "put" if direction == "up" else "get",
+                 "source": paths[0], "destination": paths[1]})
 
     try:
         return run_copy(Client(), (direction, [paths[0]], paths[1], None), opts)
@@ -4507,6 +4593,9 @@ def _session_serve(session, srv, path, opts):
         op = req.get("op")
         if op not in ("send", "exec", "sftp"):
             drop()
+        if op == "jobs":
+            _reply(conn, {"jobs": session.jobs_snapshot()})
+            return
         if op == "status":
             # Answered whatever state the link is in: a session whose target
             # is rebooting is exactly when somebody wants to look at it.
@@ -4562,9 +4651,16 @@ def _session_serve(session, srv, path, opts):
                 _SESSION_LOG_CONTEXT.channel = getattr(chan, "chanid", None)
                 _session_log("sftp.opened", session=session, chan=chan, relay_fd=fd)
                 chan.settimeout(session.timeout)
-                job = _ExecJob(chan)
+                transfer = req.get("transfer") or {}
+                kind = transfer.get("kind", "sftp")
+                if kind not in ("put", "get"):
+                    kind = "sftp"
+                description = "%s -> %s" % (
+                    transfer.get("source", ""), transfer.get("destination", ""))
+                job = session._new_job(chan, kind, description)
                 with session.execs_lock:
                     session.execs.add(job)
+                session.served += 1
                 chan.invoke_subsystem("sftp")
                 os.set_blocking(fd, False)
                 sink = _FdSink(fd)
@@ -5297,6 +5393,31 @@ def run_session_status(name):
     return 0
 
 
+def run_session_jobs(name):
+    info = session_request(name, {"op": "jobs"}, timeout=15.0)
+    if info.get("error"):
+        sys.stderr.write(info["error"].rstrip("\n") + "\n")
+        return 1
+    if "jobs" not in info:
+        raise SystemExit("mssh: session daemon does not support --jobs; "
+                         "stop and recreate the session")
+    rows = info["jobs"]
+    if not rows:
+        sys.stdout.write("No running jobs.\n")
+        return 0
+    sys.stdout.write("ID    TYPE     CHANNEL  STATE     ELAPSED    COMMAND\n")
+    for row in rows:
+        # Keep terminal controls and embedded newlines out of the table.
+        command = "".join(char if char.isprintable() else " "
+                          for char in row.get("command", ""))
+        sys.stdout.write("%-5s %-8s %-8s %-9s %-10s %s\n" %
+                         (row["id"], row["kind"],
+                          row["channel"] if row["channel"] is not None else "-",
+                          row["state"],
+                          _uptime(max(0, time.time() - row["started"])), command))
+    return 0
+
+
 def run_session_stop(name):
     session_request(name, {"op": "stop"}, timeout=15.0)
     # The daemon acknowledges before it unwinds, so wait for the socket to go:
@@ -5370,7 +5491,7 @@ def _session_login_wanted(opts):
     only thing left to mean is the thing ssh means by the same words: a shell
     on the target, with your terminal at it.  Anything that says what to do --
     a command, a positional, a chain to build, a key to install -- is that
-    instead, and so are --status/--stop/--interrupt, which act on the session
+    instead, and so are --status/--stop/--interrupt/--jobs, which act on the session
     rather than on the machine behind it.
     """
     if not opts.session:
@@ -5378,7 +5499,7 @@ def _session_login_wanted(opts):
     if opts.args or opts.command or opts.jump or opts.copy_id is not None \
             or opts.put is not None or opts.get is not None:
         return False
-    return not (opts.stop or opts.interrupt or opts.status)
+    return not (opts.stop or opts.interrupt or opts.status or opts.jobs)
 
 
 def run_session(parser, opts):
@@ -5393,7 +5514,8 @@ def run_session(parser, opts):
     if opts.put is not None or opts.get is not None:
         if opts.args or opts.command or opts.jump or opts.copy_id is not None \
                 or opts.rcfile or opts.exec_channel or opts.force_tty \
-                or opts.stop or opts.interrupt or opts.status or opts.reconnect \
+                or opts.stop or opts.interrupt or opts.status or opts.jobs \
+                or opts.reconnect \
                 or opts.prompt is not None:
             parser.error("--put/--get only combine with file-copy options "
                          "and an existing session name")
@@ -5406,12 +5528,16 @@ def run_session(parser, opts):
         except SessionGone:
             _no_session(name)
 
-    controls = [flag for flag in ("stop", "interrupt", "status")
+    controls = [flag for flag in ("stop", "interrupt", "status", "jobs")
                 if getattr(opts, flag)]
     if len(controls) > 1:
         parser.error("--%s and --%s cannot be combined" % tuple(controls[:2]))
         return 2
     if controls:
+        if opts.jobs and (opts.command or opts.jump or opts.force_tty or
+                          opts.recursive or opts.preserve or opts.reconnect or
+                          opts.copy_id is not None or opts.stdin):
+            parser.error("--jobs only takes an existing session name")
         if opts.args:
             parser.error("--%s takes no other arguments" % controls[0])
             return 2
@@ -5422,6 +5548,8 @@ def run_session(parser, opts):
         try:
             if controls[0] == "status":
                 return run_session_status(name)
+            if controls[0] == "jobs":
+                return run_session_jobs(name)
             if controls[0] == "stop":
                 return run_session_stop(name)
             return run_session_interrupt(name)
@@ -5603,12 +5731,21 @@ persistent session (keep one connection and one shell alive):
   name of the machine it reached -- it is the whole path, under an alias:
   mssh s 'cd /var/log && ls'          # = mssh --session s 'cd ...'
   mssh s --status                     # and --stop, --interrupt
+  mssh s --jobs                       # active commands and transfer channels
   mssh s --exec -t 'vim /etc/hosts'
   mssh s                              # nothing to run: a login
   A word no live session answers to is read as a host, exactly as before,
   so 'mssh 10.0.0.9' still logs in to 10.0.0.9.
 
-  That last line is 'ssh s' as nearly as this can be: a shell on the
+  Copy files through an existing session without reconnecting:
+  mssh s --put ./app.conf /tmp/app.conf           # LOCAL -> REMOTE
+  mssh s --get /var/log/app.log ./app.log         # REMOTE -> LOCAL
+  mssh s -rp --put ./release /tmp/                # directory, keep attributes
+  --put/--get require SFTP on the target. Add -r for directories and -p
+  to preserve permissions and timestamps. Transfers use a separate channel;
+  relative remote paths do not follow the session shell's current directory.
+
+  'mssh s' with nothing to run is 'ssh s' as nearly as this can be: a shell on the
   target, on a channel of its own rather than the session's own shell,
   which is busy being a session -- the framing around every command above
   is what makes it one.  Your terminal drives the shell the way --exec -t
@@ -5854,6 +5991,11 @@ def build_parser():
         help="send Ctrl-C to the session, as if at its keyboard",
     )
     group.add_argument(
+        "--jobs", action="store_true",
+        help="list active session commands, exec/login channels and transfers; "
+             "exclude the default persistent shell",
+    )
+    group.add_argument(
         "--status", action="store_true",
         help="print the session's target, uptime, command count and, when "
              "the connection has dropped, what --reconnect is doing about it",
@@ -6038,7 +6180,8 @@ def main(argv=None):
     opts.rcfile_data = None
     if opts.rcfile:
         if opts.command or opts.copy_id is not None or opts.sessions \
-                or opts.stop or opts.interrupt or opts.status or opts.exec_channel:
+                or opts.stop or opts.interrupt or opts.status or opts.jobs \
+                or opts.exec_channel:
             parser.error("--rcfile only applies to logins and shell session creation")
         try:
             with open(os.path.expanduser(opts.rcfile), "rb") as source:
@@ -6070,6 +6213,8 @@ def main(argv=None):
             else DEFAULT_SESSION_WAIT
 
     if opts.sessions:
+        if opts.jobs:
+            parser.error("--jobs cannot be combined with --sessions")
         if opts.put is not None or opts.get is not None:
             parser.error("--put/--get require an existing session")
         if opts.session or opts.args:
@@ -6085,7 +6230,7 @@ def main(argv=None):
         parser.error("--put/--get require an existing session: "
                      "mssh NAME --put LOCAL REMOTE")
 
-    for flag in ("stop", "interrupt", "status"):
+    for flag in ("stop", "interrupt", "status", "jobs"):
         if getattr(opts, flag):
             # Either no name was given or the one given is not live; both end
             # here, so the message names the live ones rather than guessing

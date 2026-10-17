@@ -276,6 +276,7 @@ Managing them:
 
 ```bash
 mssh --session s --status      # target, uptime, commands served, idle/running
+mssh --session s --jobs        # commands, exec/login channels and transfers
 mssh --session s --interrupt   # Ctrl-C into the session, to unstick something
 mssh --session s --stop        # end it and close the connection
 mssh --sessions                # list every live session
@@ -345,6 +346,15 @@ Without `--reconnect` nothing changes: a dropped connection ends the session
 immediately, as it always has.
 
 ### Borrowing the connection without the shell
+
+`mssh NAME --jobs` lists mssh-managed tasks with their ID, type, channel,
+state, elapsed time and command or transfer paths. It includes active shell
+commands, exec/login channels, SFTP transfers and a program started with `-c`.
+The default persistent shell itself is not a job. A timed-out or detached
+shell command remains `pending` until it is completed or resynchronized.
+This is a daemon snapshot, not a remote process list: background processes
+started by the shell are not tracked individually. Finished tasks disappear;
+jobs are not saved as history, and IDs restart when the daemon is recreated.
 
 Files can also use the existing session's connection, without rebuilding
 the jump chain or authenticating again:
