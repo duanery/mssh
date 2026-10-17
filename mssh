@@ -875,6 +875,20 @@ def _both_ends_are_tty():
         return False
 
 
+def _terminal_pty():
+    """The local terminal settings used by direct and session requests."""
+    cols, rows = term_size()
+    return {"term": os.environ.get("TERM", "xterm-256color"),
+            "cols": cols, "rows": rows}
+
+
+def _request_pty(chan, settings):
+    """Apply the same defaults to local and wire-protocol PTY settings."""
+    chan.get_pty(term=settings.get("term") or "xterm-256color",
+                 width=int(settings.get("cols") or 80),
+                 height=int(settings.get("rows") or 24))
+
+
 class _RawTerminal(object):
     """Hold the local terminal in raw mode for as long as a remote one runs.
 
@@ -928,7 +942,7 @@ _RAW = {"depth": 0}
 
 
 class _WindowWatcher(object):
-    """Tell the daemon when this terminal is resized, so the remote pty follows.
+    """Watch terminal resizing for a direct channel or a daemon request.
 
     The size is sent once with the request, which is right until the window is
     dragged: from then on the remote program is drawing to the old one, and a
@@ -936,34 +950,38 @@ class _WindowWatcher(object):
     the wrong rectangle and stays wrong until it is restarted.  SIGWINCH is the
     only notice there is, so it has to be carried across while the command runs.
 
-    It goes down the connection the command is already using.  That socket is
-    open for the command's whole life and the daemon's loop is already watching
-    it; a second connection would have to say which of several running commands
-    it meant, and this one is the answer by being that command's own.
+    Direct connections resize their channel through a callback. For a session
+    it goes down the connection the command is already using. That socket is
+    open for the command's whole life and the daemon's loop watches it;
+    a second connection would have to identify which command it meant.
 
-    The handler itself does nothing but write a byte to a pipe.  It can arrive
-    in the middle of anything, so it must not send or allocate; the pipe is
-    what turns an asynchronous signal into one more descriptor for the client's
-    select loop, which then does the work with nothing interrupted.  That pipe
-    is also the only way the loop hears about it at all: a select blocked with
-    no timeout retries itself after a handler returns (PEP 475), so a flag set
-    in the handler would go unread until the command happened to print.
+    The handler marks a pending resize and writes a byte to a pipe; it never
+    resizes or sends a control message itself. The flag lets a busy output
+    loop check for a resize without an extra select call. The pipe still
+    wakes a blocked select: PEP 475 retries it after a handler returns, so
+    a flag alone would go unread until the command happened to print.
     """
 
-    def __init__(self):
+    def __init__(self, enabled=True, on_resize=None):
+        self.enabled = enabled
+        self.on_resize = on_resize
         self.rfd = self.wfd = None
         self.previous = None
         self.last = None
+        self.pending = False
 
     def fileno(self):
         return self.rfd
 
     def __enter__(self):
+        if not self.enabled:
+            return self
         self.rfd, self.wfd = os.pipe()
         os.set_blocking(self.rfd, False)
         os.set_blocking(self.wfd, False)
 
         def on_winch(_signum, _frame):
+            self.pending = True
             try:
                 os.write(self.wfd, b"w")
             except OSError:
@@ -976,8 +994,13 @@ class _WindowWatcher(object):
         self.last = term_size()
         return self
 
-    def pump(self, conn):
-        """Drain the pipe and send the new size down the command's socket."""
+    def pump(self, conn=None):
+        """Drain the wakeup, then resize directly or send a session control."""
+        if not self.enabled or not self.pending:
+            return
+        # Clear before draining: a signal during this operation must leave
+        # its new flag set, including when the pipe is already full.
+        self.pending = False
         try:
             while os.read(self.rfd, 4096):
                 pass
@@ -988,9 +1011,12 @@ class _WindowWatcher(object):
             return                        # a SIGWINCH that changed nothing
         self.last = size
         try:
+            if self.on_resize is not None:
+                self.on_resize(*size)
+                return
             conn.sendall(json.dumps({"op": "resize", "cols": size[0],
                                      "rows": size[1]}).encode("utf-8") + b"\n")
-        except (socket.error, OSError):
+        except Exception:
             # A resize is cosmetic.  The command is still running and its
             # output is still arriving; losing one is not worth ending over,
             # and a socket that is really gone is noticed where it matters --
@@ -1011,6 +1037,7 @@ class _WindowWatcher(object):
                 except OSError:
                     pass
         self.rfd = self.wfd = None
+        self.pending = False
         return False
 
 
@@ -1033,9 +1060,6 @@ def pump(chan, is_tty=False, initial=b""):
     socket.timeout, and sendall() would have swallowed an unknowable number
     of bytes before doing so.
     """
-    import termios
-    import tty
-
     out = sys.stdout.buffer
     err = sys.stderr.buffer
     if initial:
@@ -1043,39 +1067,20 @@ def pump(chan, is_tty=False, initial=b""):
         out.flush()
     chan.settimeout(0.0)
     infd = stdin_fd()
-    ttyfd = infd                      # infd is cleared at EOF; this is not
-
-    resized = [False]
-
-    def on_winch(signum, frame):
-        resized[0] = True
-
-    old_attrs = None
-    old_winch = None
-    if is_tty:
-        try:
-            old_winch = signal.signal(signal.SIGWINCH, on_winch)
-        except (ValueError, AttributeError, OSError):
-            pass
-        if infd is not None:
-            old_attrs = termios.tcgetattr(infd)
 
     pending = b""                     # read locally, not yet on the channel
     sent_eof = False                  # the remote's stdin has been closed
 
-    try:
-        if old_attrs is not None:
-            tty.setraw(ttyfd)
-            tty.setcbreak(ttyfd)
+    def resize(cols, rows):
+        chan.resize_pty(width=cols, height=rows)
 
+    with _RawTerminal(infd if is_tty else None), \
+            _WindowWatcher(enabled=is_tty, on_resize=resize) as watcher:
         while True:
-            if resized[0]:
-                resized[0] = False
-                cols, rows = term_size()
-                try:
-                    chan.resize_pty(width=cols, height=rows)
-                except Exception:
-                    pass
+            # Check before draining output as well as after select: a busy
+            # remote stream must not postpone terminal resizing indefinitely.
+            if watcher.pending:
+                watcher.pump()
 
             # Drain whatever the remote has already sent, then wait.  Any
             # error here -- a dropped connection most of all -- ends the
@@ -1143,6 +1148,8 @@ def pump(chan, is_tty=False, initial=b""):
             # from, not in this process.
             if infd is not None and not stalled:
                 watch.append(infd)
+            if watcher.fileno() is not None:
+                watch.append(watcher.fileno())
             # Nothing wakes us when the remote's window reopens -- the
             # channel's fileno() is an event pipe for arriving data, not for
             # sending room -- so a stalled send is retried on a short tick
@@ -1153,6 +1160,9 @@ def pump(chan, is_tty=False, initial=b""):
             except (select.error, InterruptedError):
                 continue
 
+            if watcher.fileno() is not None and watcher.fileno() in ready:
+                watcher.pump()
+
             if infd is not None and infd in ready:
                 try:
                     data = os.read(infd, 65536)
@@ -1162,14 +1172,6 @@ def pump(chan, is_tty=False, initial=b""):
                     pending += data
                 else:
                     infd = None          # the local side is done
-    finally:
-        if old_attrs is not None:
-            termios.tcsetattr(ttyfd, termios.TCSADRAIN, old_attrs)
-        if old_winch is not None:
-            try:
-                signal.signal(signal.SIGWINCH, old_winch)
-            except Exception:
-                pass
 
 
 def _rc_command(transport, command, timeout, data=b""):
@@ -1334,11 +1336,9 @@ def run_interactive(client, opts):
     transport = client.get_transport()
     chan = transport.open_session(timeout=opts.timeout)
 
-    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    interactive = _both_ends_are_tty()
     if interactive:
-        cols, rows = term_size()
-        chan.get_pty(term=os.environ.get("TERM", "xterm-256color"),
-                     width=cols, height=rows)
+        _request_pty(chan, _terminal_pty())
     chan.invoke_shell()
 
     def show_banner(data):
@@ -1367,12 +1367,10 @@ def run_command(client, command, opts):
     transport = client.get_transport()
     chan = transport.open_session(timeout=opts.timeout)
     if opts.force_tty:
-        cols, rows = term_size()
-        chan.get_pty(term=os.environ.get("TERM", "xterm-256color"),
-                     width=cols, height=rows)
+        _request_pty(chan, _terminal_pty())
     chan.exec_command(command)
 
-    if opts.force_tty and sys.stdin.isatty() and sys.stdout.isatty():
+    if opts.force_tty and _both_ends_are_tty():
         # The remote pty echoes and handles line editing, so the local tty has
         # to stay out of the way -- the same bridge an interactive login uses.
         pump(chan, is_tty=True)
@@ -3279,9 +3277,7 @@ class _Session(object):
         try:
             if pty:
                 try:
-                    chan.get_pty(term=pty.get("term") or "xterm-256color",
-                                 width=int(pty.get("cols") or 80),
-                                 height=int(pty.get("rows") or 24))
+                    _request_pty(chan, pty)
                 except Exception as exc:
                     _session_log("exec.pty_failed", logging.ERROR, self, chan, exc)
                     raise _SessionDead("the server refused a terminal for "
@@ -4330,83 +4326,6 @@ def session_exec(name, payload, send_stdin=False, watcher=None):
                           send_stdin=send_stdin, watcher=watcher)
 
 
-class _SessionSFTPChannel(object):
-    """A local duplex socket relayed to an SFTP channel on the held transport."""
-
-    def __init__(self, sock, control):
-        self.sock = sock
-        self.control = control
-
-    def send(self, data):
-        return self.sock.send(data)
-
-    def recv(self, size):
-        return self.sock.recv(size)
-
-    def settimeout(self, timeout):
-        self.sock.settimeout(timeout)
-
-    def get_name(self):
-        return "session-sftp"
-
-    def close(self):
-        self.sock.close()
-        self.control.close()
-
-
-def open_session_sftp(name, timeout, transfer=None, job_token=None):
-    control = _connect_session(name, timeout)
-    local, remote = socket.socketpair()
-    channel = _SessionSFTPChannel(local, control)
-    try:
-        payload = {"op": "sftp",
-                   "job_token": (job_token if job_token is not None
-                                 else secrets.token_hex(16))}
-        if transfer is not None:
-            payload["transfer"] = transfer
-        request = json.dumps(payload).encode("utf-8") + b"\n"
-        sent = control.sendmsg(
-            [request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                         array.array("i", [remote.fileno()]).tobytes())])
-        control.sendall(request[sent:])
-        remote.close()
-        reply = b""
-        while b"\n" not in reply:
-            chunk = control.recv(65536)
-            if not chunk:
-                raise RuntimeError("session daemon closed the SFTP request")
-            reply += chunk
-        info = _parse_reply(name, reply.split(b"\n", 1)[0])
-        if info.get("error"):
-            raise RuntimeError(info["error"])
-        if not info.get("ok"):
-            raise RuntimeError("session daemon did not open an SFTP channel")
-        local.settimeout(timeout)
-        return paramiko.SFTPClient(channel)
-    except BaseException:
-        channel.close()
-        raise
-    finally:
-        remote.close()
-
-
-def run_session_copy(name, opts):
-    paths = opts.put if opts.put is not None else opts.get
-    direction = "up" if opts.put is not None else "down"
-
-    class Client:
-        def open_sftp(self):
-            return open_session_sftp(
-                name, opts.timeout,
-                {"kind": "put" if direction == "up" else "get",
-                 "source": paths[0], "destination": paths[1]})
-
-    try:
-        return run_copy(Client(), (direction, [paths[0]], paths[1], None), opts)
-    except (RuntimeError, socket.error, OSError) as exc:
-        raise SystemExit("mssh: session %s: file transfer failed: %s" % (name, exc))
-
-
 def session_alive(name):
     try:
         session_request(name, {"op": "status"}, timeout=10.0)
@@ -5068,8 +4987,8 @@ def _open_shell(jumps, target, opts):
     try:
         transport = tgt.get_transport()
         chan = transport.open_session(timeout=opts.timeout)
-        chan.get_pty(term=SESSION_TERM, width=SESSION_COLS,
-                     height=SESSION_ROWS)
+        _request_pty(chan, {"term": SESSION_TERM, "cols": SESSION_COLS,
+                           "rows": SESSION_ROWS})
         # Keep signals enabled without echo, canonical buffering or CRLF
         # expansion.  Ctrl-C targets the terminal's foreground process group.
         chan.exec_command(SESSION_STTY + " 2>/dev/null; exec "
@@ -5252,11 +5171,30 @@ def _await_session(name, readfd, pid, opts):
 # -- client ----------------------------------------------------------------
 
 
-def _no_session(name):
-    raise SystemExit(
-        "mssh: no session %r; start one with:\n"
-        "    mssh --session %s [-j <jump>...] <target>" % (name, name)
-    )
+def _session_exit_code(name, message, opts, interrupted=None):
+    """What this process should exit with, given the daemon's last word.
+
+    The output itself has already been written: it came off the pipe as the
+    command produced it, and this is only the one message that ends it.
+    """
+    message = message or {}
+    error = message.get("error")
+    status = message.get("status")
+    timed_out = bool(message.get("timed_out"))
+
+    if error:
+        sys.stderr.write(error.rstrip("\n") + "\n")
+        return 1
+    if interrupted and interrupted["count"]:
+        return 130
+    if timed_out:
+        sys.stderr.write(
+            "mssh: session %s: no end of output after %gs -- the command may "
+            "still be running (raise --wait, or --interrupt it)\n"
+            % (name, opts.wait)
+        )
+        return 124
+    return int(status) if status is not None else 0
 
 
 def run_session_send(name, line, opts, shell=False):
@@ -5327,9 +5265,7 @@ def run_session_send(name, line, opts, shell=False):
     if with_stdin:
         request["stdin"] = True
     if want_pty:
-        cols, rows = term_size()
-        request["pty"] = {"term": os.environ.get("TERM", "xterm-256color"),
-                          "cols": cols, "rows": rows}
+        request["pty"] = _terminal_pty()
     call = session_exec if use_exec else session_send
 
     try:
@@ -5384,30 +5320,81 @@ def run_session_interrupt(name, job_id=None):
     return 0
 
 
-def _session_exit_code(name, message, opts, interrupted=None):
-    """What this process should exit with, given the daemon's last word.
+class _SessionSFTPChannel(object):
+    """A local duplex socket relayed to an SFTP channel on the held transport."""
 
-    The output itself has already been written: it came off the pipe as the
-    command produced it, and this is only the one message that ends it.
-    """
-    message = message or {}
-    error = message.get("error")
-    status = message.get("status")
-    timed_out = bool(message.get("timed_out"))
+    def __init__(self, sock, control):
+        self.sock = sock
+        self.control = control
 
-    if error:
-        sys.stderr.write(error.rstrip("\n") + "\n")
-        return 1
-    if interrupted and interrupted["count"]:
-        return 130
-    if timed_out:
-        sys.stderr.write(
-            "mssh: session %s: no end of output after %gs -- the command may "
-            "still be running (raise --wait, or --interrupt it)\n"
-            % (name, opts.wait)
-        )
-        return 124
-    return int(status) if status is not None else 0
+    def send(self, data):
+        return self.sock.send(data)
+
+    def recv(self, size):
+        return self.sock.recv(size)
+
+    def settimeout(self, timeout):
+        self.sock.settimeout(timeout)
+
+    def get_name(self):
+        return "session-sftp"
+
+    def close(self):
+        self.sock.close()
+        self.control.close()
+
+
+def open_session_sftp(name, timeout, transfer=None, job_token=None):
+    control = _connect_session(name, timeout)
+    local, remote = socket.socketpair()
+    channel = _SessionSFTPChannel(local, control)
+    try:
+        payload = {"op": "sftp",
+                   "job_token": (job_token if job_token is not None
+                                 else secrets.token_hex(16))}
+        if transfer is not None:
+            payload["transfer"] = transfer
+        request = json.dumps(payload).encode("utf-8") + b"\n"
+        sent = control.sendmsg(
+            [request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                         array.array("i", [remote.fileno()]).tobytes())])
+        control.sendall(request[sent:])
+        remote.close()
+        reply = b""
+        while b"\n" not in reply:
+            chunk = control.recv(65536)
+            if not chunk:
+                raise RuntimeError("session daemon closed the SFTP request")
+            reply += chunk
+        info = _parse_reply(name, reply.split(b"\n", 1)[0])
+        if info.get("error"):
+            raise RuntimeError(info["error"])
+        if not info.get("ok"):
+            raise RuntimeError("session daemon did not open an SFTP channel")
+        local.settimeout(timeout)
+        return paramiko.SFTPClient(channel)
+    except BaseException:
+        channel.close()
+        raise
+    finally:
+        remote.close()
+
+
+def run_session_copy(name, opts):
+    paths = opts.put if opts.put is not None else opts.get
+    direction = "up" if opts.put is not None else "down"
+
+    class Client:
+        def open_sftp(self):
+            return open_session_sftp(
+                name, opts.timeout,
+                {"kind": "put" if direction == "up" else "get",
+                 "source": paths[0], "destination": paths[1]})
+
+    try:
+        return run_copy(Client(), (direction, [paths[0]], paths[1], None), opts)
+    except (RuntimeError, socket.error, OSError) as exc:
+        raise SystemExit("mssh: session %s: file transfer failed: %s" % (name, exc))
 
 
 def _uptime(seconds):
@@ -5532,6 +5519,13 @@ def run_session_list():
                          % (width, row[0], tgtw, row[1], row[2], row[3],
                             row[4]))
     return 0
+
+
+def _no_session(name):
+    raise SystemExit(
+        "mssh: no session %r; start one with:\n"
+        "    mssh --session %s [-j <jump>...] <target>" % (name, name)
+    )
 
 
 def _live_session_named(name):
