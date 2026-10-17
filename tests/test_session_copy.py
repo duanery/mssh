@@ -130,10 +130,37 @@ class TestSessionCopy(SessionTest):
             try:
                 proc = run(self.name, "--interrupt")
                 self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertTrue(sftp.stat("/tmp"))
+                jobs = mssh.session_request(
+                    self.name, {"op": "jobs"}, timeout=3)["jobs"]
+                proc = run(self.name, "--interrupt", "--job", str(jobs[0]["id"]))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
                 with self.assertRaises((EOFError, OSError)):
                     sftp.stat("/tmp")
             finally:
                 sftp.close()
+        self.assertEqual(self.send("echo alive").stdout, b"alive\n")
+
+    def test_sftp_request_token_interrupts_only_its_channel(self):
+        self.start()
+        with mock.patch.dict(os.environ, HOME=ENV["HOME"]):
+            first = mssh.open_session_sftp(
+                self.name, 3, job_token="first-transfer")
+            second = None
+            try:
+                second = mssh.open_session_sftp(
+                    self.name, 3, job_token="second-transfer")
+                reply = mssh.session_request(
+                    self.name, {"op": "interrupt",
+                                "job_token": "first-transfer"}, timeout=3)
+                self.assertTrue(reply.get("interrupted"), reply)
+                with self.assertRaises((EOFError, OSError)):
+                    first.stat("/tmp")
+                self.assertTrue(second.stat("/tmp"))
+            finally:
+                first.close()
+                if second is not None:
+                    second.close()
         self.assertEqual(self.send("echo alive").stdout, b"alive\n")
 
     def test_disconnected_clients_release_daemon_descriptors(self):

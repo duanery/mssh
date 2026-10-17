@@ -741,14 +741,14 @@ class TestShellSessionLive(unittest.TestCase):
         self.assertTrue(timed_out)
         self.assertTrue(self.sess.pending)
         # Nothing is streaming, but a command is still running out there.
-        self.assertTrue(self.sess.interrupt_running())
+        self.assertTrue(self.sess.interrupt_job())
         self.assertFalse(self.sess.pending)
         out, status, _ = drain(self.sess, "echo back", 10.0)
         self.assertEqual((out.strip(), status), (b"back", 0))
 
     def test_interrupt_with_nothing_running(self):
         drain(self.sess, "true", 10.0)
-        self.assertFalse(self.sess.interrupt_running())
+        self.assertFalse(self.sess.interrupt_job())
         out, status, _ = drain(self.sess, "echo fine", 10.0)
         self.assertEqual((out.strip(), status), (b"fine", 0))
 
@@ -766,7 +766,7 @@ class TestShellSessionLive(unittest.TestCase):
         worker = threading.Thread(target=run)
         worker.start()
         time.sleep(1.0)
-        self.assertTrue(self.sess.interrupt_running(),
+        self.assertTrue(self.sess.interrupt_job(),
                         "a running command should report as signalled")
         self.assertTrue(done.wait(30), "the command never ended")
         worker.join()

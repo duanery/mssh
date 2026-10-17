@@ -2556,9 +2556,9 @@ class _InteractiveFramer(object):
 
     def on_abort(self, sink):
         self.flush(sink)
-        # The program itself handled the Ctrl-C and will print its own prompt
-        # again; drain that so the next command frames cleanly.
-        self.session._drain_interactive()
+        # Deliver Ctrl-C, then drain the program's replacement prompt so the
+        # next command frames cleanly without closing the primary channel.
+        self.session._resync()
         return (130, False)
 
 
@@ -2599,23 +2599,30 @@ def _close_session_channel(chan):
 
 
 class _ExecJob(object):
-    """One command running on a channel of its own, outside the session shell.
+    """One tracked shell command, exec/login request, or SFTP transfer.
 
-    Held in the session only so that --interrupt can reach it: there is no pty
-    here and therefore no Ctrl-C to type, so the only way to stop the remote
-    command is to close the channel under it.
+    Independent exec/login/SFTP channels are closed on targeted interruption.
+    Shell jobs instead flag their pump, keeping the shared shell channel alive.
     """
 
-    def __init__(self, chan, kind="exec", command=""):
+    def __init__(self, chan, kind="exec", command="", token=None, default=False):
         self.chan = chan
         self.kind = kind
         self.command = command
         self.started = time.time()
         self.id = None
+        # Match a client's Ctrl-C to its own exec/login request, even when
+        # other jobs are running and the client has not fetched --jobs.
+        self.token = token
+        self.default = default
         self.aborted = False
 
     def abort(self):
         self.aborted = True
+        if self.default:
+            # The primary channel survives cancellation. Its owning pump
+            # sends Ctrl-C and resynchronizes before the next request.
+            return
         _session_log("channel.abort", chan=self.chan)
         try:
             _close_session_channel(self.chan)
@@ -2740,22 +2747,16 @@ class _Session(object):
         self.last = self.started
         self.served = 0
         self.dead = None
-        # Frames we have asked for but not yet seen the marker of.  A command
-        # that timed out leaves one behind, and its marker will still turn up
-        # later; without this count the next command would frame on that stale
-        # marker and report the stale command's exit status as its own.
-        self.outstanding = 0
-        # Set to ask an in-flight command to stop.  An interrupt cannot wait
-        # for the lock -- the command holding it is exactly what needs
-        # interrupting -- so it signals through this instead.
-        self.abort = threading.Event()
+        # One request owns the primary channel in either mode. A timeout or
+        # abandoned client leaves this job pending until resynchronization;
+        # cancellation belongs to that job, never to a later request.
+        self.default_job = None
         # Commands running on channels of their own (--exec).  They do not
         # touch the pty and do not take the lock, so several run at once and
-        # --interrupt has to be able to find them.
+        # --interrupt --job has to be able to find them.
         self.execs = set()
         self.execs_lock = threading.Lock()
         self.job_sequence = 0
-        self.shell_job = None
         # Everything --reconnect needs, all of it inert until arm() fills it
         # in: a session that was never armed behaves exactly as it did before
         # the option existed.  state_lock guards this group alone -- it is
@@ -2783,33 +2784,91 @@ class _Session(object):
 
     @property
     def pending(self):
-        return self.outstanding > 0
+        with self.execs_lock:
+            return self.default_job is not None
 
-    def _new_job(self, chan, kind, command):
-        job = _ExecJob(chan, kind, command)
+    def _new_job(self, chan, kind, command, token=None, default=False):
+        job = _ExecJob(chan, kind, command, token=token, default=default)
         with self.execs_lock:
             self.job_sequence += 1
             job.id = self.job_sequence
         return job
 
+    def _register_job(self, job):
+        with self.execs_lock:
+            stopping = self.stopping.is_set()
+            if not stopping:
+                self.execs.add(job)
+        if stopping:
+            job.abort()
+            raise _SessionDead("session is stopping")
+
+    def close_channels(self):
+        """Stop accepting jobs before closing their channels outside the lock."""
+        self.stopping.set()
+        with self.execs_lock:
+            jobs = list(self.execs)
+            if self.default_job is not None:
+                jobs.append(self.default_job)
+        # Channel teardown wakes relay workers, which remove themselves from
+        # execs. Never hold execs_lock while closing. Late registrations see
+        # stopping and close their own channel instead of missing this snapshot.
+        for job in jobs:
+            job.abort()
+        try:
+            _close_session_channel(self.chan)
+        except Exception as exc:
+            _session_log("daemon.shell_close_failed", logging.WARNING,
+                         self, self.chan, exc)
+
+    def interrupt_job(self, job_id=None, token=None):
+        """Cancel one job; no selector means the current primary request."""
+        default_request = job_id is None and token is None
+        with self.execs_lock:
+            if token is not None:
+                job = next((item for item in self.execs if item.token == token), None)
+            elif default_request:
+                job = self.default_job
+            else:
+                job = next((item for item in self.execs if item.id == job_id), None)
+                if self.default_job is not None and self.default_job.id == job_id:
+                    job = self.default_job
+            if job is not None and job.default:
+                job.abort()
+        if job is None and default_request:
+            return False
+        if job is not None and job.default:
+            if self.lock.acquire(False):
+                try:
+                    with self.execs_lock:
+                        if self.default_job is not job:
+                            if default_request:
+                                return False
+                            raise ValueError("job %s is no longer running" % job_id)
+                    self._resync()
+                finally:
+                    self.lock.release()
+            return True
+        if job is None or getattr(job.chan, "closed", False):
+            raise ValueError("job %s is not running" %
+                             (job_id if token is None else "for this request"))
+        job.abort()
+        return True
+
     def jobs_snapshot(self):
         """Copy job metadata without waiting for the persistent shell lock."""
         with self.execs_lock:
             jobs = list(self.execs)
-            if self.shell_job is not None:
-                jobs.append(self.shell_job)
+            if self.default_job is not None:
+                jobs.append(self.default_job)
             rows = [
                 {"id": job.id, "kind": job.kind, "command": job.command,
                  "channel": getattr(job.chan, "chanid", None),
                  "started": job.started,
                  "state": "stopping" if job.aborted else
-                          "pending" if job is self.shell_job and
+                          "pending" if job is self.default_job and
                           not self.lock.locked() else "running"}
                 for job in jobs if not getattr(job.chan, "closed", False)]
-        if self.mode == "interactive" and not getattr(self.chan, "closed", False):
-            rows.append({"id": 0, "kind": "program", "command": self.command,
-                         "channel": getattr(self.chan, "chanid", None),
-                         "started": self.started, "state": "running"})
         return sorted(rows, key=lambda row: row["id"])
 
     # -- channel i/o ------------------------------------------------------
@@ -2904,7 +2963,7 @@ class _Session(object):
     # -- the loop ---------------------------------------------------------
 
     def _pump(self, framer, sink, deadline, in_fd=None, in_chan=None,
-              conn=None):
+              conn=None, job=None):
         """Drive one command to its end.  Returns (status, timed_out).
 
         Everything that can block is watched here together, in one thread:
@@ -3010,19 +3069,23 @@ class _Session(object):
                 if data:
                     done = framer.feed(data, sink)
                     if done is not None:
-                        self.outstanding = 0
+                        # Completion wins over a concurrent cancellation:
+                        # this marker/prompt already ended this exact job.
                         with self.execs_lock:
-                            self.shell_job = None
+                            if job is not None and self.default_job is job:
+                                self.default_job = None
                         sink.flush()
                         return done
 
-            if self.abort.is_set():
-                self.abort.clear()
+            if job is not None and job.aborted:
                 return framer.on_abort(sink)
 
             now = time.time()
             done = framer.idle(sink, now)
             if done is not None:
+                with self.execs_lock:
+                    if job is not None and self.default_job is job:
+                        self.default_job = None
                 return done
             if now >= deadline:
                 framer.flush(sink)
@@ -3055,11 +3118,10 @@ class _Session(object):
                 time.sleep(0.3)
             self._write(self._marker_command(token.decode("ascii")))
             if self._await_token(token, 20 if attempt == 0 else 10):
-                self.outstanding = 0
                 with self.execs_lock:
-                    self.shell_job = None
+                    self.default_job = None
                 return
-        # The shell never answered.  Leave the count set so the next command
+        # The shell never answered. Leave the default job so the next command
         # tries to resynchronise again rather than framing on a stale marker.
 
     def _await_token(self, token, limit):
@@ -3159,7 +3221,8 @@ class _Session(object):
     # -- a command on a channel of its own --------------------------------
 
     def exec_run(self, line, wait, out_sink, err_sink, in_fd=None, conn=None,
-                 pty=None, control=b"", shell=False, rcfile_data=None):
+                 pty=None, control=b"", shell=False, rcfile_data=None,
+                 job_token=None):
         """Run one command on a new channel, outside the session's shell.
 
         Nothing here touches the session's pty: a fresh channel is opened, the
@@ -3210,9 +3273,8 @@ class _Session(object):
         _SESSION_LOG_CONTEXT.channel = getattr(chan, "chanid", None)
         _session_log("exec.opened", session=self, chan=chan)
         job = self._new_job(chan, "login" if shell else "exec",
-                            "login shell" if shell else line)
-        with self.execs_lock:
-            self.execs.add(job)
+                            "login shell" if shell else line, token=job_token)
+        self._register_job(job)
         self.served += 1
         try:
             if pty:
@@ -3291,6 +3353,10 @@ class _Session(object):
             self._exec_control(chan, one)
 
         while True:
+            # A control worker may have closed this channel since the last
+            # tick. Do not send stdin or recreate its select pipe afterward.
+            if job.aborted:
+                return (130, False)
             for sink in (out_sink, err_sink):
                 if not sink.flush():
                     raise _ClientGone("the client stopped reading")
@@ -3340,6 +3406,9 @@ class _Session(object):
                 _session_log("relay.select_failed", logging.DEBUG,
                              self, chan, exc)
                 ready = []
+
+            if job.aborted:
+                return (130, False)
 
             if conn is not None and conn in ready:
                 try:
@@ -3459,19 +3528,6 @@ class _Session(object):
         except Exception as exc:
             _session_log("control.resize_failed", logging.DEBUG, chan=chan, exc=exc)
 
-    def interrupt_execs(self):
-        """Stop every --exec command running on its own channel.
-
-        Closing the channel is the whole mechanism: without a pty there is no
-        Ctrl-C to deliver, and the server kills the command when its channel
-        goes.
-        """
-        with self.execs_lock:
-            jobs = list(self.execs)
-        for job in jobs:
-            job.abort()
-        return len(jobs)
-
     # -- operations -------------------------------------------------------
 
     def run(self, line, wait, sink, in_path=None, in_fd=None, in_chan=None,
@@ -3494,60 +3550,36 @@ class _Session(object):
         interleaved on one pty would each read the other's output.
         """
         with self.lock:
-            self.abort.clear()
-            if self.outstanding:
+            if self.stopping.is_set():
+                raise _SessionDead("session is stopping")
+            if self.pending:
                 # A previous command timed out and may still be running.  It
                 # has to be stopped before this one starts, or its output would
                 # be mixed into ours and its marker would frame us early.
                 self._resync()
-            if self.mode == "shell":
-                self._write(self.session_frame(line, in_path))
-                framer = _ShellFramer(self)
-            else:
-                self._write(line.rstrip("\r\n") + "\n")
-                framer = _InteractiveFramer(self)
-            self.outstanding = 1
+                if self.pending:
+                    raise _SessionDead("the default job could not be resynchronized")
+            job = self._new_job(self.chan, self.mode, line, default=True)
+            with self.execs_lock:
+                self.default_job = job
             self.served += 1
-            if self.mode == "shell":
-                job = self._new_job(self.chan, "shell", line)
-                with self.execs_lock:
-                    self.shell_job = job
-
             try:
+                if self.mode == "shell":
+                    self._write(self.session_frame(line, in_path))
+                    framer = _ShellFramer(self)
+                else:
+                    self._write(line.rstrip("\r\n") + "\n")
+                    framer = _InteractiveFramer(self)
                 status, timed_out = self._pump(
                     framer, sink, time.time() + wait,
-                    in_fd=in_fd, in_chan=in_chan, conn=conn)
+                    in_fd=in_fd, in_chan=in_chan, conn=conn, job=job)
+                if not timed_out and not job.aborted:
+                    with self.execs_lock:
+                        if self.default_job is job:
+                            self.default_job = None
             finally:
                 self.last = time.time()
-            if not timed_out:
-                self.outstanding = 0
-                with self.execs_lock:
-                    self.shell_job = None
             return status, timed_out
-
-    def interrupt_running(self):
-        """Ctrl-C.  Returns True if a command was in flight and was signalled.
-
-        Deliberately does not take the lock when something is running: the
-        command holding it is the one that needs interrupting.  Writing into
-        the pty while another thread reads from it is safe.
-        """
-        if self.lock.acquire(False):
-            try:
-                if self.outstanding:
-                    # A timed-out command, still running with nobody watching.
-                    self._resync()
-                    return True
-                # Nothing running: the Ctrl-C only clears the remote line
-                # editor, but resync anyway so a half-typed state cannot
-                # linger into the next command.
-                self._resync()
-                self.last = time.time()
-                return False
-            finally:
-                self.lock.release()
-        self.abort.set()
-        return True
 
     def _drain_interactive(self):
         """Discard what an abandoned interactive command left behind.
@@ -3571,7 +3603,8 @@ class _Session(object):
                 last_data = time.time()
             elif time.time() - last_data >= quiet_for:
                 break
-        self.outstanding = 0
+        with self.execs_lock:
+            self.default_job = None
 
     def setup(self, wait):
         """Bring the program to a known state; return its banner.
@@ -3586,10 +3619,15 @@ class _Session(object):
             return sink.value()
 
         self._write(SESSION_SETUP)
+        job = self._new_job(self.chan, "shell", "echo ready", default=True)
+        with self.execs_lock:
+            self.default_job = job
         self._write(self.session_frame("echo ready"))
-        self.outstanding = 1
         status, timed_out = self._pump(_ShellFramer(self), sink,
-                                       time.time() + wait)
+                                       time.time() + wait, job=job)
+        if not timed_out and not job.aborted:
+            with self.execs_lock:
+                self.default_job = None
         out = sink.value()
         if timed_out or status is None:
             raise SystemExit(
@@ -3817,10 +3855,8 @@ class _Session(object):
                 return False
             self.chain, self.chan = clients, chan
             self.transport, self.mark = transport, mark.encode("utf-8")
-            self.outstanding = 0
-            self.abort.clear()
             with self.execs_lock:
-                self.shell_job = None
+                self.default_job = None
             try:
                 self.setup(self.setup_wait)
                 self.setup_rcfile()
@@ -3961,11 +3997,23 @@ class _Session(object):
 #                "state": "running" or "pending" or "stopping"}, ...]}\n
 #
 # It is answered before link resolution, like status, without taking the
-# persistent shell lock or starting a reconnect. The default persistent
-# shell is excluded; its active command is a separate job. Exec/login and
-# SFTP channels are included, as is an interactive program started with -c.
-# Completed jobs disappear; pending shell commands can outlive their client.
+# persistent shell lock or starting a reconnect. The idle primary shell or
+# -c program is excluded; its current request is the default job, in either
+# mode. Exec/login and SFTP channels are also included. Completed jobs
+# disappear; pending primary requests can outlive their client.
 # This is daemon metadata, not the remote shell's process/job table.
+#
+#     {"op": "interrupt"}\n
+#     {"op": "interrupt", "job": N}\n
+#
+# Without a job ID only the current default job is interrupted; idle is a
+# no-op. Default shell/interactive jobs are created per request and retain
+# cancellation state until completion or resynchronization. Their IDs signal
+# the request without closing the primary channel;
+# exec/login/SFTP job IDs close only their own channel. Unknown IDs fail.
+# Exec/login/SFTP requests may include a random "job_token", also sent with their
+# client's interrupt request, to target Ctrl-C before the client knows the ID.
+# On daemon exit all job channels and the primary channel are closed.
 #
 # An exec may carry a "pty": {"term": ..., "cols": N, "rows": N} for a command
 # that will not run without a terminal.  The size is the client's window and
@@ -4306,12 +4354,14 @@ class _SessionSFTPChannel(object):
         self.control.close()
 
 
-def open_session_sftp(name, timeout, transfer=None):
+def open_session_sftp(name, timeout, transfer=None, job_token=None):
     control = _connect_session(name, timeout)
     local, remote = socket.socketpair()
     channel = _SessionSFTPChannel(local, control)
     try:
-        payload = {"op": "sftp"}
+        payload = {"op": "sftp",
+                   "job_token": (job_token if job_token is not None
+                                 else secrets.token_hex(16))}
         if transfer is not None:
             payload["transfer"] = transfer
         request = json.dumps(payload).encode("utf-8") + b"\n"
@@ -4657,9 +4707,9 @@ def _session_serve(session, srv, path, opts):
                     kind = "sftp"
                 description = "%s -> %s" % (
                     transfer.get("source", ""), transfer.get("destination", ""))
-                job = session._new_job(chan, kind, description)
-                with session.execs_lock:
-                    session.execs.add(job)
+                job = session._new_job(chan, kind, description,
+                                       token=req.get("job_token"))
+                session._register_job(job)
                 session.served += 1
                 chan.invoke_subsystem("sftp")
                 os.set_blocking(fd, False)
@@ -4700,7 +4750,21 @@ def _session_serve(session, srv, path, opts):
 
         if op == "interrupt":
             try:
-                signalled = session.interrupt_running()
+                job_id = req.get("job")
+                token = req.get("job_token")
+                if job_id is not None:
+                    if type(job_id) is not int or job_id < 0:
+                        raise ValueError("job ID must be a nonnegative integer")
+                    signalled = session.interrupt_job(job_id)
+                elif token is not None:
+                    signalled = session.interrupt_job(token=token)
+                else:
+                    # -c replaces the default shell with a program; only
+                    # that primary channel is signalled, never exec/SFTP.
+                    signalled = session.interrupt_job()
+            except ValueError as exc:
+                _reply(conn, {"error": "mssh: %s" % exc})
+                return
             except _SessionDead as exc:
                 _session_log("session.interrupt_failed", logging.ERROR,
                              session, session.chan, exc)
@@ -4713,10 +4777,6 @@ def _session_serve(session, srv, path, opts):
                 else:
                     _reply(conn, {"error": _reconnecting_message(session, exc)})
                 return
-            # An --exec command has no pty to type a Ctrl-C into, so it is
-            # stopped by closing its channel; either kind counts as a command
-            # that was interrupted.
-            signalled = bool(session.interrupt_execs()) or signalled
             # Whatever output the interrupt produced belongs to the client
             # that is still streaming the interrupted command, not to this
             # one, so there is nothing to return but the fact of it.
@@ -4898,7 +4958,8 @@ def _session_serve(session, srv, path, opts):
                 status, timed_out = session.exec_run(
                     req.get("line", ""), wait, out_sink, err_sink,
                     in_fd=in_fd, conn=conn, pty=pty, control=rest,
-                    shell=bool(req.get("shell")), rcfile_data=rcfile_data)
+                    shell=bool(req.get("shell")), rcfile_data=rcfile_data,
+                    job_token=req.get("job_token"))
             except _SessionDead as exc:
                 _session_log("exec.request_failed", logging.ERROR,
                              session, exc=exc)
@@ -4984,11 +5045,7 @@ def _session_serve(session, srv, path, opts):
             _session_log("daemon.socket_unlink_failed", logging.WARNING, exc=exc)
         session.stopping.set()            # stop a reconnect run mid-backoff
         session.cleanup_rcfiles()
-        try:
-            _close_session_channel(session.chan)
-        except Exception as exc:
-            _session_log("daemon.shell_close_failed", logging.WARNING,
-                         session, session.chan, exc)
+        session.close_channels()
         close_all(session.chain)
         _session_log("daemon.stopped")
 
@@ -5233,6 +5290,7 @@ def run_session_send(name, line, opts, shell=False):
     use_exec = shell or bool(getattr(opts, "exec_channel", False))
     want_pty = use_exec and (shell or opts.force_tty) and _both_ends_are_tty()
     interrupted = {"count": 0}
+    job_token = secrets.token_hex(16) if use_exec else None
 
     def on_sigint(_signum, _frame):
         interrupted["count"] += 1
@@ -5243,7 +5301,10 @@ def run_session_send(name, line, opts, shell=False):
         sys.stderr.write("\nmssh: interrupting the remote command "
                          "(Ctrl-C again to leave it running)\n")
         try:
-            session_request(name, {"op": "interrupt"}, timeout=15.0)
+            control = {"op": "interrupt"}
+            if job_token is not None:
+                control["job_token"] = job_token
+            session_request(name, control, timeout=15.0)
         except (SessionGone, SystemExit, OSError):
             pass
 
@@ -5257,6 +5318,8 @@ def run_session_send(name, line, opts, shell=False):
 
     request = {"op": "exec" if use_exec else "send",
                "line": line, "wait": opts.wait}
+    if job_token is not None:
+        request["job_token"] = job_token
     if shell:
         request["shell"] = True
         if getattr(opts, "rcfile_data", None) is not None:
@@ -5304,14 +5367,18 @@ def run_session_send(name, line, opts, shell=False):
             signal.signal(signal.SIGINT, previous)
 
 
-def run_session_interrupt(name):
-    reply = session_request(name, {"op": "interrupt"}, timeout=30.0)
+def run_session_interrupt(name, job_id=None):
+    payload = {"op": "interrupt"}
+    if job_id is not None:
+        payload["job"] = job_id
+    reply = session_request(name, payload, timeout=30.0)
     if reply.get("error"):
         sys.stderr.write(reply["error"].rstrip("\n") + "\n")
         return 1
     if reply.get("interrupted"):
-        sys.stderr.write("mssh: session %s: interrupted the running command\n"
-                         % name)
+        sys.stderr.write("mssh: session %s: interrupted %s\n" %
+                         (name, "job %d" % job_id if job_id is not None else
+                          "the running command"))
     else:
         sys.stderr.write("mssh: session %s: nothing was running\n" % name)
     return 0
@@ -5552,7 +5619,7 @@ def run_session(parser, opts):
                 return run_session_jobs(name)
             if controls[0] == "stop":
                 return run_session_stop(name)
-            return run_session_interrupt(name)
+            return run_session_interrupt(name, opts.job)
         except SessionGone:
             _no_session(name)
 
@@ -5772,7 +5839,14 @@ persistent session (keep one connection and one shell alive):
 
   mssh --session s --status    # target, uptime, commands served, link
   mssh --session s --interrupt # Ctrl-C, to unstick a hung command
+  mssh s --jobs               # list active tasks and their IDs
+  mssh s --interrupt --job 3  # interrupt only this task
   mssh --session s --stop      # end it; --sessions lists live ones
+
+  --interrupt alone only reaches the current default shell/interactive
+  request, not independent exec/login/SFTP jobs. Idle is a no-op.
+  --job ID selects one task from --jobs.
+  --stop closes the default channel and every job channel.
 
   A session dies with its connection: a jump host or the target rebooting
   ends it, and the next call says so.  --reconnect N, on the call that
@@ -5816,9 +5890,9 @@ persistent session (keep one connection and one shell alive):
   does NOT apply and neither do its variables or functions.  In exchange
   there is no pty: stdout and stderr stay apart, nothing is framed and no
   carriage returns are added, and several --exec commands can run at once,
-  even while the session's own shell is busy.  --wait, --interrupt, Ctrl-C,
-  stdin and the exit code behave as they do without it, except that a
-  command cut short -- a timeout, an interrupt, a client that walked away --
+  even while the session's own shell is busy.  --wait, Ctrl-C, stdin and the
+  exit code behave as they do without it; --interrupt requires --job ID.
+  A command cut short -- a timeout, an interrupt, a client that walked away --
   is killed with its channel rather than left running on the target.
 
   --exec -t asks for a pty on that channel, for the programs that refuse
@@ -5988,7 +6062,11 @@ def build_parser():
     )
     group.add_argument(
         "--interrupt", action="store_true",
-        help="send Ctrl-C to the session, as if at its keyboard",
+        help="interrupt the default shell's task; use --job ID for a specific task",
+    )
+    group.add_argument(
+        "--job", type=int, metavar="ID",
+        help="with --interrupt, target a job ID from --jobs",
     )
     group.add_argument(
         "--jobs", action="store_true",
@@ -6177,6 +6255,9 @@ def main(argv=None):
     head, command = _split_command(parser, list(argv))
     opts = parse_cli(parser, head)
     opts.args = list(opts.args) + command
+
+    if opts.job is not None and (not opts.interrupt or opts.job < 0):
+        parser.error("--job requires --interrupt and a nonnegative job ID")
     opts.rcfile_data = None
     if opts.rcfile:
         if opts.command or opts.copy_id is not None or opts.sessions \
@@ -6213,6 +6294,8 @@ def main(argv=None):
             else DEFAULT_SESSION_WAIT
 
     if opts.sessions:
+        if opts.job is not None:
+            parser.error("--job cannot be combined with --sessions")
         if opts.jobs:
             parser.error("--jobs cannot be combined with --sessions")
         if opts.put is not None or opts.get is not None:

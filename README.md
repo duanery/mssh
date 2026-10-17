@@ -349,12 +349,30 @@ immediately, as it always has.
 
 `mssh NAME --jobs` lists mssh-managed tasks with their ID, type, channel,
 state, elapsed time and command or transfer paths. It includes active shell
-commands, exec/login channels, SFTP transfers and a program started with `-c`.
-The default persistent shell itself is not a job. A timed-out or detached
-shell command remains `pending` until it is completed or resynchronized.
+or interactive requests, exec/login channels and SFTP transfers.
+The idle persistent shell or `-c` program itself is not a job. Each request
+on its primary channel creates a default job, removed when the reply completes.
+A timed-out or detached request remains `pending` until resynchronized.
 This is a daemon snapshot, not a remote process list: background processes
 started by the shell are not tracked individually. Finished tasks disappear;
 jobs are not saved as history, and IDs restart when the daemon is recreated.
+
+```bash
+mssh web --interrupt          # only the default shell's task
+mssh web --jobs               # find the task's ID
+mssh web --interrupt --job 3  # interrupt one specific task
+```
+
+`--interrupt` without `--job` leaves independent exec/login/SFTP tasks alone.
+For a `-c` session it interrupts the current interactive request.
+With no default job, it reports that nothing is running.
+`--job ID` requires `--interrupt`; an unknown or completed ID reports an error.
+Interrupting a default shell or interactive task keeps the primary channel
+alive; interrupting an exec/login/SFTP task closes only that task's channel.
+Client-side Ctrl-C
+on an exec/login request targets its own task, not the default shell or
+other jobs. Stopping or exiting the session closes the default channel
+and all job channels.
 
 Files can also use the existing session's connection, without rebuilding
 the jump chain or authenticating again:
@@ -376,8 +394,9 @@ variables and `~` are not expanded. The target must provide SFTP.
 
 Transfers use their own channel and can run alongside shell commands or
 other transfers, including in a session holding an interactive program.
-An interrupted download removes its partial local file. `--interrupt`
-also stops active transfer channels. Session channels detach their receive
+An interrupted download removes its partial local file.
+`--interrupt --job ID` stops the selected transfer; plain `--interrupt`
+does not stop transfers. Session channels detach their receive
 notifications before closing, preventing late remote data from writing to
 a closed Paramiko event pipe and disconnecting the shared transport.
 Client-side prefetch cancellation hardening remains separate work; some
@@ -410,9 +429,10 @@ jobs. What you get instead is everything the pty was costing —
 - **Several run at once**, including while the session's shell is busy with
   something else.
 
-`--wait`, `--interrupt`, Ctrl-C, stdin and the exit code behave as they do for
-a normal send, with one deliberate difference: a command that ends any way but
-normally — a `--wait` timeout, an `--interrupt`, a client that walked away — is
+`--wait`, Ctrl-C, stdin and the exit code behave as they do for a normal send;
+use `--interrupt --job ID` to interrupt an exec task from another client.
+A command that ends any way but
+normally — a `--wait` timeout, a targeted interruption, a client that walked away — is
 **killed** rather than left running, because closing its channel is what ends
 it and nothing else is waiting on that channel. A shell command in the same
 position keeps running, since the next send has to share the same pty with it.
@@ -616,7 +636,7 @@ points at a specific file.
 | `-V, --version` | Print the version |
 
 Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
-`--interrupt`, `--exec`, `--prompt REGEX`, `--stdin`, `--idle SEC`,
+`--interrupt`, `--job ID`, `--exec`, `--prompt REGEX`, `--stdin`, `--idle SEC`,
 `--wait SEC`, `--reconnect N`, `--session-idle SEC`.
 
 `mssh --help` carries the same detail plus worked examples.

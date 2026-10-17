@@ -19,6 +19,111 @@ SPEC.loader.exec_module(mssh)
 
 
 class TestSessionChannelClose(unittest.TestCase):
+    def make_session(self):
+        return mssh._Session(mock.Mock(), "marker", "shell", None, 0.1,
+                             "root@localhost:22", None)
+
+    def test_shutdown_closes_all_channels_and_rejects_late_jobs(self):
+        session = self.make_session()
+        jobs = [session._new_job(mock.Mock(), kind, "")
+                for kind in ("exec", "login", "sftp")]
+        for job in jobs:
+            session._register_job(job)
+        closed = []
+
+        def close(chan):
+            self.assertTrue(session.stopping.is_set())
+            # Closing must not hold the registry lock: channel teardown can
+            # wake workers which need that lock to unregister themselves.
+            self.assertTrue(session.execs_lock.acquire(False))
+            session.execs_lock.release()
+            closed.append(chan)
+
+        with mock.patch.object(mssh, "_close_session_channel", side_effect=close):
+            session.close_channels()
+            late = session._new_job(mock.Mock(), "exec", "")
+            with self.assertRaises(mssh._SessionDead):
+                session._register_job(late)
+        self.assertEqual(set(closed),
+                         set([session.chan, late.chan] + [j.chan for j in jobs]))
+        self.assertTrue(all(job.aborted for job in jobs))
+        self.assertTrue(late.aborted)
+        self.assertNotIn(late, session.execs)
+
+    def test_targeted_shell_interrupt_does_not_cancel_successor(self):
+        session = self.make_session()
+        job = session._new_job(session.chan, "shell", "sleep 30", default=True)
+        session.default_job = job
+        session.lock.acquire()
+        try:
+            self.assertTrue(session.interrupt_job(job.id))
+            self.assertTrue(job.aborted)
+            # Simulate command completion before the pump sees cancellation.
+            successor = session._new_job(session.chan, "shell", "echo next",
+                                         default=True)
+            session.default_job = successor
+            self.assertFalse(successor.aborted)
+            with self.assertRaises(ValueError):
+                session.interrupt_job(job.id)
+            self.assertFalse(successor.aborted)
+        finally:
+            session.lock.release()
+
+    def test_aborted_exec_does_not_touch_closed_channel(self):
+        session = self.make_session()
+        job = session._new_job(mock.Mock(), "exec", "sleep 30")
+        job.aborted = True
+        sinks = [mssh._BufSink(), mssh._BufSink()]
+        self.assertEqual(session._pump_exec(
+            job, sinks[0], sinks[1], float("inf")), (130, False))
+        self.assertEqual(job.chan.mock_calls, [])
+
+    def test_default_interrupt_resynchronizes_both_modes(self):
+        session = self.make_session()
+        session.chan.closed = False
+        for mode in ("shell", "interactive"):
+            session.mode = mode
+            session.default_job = None
+            self.assertFalse(session.interrupt_job())
+            job = session._new_job(session.chan, mode, "command", default=True)
+            session.default_job = job
+            with mock.patch.object(session, "_resync") as resync:
+                self.assertTrue(session.interrupt_job())
+                resync.assert_called_once_with()
+            self.assertTrue(job.aborted)
+            session.chan.close.assert_not_called()
+
+    def test_concurrent_job_tokens_are_explicit(self):
+        session = self.make_session()
+        barrier = threading.Barrier(3)
+        jobs = []
+
+        def create(token):
+            # Logging context is intentionally irrelevant to job identity.
+            mssh._SESSION_LOG_CONTEXT.job_token = "not-the-request-token"
+            barrier.wait()
+            job = session._new_job(mock.Mock(closed=False), "exec", token,
+                                   token=token)
+            session._register_job(job)
+            jobs.append(job)
+
+        workers = [threading.Thread(target=create, args=(token,))
+                   for token in ("request-one", "request-two")]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual({job.token for job in jobs},
+                         {"request-one", "request-two"})
+        with mock.patch.object(mssh, "_close_session_channel") as close:
+            self.assertTrue(session.interrupt_job(token="request-one"))
+            close.assert_called_once_with(
+                next(job.chan for job in jobs if job.token == "request-one"))
+        self.assertFalse(next(job.aborted for job in jobs
+                              if job.token == "request-two"))
+
     def test_original_close_exposes_closed_pipe_to_late_feed(self):
         chan = paramiko.Channel(1)
         chan.fileno()
