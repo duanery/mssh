@@ -275,7 +275,7 @@ tar cf - ./dir | mssh --session s 'tar xf - -C /srv'
 Managing them:
 
 ```bash
-mssh --session s --status      # target, uptime, commands served, idle/running
+mssh --session s --status      # session/link state, activity and job counts
 mssh --session s --jobs        # commands, exec/login channels and transfers
 mssh --session s --interrupt   # Ctrl-C into the session, to unstick something
 mssh --session s --stop        # end it and close the connection
@@ -285,6 +285,23 @@ mssh --sessions                # list every live session and its job count
 The `JOBS` column uses the same task snapshot as `--jobs`, including pending
 requests and persistent forwards but excluding the idle primary shell.
 It shows `?` when an older daemon does not provide a count or cannot respond.
+
+`--status` distinguishes idle, forwarding-only, running, pending, interrupting,
+disconnected, reconnecting, stopping and ended sessions. A pending task means
+its client stopped waiting; it remains tracked until its result is consumed
+or the primary channel is resynchronized. Connection/lifecycle states take
+precedence over surviving forward listeners. The `default:` line reports the
+primary shell or interactive request independently of exec/login channels,
+transfers and proxies.
+
+The reply includes total jobs with a type breakdown (`socks` counts `-D`
+listeners, `forward` counts `-L` listeners), time since last session activity,
+and the configured idle expiry. Detailed commands, channels and forwarding
+addresses are shown only by `--jobs`, not `--status`.
+An unused listener does not mean traffic is flowing.
+Status remains available during long commands and reconnect backoff, without
+waiting for the shell or starting a reconnect. Older daemons show only the
+fields they provide; missing task details are not reported as zero jobs.
 
 ### Surviving a reboot
 

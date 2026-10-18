@@ -3570,6 +3570,9 @@ class _Session(object):
                 {"id": job.id, "kind": job.kind, "command": job.command,
                  "channel": getattr(job.chan, "chanid", None),
                  "started": job.started,
+                 "default": job.default,
+                 "forward_type": "socks" if getattr(job, "dynamic", False) else
+                                 "local" if job.kind == "forward" else None,
                  "state": "stopping" if job.aborted else
                           "pending" if job is self.default_job and
                           not self.lock.locked() else "running"}
@@ -4714,6 +4717,8 @@ class _Session(object):
 #     {"op": "jobs"}\n
 #     {"jobs": [{"id": N, "kind": "...", "command": "...",
 #                "channel": N or null, "started": UNIX_SECONDS,
+#                "default": true or false,
+#                "forward_type": "local" or "socks" or null,
 #                "state": "running" or "pending" or "stopping"}, ...]}\n
 #
 # It is answered before link resolution, like status, without taking the
@@ -4722,8 +4727,14 @@ class _Session(object):
 # mode. Exec/login, SFTP channels and local forwards are included. Completed jobs
 # disappear; pending primary requests can outlive their client.
 # This is daemon metadata, not the remote shell's process/job table.
-# The status reply includes "jobs": N using the same snapshot rules, so
-# --sessions can show counts without making a second request to each daemon.
+# The status reply keeps "jobs": N for --sessions and older clients, and
+# adds "job_details": [...] from that same snapshot. "default" identifies the
+# primary request; "forward_type" distinguishes -L from -D while preserving
+# the existing "forward" job kind. Status also includes "last_activity"
+# (UNIX_SECONDS), "idle_limit" (seconds; zero disables expiry) and "stopping"
+# (boolean). These are read-only metadata: a query does not refresh activity,
+# acquire the primary lock, resynchronize a pending task or trigger reconnect.
+# Clients must distinguish absent details from an empty list on old daemons.
 #
 # "op": "forward" adds persistent local TCP/Unix listeners, with no descriptors:
 #
@@ -5333,6 +5344,7 @@ def _session_serve(session, srv, path, opts):
             # Answered whatever state the link is in: a session whose target
             # is rebooting is exactly when somebody wants to look at it.
             link, broken, attempt = session.link_state()
+            jobs = session.jobs_snapshot()
             _reply(conn, {
                 "target": str(session.target), "command": session.command,
                 "mode": session.mode, "started": session.started,
@@ -5342,7 +5354,13 @@ def _session_serve(session, srv, path, opts):
                 "retries": session.retries, "reconnects": session.reconnects,
                 "refusal": session.refusal(), "last_error": session.last_error,
                 "rcfile": session.rcfile_path,
-                "jobs": len(session.jobs_snapshot()),
+                # Keep the numeric count for --sessions and older clients.
+                # Details use the same snapshot, without a second request or
+                # waiting for the primary shell to finish its current command.
+                "jobs": len(jobs), "job_details": jobs,
+                "last_activity": session.last,
+                "idle_limit": opts.session_idle,
+                "stopping": session.stopping.is_set(),
             })
             return
         if op == "stop":
@@ -6231,6 +6249,33 @@ def _uptime(seconds):
 
 def run_session_status(name):
     info = session_request(name, {"op": "status"}, timeout=15.0)
+    if info.get("error"):
+        sys.stderr.write(info["error"].rstrip("\n") + "\n")
+        return 1
+    now = time.time()
+    link = info.get("link") or "up"
+    rows = info.get("job_details")
+    # Old daemons expose only the primary-shell lock and possibly a count.
+    # Do not turn missing details into "no jobs" or invent per-type counts.
+    state = "running a command" if info.get("running") else "idle"
+    if rows is not None:
+        if any(row["kind"] != "forward" and row["state"] == "running" for row in rows):
+            state = "running"
+        elif any(row["state"] == "stopping" for row in rows):
+            state = "interrupting"
+        elif any(row["state"] == "pending" for row in rows):
+            state = "pending"
+        elif rows:
+            state = "forwarding"
+    # Lifecycle takes precedence over surviving listeners or stale job rows.
+    if info.get("dead"):
+        state = "ended (%s)" % info["dead"]
+    elif info.get("stopping"):
+        state = "stopping"
+    elif link == "reconnecting":
+        state = "reconnecting"
+    elif link == "down":
+        state = "disconnected"
     sys.stdout.write(
         "session:  %s\n"
         "target:   %s\n"
@@ -6244,12 +6289,35 @@ def run_session_status(name):
         % (name, info.get("target", "?"), info.get("mode", "?"),
            info.get("command") or "login shell",
            info.get("rcfile") or "none",
-           _uptime(time.time() - float(info.get("started") or time.time())),
+           _uptime(max(0, now - float(info.get("started") or now))),
            int(info.get("served") or 0),
-           "running a command" if info.get("running") else "idle",
+           state,
            int(info.get("pid") or 0))
     )
-    link = info.get("link") or "up"
+    if rows is not None:
+        default = next((row for row in rows if row.get("default")), None)
+        sys.stdout.write("default:  %s\n" %
+                         ("job %s (%s)" % (default["id"], default["state"])
+                          if default else "idle"))
+        counts = {}
+        for row in rows:
+            kind = "socks" if row.get("forward_type") == "socks" else row["kind"]
+            counts[kind] = counts.get(kind, 0) + 1
+        sys.stdout.write("jobs:     %d%s\n" %
+                         (len(rows), " (%s)" % ", ".join(
+                             "%s=%d" % (kind, counts[kind]) for kind in sorted(counts))
+                          if counts else ""))
+    elif "jobs" in info:
+        sys.stdout.write("jobs:     %s\n" % info["jobs"])
+    else:
+        sys.stdout.write("jobs:     unknown\n")
+    if info.get("last_activity") is not None:
+        sys.stdout.write("activity: %s ago\n" %
+                         _uptime(max(0, now - float(info["last_activity"]))))
+    if "idle_limit" in info:
+        sys.stdout.write("expiry:   %s\n" %
+                         ("%gs of inactivity" % info["idle_limit"]
+                          if info["idle_limit"] > 0 else "disabled"))
     if link == "reconnecting":
         sys.stdout.write("link:     down (%s) -- reconnecting, attempt %d "
                          "of %d\n"
@@ -6261,16 +6329,17 @@ def run_session_status(name):
             "link:     down (%s); %s\n"
             % (info.get("broken") or "?",
                info.get("refusal")
-               or ("no reconnection left -- one more will be tried when the "
+               or ("reconnection disabled" if not info.get("retries") else
+                   "no reconnection left -- one more will be tried when the "
                    "next command arrives" + (", last error: %s"
                                              % info["last_error"]
                                              if info.get("last_error")
                                              else ""))))
+    else:
+        sys.stdout.write("link:     %s\n" % link)
     if info.get("reconnects"):
         sys.stdout.write("rebuilt:  %d time(s) since it started\n"
                          % int(info["reconnects"]))
-    if info.get("dead"):
-        sys.stdout.write("state:    ended (%s)\n" % info["dead"])
     return 0
 
 
@@ -6705,6 +6774,8 @@ persistent session (keep one connection and one shell alive):
   mssh --session g 'bt'                            # output, then exit 0
 
   mssh --session s --status    # target, uptime, commands served, link
+  --status also shows task counts, default job state and recent activity.
+  Use --jobs for commands, channels and -L/-D listener details.
   mssh --session s --interrupt # Ctrl-C, to unstick a hung command
   mssh s --jobs               # list active tasks and their IDs
   mssh s --interrupt --job 3  # interrupt only this task
@@ -6946,8 +7017,8 @@ def build_parser():
     )
     group.add_argument(
         "--status", action="store_true",
-        help="print the session's target, uptime, command count and, when "
-             "the connection has dropped, what --reconnect is doing about it",
+        help="print session state, link, uptime, activity and task counts, "
+             "including default job state and reconnect progress",
     )
     group.add_argument(
         "-L", dest="local_forwards", action="append", default=[],
