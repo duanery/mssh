@@ -303,6 +303,9 @@ Status remains available during long commands and reconnect backoff, without
 waiting for the shell or starting a reconnect. Older daemons show only the
 fields they provide; missing task details are not reported as zero jobs.
 
+For client/server message layouts, descriptor ownership and request
+lifecycles, see [Session Client/Server Interaction](session-protocol.md).
+
 ### Surviving a reboot
 
 A session is only as alive as its connection. A jump host restarting, the
