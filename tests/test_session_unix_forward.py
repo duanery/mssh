@@ -542,7 +542,7 @@ class TestSessionUnixForward(SessionTest, UnixServers):
 
 @unittest.skipUnless(shutil.which("sshd") and os.getuid() == 0,
                      "local OpenSSH inetd tests require sshd and root")
-class TestOpenSSHUnixForward(unittest.TestCase, UnixServers):
+class OpenSSHForwardTest(unittest.TestCase, UnixServers):
     def setUp(self):
         self.temp = TemporaryDirectory(prefix="mssh-openssh-unix-")
         self.addCleanup(self.temp.cleanup)
@@ -586,6 +586,8 @@ class TestOpenSSHUnixForward(unittest.TestCase, UnixServers):
             self.daemon.kill()
             self.daemon.communicate(timeout=5)
 
+
+class TestOpenSSHUnixForward(OpenSSHForwardTest):
     def test_real_openssh_all_unix_combinations_and_half_closes(self):
         self.unix.RequestHandlerClass = ReplyAfterEOF
         self.tcp.RequestHandlerClass = ReplyAfterEOF

@@ -462,6 +462,52 @@ the rebuilt transport. Connections received while the link is down are
 closed rather than queued or replayed. Forward traffic updates session
 activity; an unused listener alone does not prevent `--session-idle` expiry.
 
+#### Dynamic SOCKS Proxies
+
+`-D [bind_address:]port` creates a SOCKS proxy owned by the session daemon,
+at startup or through a later client:
+
+```bash
+mssh --session web -D 1080 -j ops@jump root@target
+mssh web -D 127.0.0.1:1081
+mssh web -D '[::1]:1082'
+curl --socks5-hostname 127.0.0.1:1080 http://service.internal/
+mssh web --jobs
+mssh web --stop --job 3
+```
+
+SOCKS4, SOCKS4a and SOCKS5 support TCP `CONNECT`. SOCKS4a and SOCKS5
+domain names are passed to the target's SSH server for resolution, not
+resolved on the local machine. Use a client option such as
+`curl --socks5-hostname` when remote DNS is needed. SOCKS5 offers only
+the no-authentication method; authentication, `BIND` and `UDP ASSOCIATE`
+are not supported. The SSH server must permit `direct-tcpip` forwarding.
+CONNECT is acknowledged only after the SSH channel has opened; a refused
+destination affects that client connection, not the listener or session.
+
+Default binding is `localhost`, with IPv4 and IPv6 when available.
+Bracket explicit IPv6 addresses. Ports must be between 1 and 65535.
+`*` or an empty bind address exposes the proxy on all interfaces:
+there is no SOCKS authentication, so anyone who can reach that listener
+can use the session's access to TCP services on the target's network.
+Keep the default loopback binding unless this exposure is intended.
+
+Repeat `-D` and combine it with `-L` in one request. All new listeners
+are bound before success; any failure rolls back the whole addition
+without changing existing forwards. Configuring an existing session
+takes no command, login or copy options. The configuring client exits,
+while each proxy remains as one `forward` job (`bind -> SOCKS4/5`).
+`--stop --job ID` or `--interrupt --job ID` closes its listener, pending
+handshakes and active connections; default `--interrupt` leaves it alone.
+Session stop, exit and idle expiry close every proxy.
+
+With `--reconnect`, listeners and job IDs survive transport replacement;
+connections do not. Requests made while disconnected fail rather than
+being queued. Handshakes have a total `--timeout` limit, with a minimum
+of one second, and bounded fields. Successful requests and relayed traffic
+update session activity; an unused listener alone does not prevent expiry.
+Older session daemons must be stopped and recreated to accept `-D`.
+
 #### File Transfers
 
 Files can also use the existing session's connection, without rebuilding
@@ -727,7 +773,8 @@ points at a specific file.
 | `-V, --version` | Print the version |
 
 Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
-`--interrupt`, `--job ID`, `-L [BIND:]PORT:HOST:HOSTPORT`, `--exec`,
+`--interrupt`, `--job ID`, `--jobs`, `-L SPEC`, `-D [BIND:]PORT`, `--exec`,
+`--put LOCAL REMOTE`, `--get REMOTE LOCAL`,
 `--prompt REGEX`, `--stdin`, `--idle SEC`,
 `--wait SEC`, `--reconnect N`, `--session-idle SEC`.
 
@@ -768,6 +815,7 @@ python3 tests/test_session_daemon.py   # daemon, protocol, client      (62)
 python3 tests/test_copy_mode.py        # copy permissions vs real scp (51)
 python3 -m unittest discover -s tests -p test_session_forward.py
 python3 -m unittest discover -s tests -p test_session_unix_forward.py
+python3 -m unittest discover -s tests -p test_session_socks.py
 ```
 
 No external network: the framing layer is driven against local `bash`,
@@ -779,6 +827,8 @@ listeners and a real Paramiko client/server transport over a socketpair.
 Unix forwarding tests also use local Unix sockets. When `sshd` is available
 and the tests run as root, additional socketpair-based tests check actual
 OpenSSH streamlocal channels; otherwise only those tests are skipped.
+SOCKS tests exercise fragmented requests, remote DNS, failures, cancellation,
+reconnects and binary half-closes, including a real curl client when available.
 Some of the permission tests drop to
 an unprivileged user, since root ignores permission bits and would pass either
 way.

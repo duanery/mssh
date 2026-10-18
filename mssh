@@ -2860,14 +2860,150 @@ def _forward_address(host, port):
     return "%s:%d" % ("[%s]" % host if ":" in host else host, port)
 
 
+def parse_dynamic_forward(spec):
+    """Parse SSH -D [bind_address:]port using the same TCP bind rules as -L."""
+    if not isinstance(spec, str) or not re.fullmatch(
+            r"(?:(\[[^\]]+\]|[^:]*):)?[0-9]+", spec):
+        raise ValueError("-D expects [bind_address:]port")
+    try:
+        settings = parse_local_forward(spec + ":localhost:1")
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("-L", "-D"))
+    return {"bind": settings["bind"], "port": settings["port"], "dynamic": True}
+
+
+class _SocksRequest(object):
+    """One bounded SOCKS4/4a or SOCKS5 CONNECT handshake, not a data relay.
+
+    Field widths below are bytes; all two-byte ports use network byte order.
+    TCP may split or combine messages, so _read() consumes exact field sizes
+    and leaves any application data following CONNECT for the stream relay.
+    """
+
+    def __init__(self, conn, timeout):
+        self.conn = conn
+        self.deadline = time.monotonic() + max(timeout, 1.0)
+        self.version = None
+        self.replied = False
+
+    def _read(self, size):
+        data = bytearray()
+        while len(data) < size:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("SOCKS handshake timed out")
+            self.conn.settimeout(remaining)
+            chunk = self.conn.recv(size - len(data))
+            if not chunk:
+                raise EOFError("client closed during SOCKS handshake")
+            data.extend(chunk)
+        return bytes(data)
+
+    def _string(self, limit):
+        data = bytearray()
+        for _ in range(limit + 1):
+            byte = self._read(1)
+            if byte == b"\x00":
+                return bytes(data)
+            data.extend(byte)
+        raise ValueError("SOCKS string exceeds length limit")
+
+    def reply(self, code=0):
+        if self.replied or self.version is None:
+            return
+        self.replied = True
+        # SOCKS5: VER(1)=5 | REP(1) | RSV(1)=0 | ATYP(1)=1 |
+        #         BND.ADDR(4)=0.0.0.0 | BND.PORT(2)=0
+        # REP: 0 success, 1 general failure, 2 denied, 4 host unreachable,
+        #      7 command unsupported, 8 address type unsupported.
+        # SOCKS4/4a: VN(1)=0 | CD(1)=90 granted/91 rejected |
+        #            DSTPORT(2)=0 | DSTIP(4)=0.0.0.0
+        # This proxy has no local socket bound to the destination: the target
+        # SSH server opens it. Return an unspecified BND.ADDR/BND.PORT, just as
+        # SSH dynamic forwarding does, and send success only after channel open.
+        packet = bytes((5, code, 0, 1)) + b"\x00" * 6 if self.version == 5 \
+            else bytes((0, 90 if code == 0 else 91)) + b"\x00" * 6
+        self.conn.sendall(packet)
+
+    def _reject(self, code, message):
+        self.reply(code)
+        raise ValueError(message)
+
+    def destination(self):
+        version = self._read(1)[0]
+        if version == 5:
+            # Method negotiation (RFC 1928):
+            # client: VER(1)=5 | NMETHODS(1) | METHODS(NMETHODS)
+            # server: VER(1)=5 | METHOD(1), 0=no authentication, 255=no match.
+            # The request below follows only after selecting method 0.
+            count = self._read(1)[0]
+            methods = self._read(count)
+            if not count or 0 not in methods:
+                self.conn.sendall(b"\x05\xff")
+                raise ValueError("SOCKS5 requires the no-authentication method")
+            self.conn.sendall(b"\x05\x00")
+            self.version = 5
+            # CONNECT request:
+            # VER(1)=5 | CMD(1)=1 | RSV(1)=0 | ATYP(1) |
+            # DST.ADDR(variable) | DST.PORT(2)
+            # ATYP=1: IPv4(4); ATYP=4: IPv6(16);
+            # ATYP=3: name length(1) followed by that many bytes, no NUL.
+            # CMD=2 is BIND and CMD=3 is UDP ASSOCIATE; neither is supported.
+            version, command, reserved, address_type = self._read(4)
+            if version != 5 or reserved != 0:
+                self._reject(1, "invalid SOCKS5 request header")
+            if command != 1:
+                self._reject(7, "SOCKS5 only supports CONNECT")
+            if address_type == 1:
+                host = socket.inet_ntop(socket.AF_INET, self._read(4))
+            elif address_type == 4:
+                host = socket.inet_ntop(socket.AF_INET6, self._read(16))
+            elif address_type == 3:
+                length = self._read(1)[0]
+                host = self._read(length).decode("ascii")
+                if not host or not valid_host(host):
+                    self._reject(4, "invalid SOCKS5 destination name")
+            else:
+                self._reject(8, "unsupported SOCKS5 address type")
+            port = int.from_bytes(self._read(2), "big")
+        elif version == 4:
+            # SOCKS4 has no method negotiation:
+            # VN(1)=4 | CD(1)=1 CONNECT | DSTPORT(2) | DSTIP(4) |
+            # USERID(variable) | NUL(1)
+            # SOCKS4a uses DSTIP=0.0.0.x (x != 0) and appends
+            # DOMAIN(variable) | NUL(1) after USERID's NUL.
+            # CD=2 (BIND) is unsupported. USERID is consumed, not authenticated.
+            self.version = 4
+            if self._read(1)[0] != 1:
+                self._reject(7, "SOCKS4 only supports CONNECT")
+            port = int.from_bytes(self._read(2), "big")
+            address = self._read(4)
+            # Consume USERID without logging it. SOCKS4a signals that a domain
+            # follows with 0.0.0.x (x != 0); never resolve that name locally.
+            self._string(1024)
+            if address[:3] == b"\x00\x00\x00" and address[3] != 0:
+                host = self._string(255).decode("ascii")
+                if not host or not valid_host(host):
+                    self._reject(4, "invalid SOCKS4a destination name")
+            else:
+                host = socket.inet_ntop(socket.AF_INET, address)
+        else:
+            raise ValueError("unsupported SOCKS version")
+        if not port:
+            self._reject(1, "SOCKS destination port must be between 1 and 65535")
+        return host, port
+
+
 class _LocalForwardJob(_ExecJob):
     """One persistent listener job, owning every accepted socket and channel."""
 
     def __init__(self, session, settings):
         super(_LocalForwardJob, self).__init__(None, "forward")
         self.session = session
+        self.dynamic = settings.get("dynamic", False)
         self.remote_socket = settings.get("remote_socket")
-        self.destination = self.remote_socket or (settings["host"], settings["hostport"])
+        self.destination = None if self.dynamic else self.remote_socket or (
+            settings["host"], settings["hostport"])
         self.socket_path = settings.get("local_socket")
         self.socket_identity = None
         self.listeners = []
@@ -2917,7 +3053,7 @@ class _LocalForwardJob(_ExecJob):
                     raise
                 self.listeners.append(listener)
             if not self.listeners:
-                raise ValueError("-L bind address has no usable addresses")
+                raise ValueError("forward bind address has no usable addresses")
         except BaseException:
             for listener in self.listeners:
                 listener.close()
@@ -2925,6 +3061,7 @@ class _LocalForwardJob(_ExecJob):
             raise
         self.command = "%s -> %s" % (
             self.socket_path or _forward_address(bind or "*", settings["port"]),
+            "SOCKS4/5" if self.dynamic else
             self.remote_socket or _forward_address(*self.destination))
 
     def _unlink_socket(self):
@@ -3037,10 +3174,21 @@ class _LocalForwardJob(_ExecJob):
 
     def _connect(self, conn, origin):
         chan = None
+        request = None
         try:
             transport = self.session.transport
-            if self.aborted or not transport.is_active():
+            if self.aborted:
                 return
+            destination = self.destination
+            if self.dynamic:
+                request = _SocksRequest(conn, self.session.timeout)
+                destination = request.destination()
+                # Handshake reads exactly its fields: bytes pipelined after
+                # CONNECT remain in the socket for the shared stream relay.
+            if self.aborted:
+                return
+            if not transport.is_active():
+                raise paramiko.SSHException("SSH session not active")
             if self.remote_socket:
                 chan = _open_streamlocal_channel(
                     transport, self.remote_socket, self.session.timeout)
@@ -3048,7 +3196,7 @@ class _LocalForwardJob(_ExecJob):
                 # AF_UNIX accept() has no IP/port origin to put in direct-tcpip.
                 source = origin[:2] if not self.socket_path else ("127.0.0.1", 0)
                 chan = transport.open_channel(
-                    "direct-tcpip", self.destination, source,
+                    "direct-tcpip", destination, source,
                     timeout=self.session.timeout)
             with self.lock:
                 if self.aborted:
@@ -3059,10 +3207,24 @@ class _LocalForwardJob(_ExecJob):
                 # _close_session_channel() has detached them for safe close.
                 chan.fileno()
                 self.connections[conn] = chan
+            if request is not None:
+                conn.settimeout(max(self.session.timeout, 1.0))
+                request.reply()
+                self.session.last = time.time()
             _session_log("forward.connected", session=self.session,
                          chan=chan, job=self.id)
             self._relay(conn, chan, transport)
         except Exception as exc:
+            if request is not None and not self.aborted:
+                # SSH exposes only a coarse channel-open error, not the
+                # target's errno. Preserve administrative denial distinctly;
+                # do not claim DNS/refusal details we cannot reliably know.
+                code = 2 if isinstance(exc, paramiko.ChannelException) and \
+                    exc.code == paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED else 1
+                try:
+                    request.reply(code)
+                except OSError:
+                    pass
             # Refused destinations are per-connection failures, not reasons
             # to terminate or reconnect the session's shared SSH transport.
             _session_log("forward.connection_failed",
@@ -3316,11 +3478,15 @@ class _Session(object):
             job.abort()
             raise _SessionDead("session is stopping")
 
-    def add_forwards(self, specs, start=True):
+    def add_forwards(self, specs, start=True, dynamic_specs=None):
         """Bind an entire request before registering any persistent jobs."""
-        if not isinstance(specs, list) or not specs:
-            raise ValueError("-L requires at least one forwarding specification")
+        if dynamic_specs is None:
+            dynamic_specs = []
+        if not isinstance(specs, list) or not isinstance(dynamic_specs, list) \
+                or not (specs or dynamic_specs):
+            raise ValueError("-L/-D require a nonempty list of forwarding specifications")
         settings = [parse_local_forward(spec) for spec in specs]
+        settings.extend(parse_dynamic_forward(spec) for spec in dynamic_specs)
         jobs = []
         try:
             for item in settings:
@@ -4579,6 +4745,20 @@ class _Session(object):
 # Forward configuration and targeted cancellation work while reconnecting.
 # Listener jobs survive transport replacement; individual connections do not.
 #
+# "op": "dynamic_forward" adds SOCKS listeners, optionally with a -L batch:
+#
+#     {"op": "dynamic_forward", "dynamic_specs": ["[bind:]port", ...],
+#      "specs": ["[bind:]port:host:hostport", ...]}\n
+#
+# Reply and atomic registration are the same as "forward". A distinct op
+# prevents old daemons from silently ignoring -D fields. Each SOCKS listener
+# is a "forward" job ("bind -> SOCKS4/5"), owning handshakes and connections.
+# SOCKS4/4a and SOCKS5 support unauthenticated TCP CONNECT only. Requests
+# select each destination; names go to the target without local resolution.
+# CONNECT success follows SSH channel-open success, not just SOCKS parsing.
+# Handshakes have a total timeout and bounded fields; pipelined application
+# bytes remain unread until the shared relay takes over.
+#
 #     {"op": "interrupt"}\n
 #     {"op": "interrupt", "job": N}\n
 #
@@ -5172,13 +5352,22 @@ def _session_serve(session, srv, path, opts):
             state["stop"] = True
             _reply(conn, {"ok": True})
             return
-        if op == "forward":
+        if op in ("forward", "dynamic_forward"):
             try:
-                jobs = session.add_forwards(req.get("specs"))
+                # Older daemons ignore unknown fields. Clients use a distinct
+                # op for -D so an old server cannot silently acknowledge it.
+                if op == "dynamic_forward":
+                    if not req.get("dynamic_specs"):
+                        raise ValueError("-D requires at least one proxy specification")
+                    jobs = session.add_forwards(
+                        req.get("specs", []), dynamic_specs=req.get("dynamic_specs"))
+                else:
+                    jobs = session.add_forwards(req.get("specs"))
             except Exception as exc:
                 _session_log("forward.setup_failed", logging.WARNING,
                              session, exc=exc)
-                _reply(conn, {"error": "mssh: cannot configure -L: %s" % exc})
+                _reply(conn, {"error": "mssh: cannot configure %s: %s" %
+                              ("-L/-D" if op == "dynamic_forward" else "-L", exc)})
             else:
                 _reply(conn, {"ok": True, "forwards": [
                     {"id": job.id, "command": job.command} for job in jobs]})
@@ -5625,10 +5814,11 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
         banner = session.setup(opts.wait)
         if session.mode == "shell":
             session.setup_rcfile()
-        if opts.local_forwards:
+        if opts.local_forwards or opts.dynamic_forwards:
             # Bind before reporting success, but do not accept connections
             # while daemonization still changes the process's standard FDs.
-            forwards = session.add_forwards(opts.local_forwards, start=False)
+            forwards = session.add_forwards(
+                opts.local_forwards, start=False, dynamic_specs=opts.dynamic_forwards)
     except SystemExit as exc:
         _session_log("daemon.start_failed", logging.ERROR, session, exc=exc)
         # A SystemExit carries its own message and nothing has printed it yet
@@ -5938,15 +6128,21 @@ def _show_forwards(name, rows):
                          (name, row["id"], row["command"]))
 
 
-def run_session_forward(name, specs):
+def run_session_forward(name, specs, dynamic_specs=None):
     specs = [_local_forward_spec(parse_local_forward(spec)) for spec in specs]
-    reply = session_request(name, {"op": "forward", "specs": specs}, timeout=30)
+    payload = {"op": "forward", "specs": specs}
+    if dynamic_specs:
+        for spec in dynamic_specs:
+            parse_dynamic_forward(spec)
+        payload.update(op="dynamic_forward", dynamic_specs=dynamic_specs)
+    reply = session_request(name, payload, timeout=30)
     if reply.get("error"):
         sys.stderr.write(reply["error"].rstrip("\n") + "\n")
         return 1
     if not reply.get("ok") or "forwards" not in reply:
-        raise SystemExit("mssh: session daemon does not support -L; "
-                         "stop and recreate the session")
+        raise SystemExit("mssh: session daemon does not support %s; "
+                         "stop and recreate the session" %
+                         ("-D" if dynamic_specs else "-L"))
     _show_forwards(name, reply["forwards"])
     return 0
 
@@ -6194,7 +6390,8 @@ def _session_login_wanted(opts):
     if not opts.session:
         return False
     if opts.args or opts.command or opts.jump or opts.copy_id is not None \
-            or opts.put is not None or opts.get is not None or opts.local_forwards:
+            or opts.put is not None or opts.get is not None or opts.local_forwards \
+            or opts.dynamic_forwards:
         return False
     return not (opts.stop or opts.interrupt or opts.status or opts.jobs)
 
@@ -6212,7 +6409,7 @@ def run_session(parser, opts):
         if opts.args or opts.command or opts.jump or opts.copy_id is not None \
                 or opts.rcfile or opts.exec_channel or opts.force_tty \
                 or opts.stop or opts.interrupt or opts.status or opts.jobs \
-                or opts.reconnect or opts.local_forwards \
+                or opts.reconnect or opts.local_forwards or opts.dynamic_forwards \
                 or opts.prompt is not None:
             parser.error("--put/--get only combine with file-copy options "
                          "and an existing session name")
@@ -6231,8 +6428,8 @@ def run_session(parser, opts):
         parser.error("--%s and --%s cannot be combined" % tuple(controls[:2]))
         return 2
     if controls:
-        if opts.local_forwards:
-            parser.error("-L cannot be combined with --%s" % controls[0])
+        if opts.local_forwards or opts.dynamic_forwards:
+            parser.error("-L/-D cannot be combined with --%s" % controls[0])
         if opts.jobs and (opts.command or opts.jump or opts.force_tty or
                           opts.recursive or opts.preserve or opts.reconnect or
                           opts.copy_id is not None or opts.stdin):
@@ -6305,11 +6502,12 @@ def run_session(parser, opts):
                 "it, --stop to end it" % name
             )
         try:
-            if opts.local_forwards:
+            if opts.local_forwards or opts.dynamic_forwards:
                 if opts.args or opts.exec_channel or opts.force_tty or opts.rcfile \
                         or opts.stdin or opts.no_stdin:
-                    parser.error("-L only takes an existing session name")
-                return run_session_forward(name, opts.local_forwards)
+                    parser.error("-L/-D only take an existing session name")
+                return run_session_forward(
+                    name, opts.local_forwards, opts.dynamic_forwards)
             if opts.rcfile and not login:
                 parser.error("--rcfile initializes a new shell, not a command "
                              "in an existing session")
@@ -6468,6 +6666,18 @@ persistent session (keep one connection and one shell alive):
   start at the configuring client's directory; remote paths are literal.
   Local sockets are mode 0600, never overwrite paths and are removed on stop.
   --reconnect retains listeners, but existing connections cannot be restored.
+
+  Keep a dynamic SOCKS proxy in the session daemon:
+  mssh --session s -D 1080 root@10.0.0.9
+  mssh s -D 127.0.0.1:1081                      # add after session startup
+  mssh s -D '[::1]:1082'                        # IPv6 listener
+  curl --socks5-hostname 127.0.0.1:1080 http://service.internal/
+  -D [bind_address:]port supports SOCKS4/4a and SOCKS5 TCP CONNECT,
+  with names resolved on the target. Authentication, BIND and UDP are
+  not supported. Default bind is localhost; exposing an unauthenticated
+  proxy with * or an empty bind lets other machines use your SSH access.
+  Repeat -D or combine with -L; all new listeners bind or all roll back.
+  Each proxy is a forward job in --jobs; --stop --job ID removes it.
 
   'mssh s' with nothing to run is 'ssh s' as nearly as this can be: a shell on the
   target, on a channel of its own rather than the session's own shell,
@@ -6748,6 +6958,13 @@ def build_parser():
              "--interrupt --job ID stops one",
     )
     group.add_argument(
+        "-D", dest="dynamic_forwards", action="append", default=[],
+        metavar="[BIND:]PORT",
+        help="add a persistent SOCKS4/5 TCP proxy to a session; repeat for "
+             "several, default bind is localhost; remote DNS, no authentication; "
+             "--jobs lists proxies and --stop --job ID stops one",
+    )
+    group.add_argument(
         "--prompt", metavar="REGEX",
         help="with --session -c: the regex marking the end of the program's "
              r"reply, e.g. '\(gdb\) $' or '>>> $'.  Without it mssh guesses, "
@@ -6933,6 +7150,8 @@ def main(argv=None):
         opts.local_forwards = [
             _local_forward_spec(parse_local_forward(spec))
             for spec in opts.local_forwards]
+        for spec in opts.dynamic_forwards:
+            parse_dynamic_forward(spec)
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -6972,8 +7191,8 @@ def main(argv=None):
             else DEFAULT_SESSION_WAIT
 
     if opts.sessions:
-        if opts.local_forwards:
-            parser.error("-L cannot be combined with --sessions")
+        if opts.local_forwards or opts.dynamic_forwards:
+            parser.error("-L/-D cannot be combined with --sessions")
         if opts.job is not None:
             parser.error("--job cannot be combined with --sessions")
         if opts.jobs:
@@ -6992,6 +7211,9 @@ def main(argv=None):
     if opts.local_forwards:
         parser.error("-L requires a session: "
                      "mssh --session NAME -L PORT:HOST:HOSTPORT TARGET")
+    if opts.dynamic_forwards:
+        parser.error("-D requires a session: "
+                     "mssh --session NAME -D [BIND:]PORT TARGET")
     if opts.put is not None or opts.get is not None:
         parser.error("--put/--get require an existing session: "
                      "mssh NAME --put LOCAL REMOTE")
