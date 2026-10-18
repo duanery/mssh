@@ -388,13 +388,25 @@ and all job channels.
 
 #### Local Port Forwarding
 
-`-L [BIND:]PORT:HOST:HOSTPORT` creates a local TCP listener owned by the
-session daemon, either when creating a session or afterward:
+`-L` uses SSH's four local forwarding forms, with a TCP or Unix-domain
+listener owned by the session daemon:
+
+```text
+-L [bind_address:]port:host:hostport
+-L [bind_address:]port:remote_socket
+-L local_socket:host:hostport
+-L local_socket:remote_socket
+```
+
+Configure forwards when creating a session or afterward:
 
 ```bash
 mssh --session web -L 8080:127.0.0.1:80 -j ops@jump root@target
 mssh web -L 15432:db.internal:5432
 mssh --session web -L 127.0.0.1:9090:127.0.0.1:9090
+mssh web -L 8080:/run/service.sock
+mssh web -L /tmp/db.sock:db.internal:5432
+mssh web -L /tmp/client.sock:/run/service.sock
 mssh web --jobs
 mssh web --interrupt --job 3
 ```
@@ -416,12 +428,30 @@ available). Specify `127.0.0.1` or `[::1]` to choose one family.
 An explicit `*` or empty bind address listens on all interfaces; use that
 only when exposing the forwarded service to other machines is intended.
 IPv6 addresses require brackets, for example
-`-L '[::1]:8080:[::1]:80'`. Both ports must be between 1 and 65535;
-Unix-domain forwarding and dynamically assigned local ports are not supported.
+`-L '[::1]:8080:[::1]:80'` or `-L '[::1]:8080:/run/service.sock'`.
+TCP ports must be between 1 and 65535; dynamically assigned local ports
+are not supported.
+
+Socket paths must contain `/` to distinguish them from host names and
+ports; write `./name.sock` for a relative path. Local relative paths are
+resolved from the configuring client's working directory, even when adding
+to an already-detached daemon. Remote socket paths are passed literally to
+the target's SSH server: shell variables and `~` are not expanded.
+Quote paths containing spaces. Escape literal `:` or `\` inside a path
+with a backslash, for example `-L '/tmp/client\:1.sock:/run/service.sock'`.
+
+Local socket files have mode `0600`. An existing path, including a stale
+socket, causes a bind failure and is never overwritten. Stopping a forward,
+session shutdown or a failed batch removes only the socket file created by
+that forward; a replaced local path is preserved. Remote socket files are
+never removed. Parent directories must already exist, and paths must fit
+the operating system's Unix socket path limit.
 
 The destination is reached through the target's SSH transport, so its host
 name is resolved from the target, not from the local machine or jump host.
-The SSH server must allow `direct-tcpip` forwarding. Configuration success
+The SSH server must allow TCP forwarding for TCP destinations, or OpenSSH
+`direct-streamlocal@openssh.com` forwarding for remote sockets
+(`AllowStreamLocalForwarding`). Configuration success
 confirms the local bind, not destination reachability: each incoming
 connection opens its own SSH channel, and a refused destination closes only
 that connection. Diagnostic failures go to the session log under `-v`.
@@ -737,14 +767,18 @@ python3 tests/test_session_unit.py     # framing, endpoints, flags     (61)
 python3 tests/test_session_daemon.py   # daemon, protocol, client      (62)
 python3 tests/test_copy_mode.py        # copy permissions vs real scp (51)
 python3 -m unittest discover -s tests -p test_session_forward.py
+python3 -m unittest discover -s tests -p test_session_unix_forward.py
 ```
 
-No external network and no sshd: the framing layer is driven against local `bash`,
+No external network: the framing layer is driven against local `bash`,
 `gdb` and `python3` behind a real pty, the daemon tests run mssh as separate
 processes with only the SSH hops faked, and the copy tests talk to OpenSSH's
 own `sftp-server` over a pipe and compare every resulting mode against what
 `scp` itself produces for the same input. Forwarding tests use local TCP
 listeners and a real Paramiko client/server transport over a socketpair.
+Unix forwarding tests also use local Unix sockets. When `sshd` is available
+and the tests run as root, additional socketpair-based tests check actual
+OpenSSH streamlocal channels; otherwise only those tests are skipped.
 Some of the permission tests drop to
 an unprivileged user, since root ignores permission bits and would pass either
 way.

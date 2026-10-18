@@ -61,18 +61,28 @@ class FakeTransport(object):
     def set_keepalive(self, interval):
         pass
 
-    def open_channel(self, kind, dest_addr, src_addr, timeout=None):
-        if kind != "direct-tcpip":
+    def open_channel(self, kind, dest_addr, src_addr=None, timeout=None):
+        if kind not in ("direct-tcpip", "direct-streamlocal@openssh.com"):
             raise ValueError("unknown channel kind")
         if not self.is_active():
             raise OSError("fake chain: the connection is down")
-        chan = _TCPChan(socket.create_connection(dest_addr, timeout=timeout))
+        if kind == "direct-tcpip":
+            sock = socket.create_connection(dest_addr, timeout=timeout)
+        else:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(timeout)
+                sock.connect(dest_addr)
+            except BaseException:
+                sock.close()
+                raise
+        chan = _TCPChan(sock)
         self.client.channels.append(chan)
         return chan
 
 
 class _TCPChan(object):
-    """A channel-shaped TCP socket for local-forward integration tests."""
+    """A channel-shaped TCP/Unix socket for local-forward integration tests."""
 
     def __init__(self, sock):
         self.sock = sock
@@ -337,6 +347,8 @@ def fake_build_chain(jumps, target, opts):
 
 
 mssh.build_chain = fake_build_chain
+mssh._open_streamlocal_channel = lambda transport, path, timeout: \
+    transport.open_channel("direct-streamlocal@openssh.com", path, timeout=timeout)
 
 if __name__ == "__main__":
     sys.exit(mssh.main())

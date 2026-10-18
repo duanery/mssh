@@ -83,7 +83,7 @@ class TestForwardParsing(unittest.TestCase):
         for spec in ("", "80:host", "0:host:80", "80:host:0",
                      "65536:host:80", "80:host:65536", "80:*:80",
                      "8080:bad host:80", "[bad]:8080:host:80",
-                     "::1:8080:host:80", "/tmp/socket:host:80", None):
+                     "::1:8080:host:80", "/tmp/socket:host", None):
             with self.subTest(spec=spec):
                 with self.assertRaises(ValueError):
                     mssh.parse_local_forward(spec)

@@ -2633,31 +2633,227 @@ class _ExecJob(object):
 
 
 def parse_local_forward(spec):
-    """Parse SSH-style [bind_address:]port:host:hostport, including IPv6."""
-    match = re.fullmatch(
-        r"(?:(\[[^\]]+\]|[^:]*):)?([0-9]+):(\[[^\]]+\]|[^:]+):([0-9]+)",
-        spec) if isinstance(spec, str) else None
-    if match is None:
-        raise ValueError("-L expects [bind_address:]port:host:hostport")
-    bind, port, host, hostport = match.groups()
-    bind = "localhost" if bind is None else bind
-    for value in (bind, host):
-        if value.startswith("["):
+    """Parse the four SSH -L forms; slash-containing fields are socket paths."""
+    if not isinstance(spec, str) or not spec:
+        raise ValueError("-L expects a TCP or Unix socket forwarding specification")
+    fields, field, bracketed, escaped, closed_bracket = [], "", False, False, False
+    for char in spec:
+        if closed_bracket and char != ":":
+            raise ValueError("unexpected characters after bracket in -L")
+        if escaped:
+            field += char
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "[" and not field and not bracketed:
+            bracketed = True
+        elif char == "]" and bracketed:
+            if "/" not in field:
+                try:
+                    ipaddress.IPv6Address(field.split("%", 1)[0])
+                except ValueError:
+                    raise ValueError("invalid IPv6 address in -L: %r" % field)
+            bracketed = False
+            closed_bracket = True
+        elif char == ":" and not bracketed:
+            fields.append(field)
+            field = ""
+            closed_bracket = False
+        else:
+            field += char
+    if escaped or bracketed:
+        raise ValueError("unterminated escape or bracket in -L")
+    fields.append(field)
+
+    local_socket = remote_socket = None
+    if len(fields) == 2 and "/" in fields[0] and "/" in fields[1]:
+        local_socket, remote_socket = fields
+    elif len(fields) == 2 and "/" in fields[1]:
+        bind, port = "localhost", fields[0]
+        remote_socket = fields[1]
+    elif len(fields) == 3 and "/" in fields[0]:
+        local_socket, host, hostport = fields
+    elif len(fields) == 3 and "/" in fields[2]:
+        bind, port, remote_socket = fields
+    elif len(fields) in (3, 4):
+        bind, port, host, hostport = (
+            ["localhost"] + fields if len(fields) == 3 else fields)
+    else:
+        raise ValueError("-L expects [bind:]port:host:hostport, "
+                         "[bind:]port:remote_socket, local_socket:host:hostport "
+                         "or local_socket:remote_socket")
+
+    settings = {}
+    for key, path in (("local_socket", local_socket), ("remote_socket", remote_socket)):
+        if path is not None:
+            if "\x00" in path or any(ord(char) < 32 for char in path):
+                raise ValueError("invalid Unix socket path in -L")
+            settings[key] = os.path.abspath(path) if key == "local_socket" else path
+    addresses = []
+    if local_socket is None:
+        addresses.append(bind)
+    if remote_socket is None:
+        addresses.append(host)
+        if host in ("", "*"):
+            raise ValueError("-L requires a destination host")
+    for value in addresses:
+        if ":" in value:
             try:
-                ipaddress.IPv6Address(value[1:-1].split("%", 1)[0])
+                ipaddress.IPv6Address(value.split("%", 1)[0])
             except ValueError:
                 raise ValueError("invalid IPv6 address in -L: %r" % value)
         if value not in ("", "*") and not valid_host(
-                value[1:-1] if value.startswith("[") else value,
-                bracketed=value.startswith("[")):
+                value, bracketed=":" in value):
             raise ValueError("invalid host in -L: %r" % value)
-    if host in ("", "*"):
-        raise ValueError("-L requires a destination host")
-    port, hostport = int(port), int(hostport)
-    if not 1 <= port <= 65535 or not 1 <= hostport <= 65535:
-        raise ValueError("-L ports must be between 1 and 65535")
-    return {"bind": bind.strip("[]"), "port": port,
-            "host": host.strip("[]"), "hostport": hostport}
+    for key, value in (("port", port if local_socket is None else None),
+                       ("hostport", hostport if remote_socket is None else None)):
+        if value is not None:
+            if not re.fullmatch("[0-9]+", value) or not 1 <= int(value) <= 65535:
+                raise ValueError("-L ports must be between 1 and 65535")
+            settings[key] = int(value)
+    if local_socket is None:
+        settings["bind"] = bind
+    if remote_socket is None:
+        settings["host"] = host
+    return settings
+
+
+def _local_forward_spec(settings):
+    """Serialize parsed settings before sending client-relative paths to a daemon."""
+    def field(value):
+        return str(value).replace("\\", "\\\\").replace(":", "\\:") \
+            .replace("[", "\\[").replace("]", "\\]")
+
+    local = [settings["local_socket"]] if "local_socket" in settings else [
+        settings["bind"], settings["port"]]
+    remote = [settings["remote_socket"]] if "remote_socket" in settings else [
+        settings["host"], settings["hostport"]]
+    local_fields = [field(value) for value in local]
+    remote_fields = [field(value) for value in remote]
+    # Keep TCP-only specs compatible with existing daemons, whose parser
+    # accepts bracketed IPv6 but not backslash-escaped address colons.
+    if "local_socket" not in settings and ":" in settings["bind"]:
+        local_fields[0] = "[%s]" % settings["bind"]
+    if "remote_socket" not in settings and ":" in settings["host"]:
+        remote_fields[0] = "[%s]" % settings["host"]
+    return ":".join(local_fields + remote_fields)
+
+
+class _StreamLocalChannel(paramiko.Channel):
+    """Close a late OPEN_SUCCESS after its streamlocal opener has timed out."""
+
+    open_abandoned = False
+
+    def _unlink(self):
+        super(_StreamLocalChannel, self)._unlink()
+        if self.open_abandoned:
+            # Transport shutdown unlinks even unopened channels. Channel's
+            # base implementation skips closed ones, so release our retained
+            # pending-open event as well when no response can arrive anymore.
+            self.transport._channels.delete(self.chanid)
+            self.transport.channel_events.pop(self.chanid, None)
+
+    def _set_remote_channel(self, chanid, window_size, max_packet_size):
+        super(_StreamLocalChannel, self)._set_remote_channel(
+            chanid, window_size, max_packet_size)
+        if self.open_abandoned:
+            from paramiko.common import cMSG_CHANNEL_CLOSE
+
+            # Paramiko invokes this in the transport thread under its lock.
+            # Cancellation already closed the local buffers, but could not
+            # send CLOSE without this remote ID. Do not call Channel.close():
+            # it skips already-closed channels, and its _send_user_message()
+            # can wait for rekeying that this very transport thread must drive.
+            self.active = False
+            message = paramiko.Message()
+            message.add_byte(cMSG_CHANNEL_CLOSE)
+            message.add_int(chanid)
+            try:
+                # An abandoned open can outlive its transport; a send failure
+                # here would escape into Transport.run() and tear down the
+                # whole connection. The remote socket dies with that
+                # connection, so dropping the CLOSE is the correct outcome.
+                self.transport._send_message(message)
+            except Exception:
+                pass
+            self.transport._channels.delete(self.chanid)
+
+
+def _open_streamlocal_channel(transport, path, timeout):
+    """Open OpenSSH's direct-streamlocal channel using Paramiko's channel lifecycle.
+
+    Transport.open_channel() accepts extension names but only encodes address
+    fields for TCP/X11. OpenSSH PROTOCOL section 2.4 requires a socket path,
+    an empty reserved string and a zero reserved integer. Keep this adapter
+    local to streamlocal opens, using the same transport lock, channel map,
+    event and SSHException handling as Paramiko 3.x/5.x open_channel().
+    """
+    from paramiko.common import cMSG_CHANNEL_OPEN
+
+    with transport.lock:
+        if not transport.is_active():
+            raise paramiko.SSHException("SSH session not active")
+        chanid = transport._next_channel()
+        chan = _StreamLocalChannel(chanid)
+        event = threading.Event()
+        # Paramiko's channel map holds weak references. Retain an abandoned
+        # pending open until SUCCESS/FAILURE (or transport shutdown), so a late
+        # SUCCESS still has a channel that can send the matching remote CLOSE.
+        event.channel = chan
+        window = transport.default_window_size
+        packet = transport.default_max_packet_size
+        message = paramiko.Message()
+        message.add_byte(cMSG_CHANNEL_OPEN)
+        message.add_string("direct-streamlocal@openssh.com")
+        message.add_int(chanid)
+        message.add_int(window)
+        message.add_int(packet)
+        message.add_string(path)
+        message.add_string("")
+        message.add_int(0)
+        transport._channels.put(chanid, chan)
+        transport.channel_events[chanid] = event
+        transport.channels_seen[chanid] = True
+        chan._set_transport(transport)
+        chan._set_window(window, packet)
+    sent = False
+    try:
+        transport._send_user_message(message)
+        sent = True
+        deadline = time.monotonic() + timeout
+        while not event.is_set():
+            if not transport.is_active():
+                raise transport.get_exception() or paramiko.SSHException(
+                    "Unable to open streamlocal channel")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise paramiko.SSHException("Timeout opening streamlocal channel")
+            event.wait(min(remaining, 0.1))
+        result = transport._channels.get(chanid)
+        if result is None or not transport.is_active():
+            raise transport.get_exception() or paramiko.SSHException(
+                "Unable to open streamlocal channel")
+        return result
+    except BaseException:
+        # Open responses and cancellation are serialized by transport.lock.
+        # SSH has no cancel-open request: deleting a pending channel would
+        # discard a late SUCCESS and leave its remote socket open indefinitely.
+        # Keep only pending opens until the peer answers; established channels
+        # use normal close outside the transport lock.
+        with transport.lock:
+            pending = sent and transport.is_active() and not chan.active \
+                and chanid in transport.channel_events
+            if pending:
+                chan.open_abandoned = True
+                with chan.lock:
+                    chan._set_closed()
+            else:
+                transport.channel_events.pop(chanid, None)
+        if not pending:
+            _close_session_channel(chan)
+            chan._unlink()
+            transport._channels.delete(chanid)
+        raise
 
 
 def _forward_address(host, port):
@@ -2670,14 +2866,18 @@ class _LocalForwardJob(_ExecJob):
     def __init__(self, session, settings):
         super(_LocalForwardJob, self).__init__(None, "forward")
         self.session = session
-        self.destination = (settings["host"], settings["hostport"])
+        self.remote_socket = settings.get("remote_socket")
+        self.destination = self.remote_socket or (settings["host"], settings["hostport"])
+        self.socket_path = settings.get("local_socket")
+        self.socket_identity = None
         self.listeners = []
         self.connections = {}
         self.lock = threading.Lock()
         self.closed = threading.Event()
         self.worker = None
-        bind = settings["bind"]
-        addresses = socket.getaddrinfo(
+        bind = settings.get("bind")
+        addresses = [(socket.AF_UNIX, socket.SOCK_STREAM, 0, "", self.socket_path)] \
+            if self.socket_path else socket.getaddrinfo(
             None if bind in ("", "*") else bind, settings["port"],
             socket.AF_UNSPEC, socket.SOCK_STREAM, 0,
             socket.AI_PASSIVE if bind in ("", "*") else 0)
@@ -2690,11 +2890,18 @@ class _LocalForwardJob(_ExecJob):
                 listener = None
                 try:
                     listener = socket.socket(family, socktype, protocol)
-                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    if family != socket.AF_UNIX:
+                        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     if family == socket.AF_INET6:
                         listener.setsockopt(socket.IPPROTO_IPV6,
                                             socket.IPV6_V6ONLY, 1)
                     listener.bind(address)
+                    if family == socket.AF_UNIX:
+                        # Never unlink an existing pathname before bind. Track
+                        # the inode we created so teardown preserves replacements.
+                        st = os.lstat(address)
+                        self.socket_identity = (st.st_dev, st.st_ino)
+                        os.chmod(address, 0o600)
                     listener.listen(128)
                     listener.setblocking(False)
                 except OSError as exc:
@@ -2710,14 +2917,29 @@ class _LocalForwardJob(_ExecJob):
                     raise
                 self.listeners.append(listener)
             if not self.listeners:
-                raise ValueError("-L bind address has no usable TCP addresses")
+                raise ValueError("-L bind address has no usable addresses")
         except BaseException:
             for listener in self.listeners:
                 listener.close()
+            self._unlink_socket()
             raise
         self.command = "%s -> %s" % (
-            _forward_address(bind or "*", settings["port"]),
-            _forward_address(*self.destination))
+            self.socket_path or _forward_address(bind or "*", settings["port"]),
+            self.remote_socket or _forward_address(*self.destination))
+
+    def _unlink_socket(self):
+        if self.socket_identity is None:
+            return
+        try:
+            st = os.lstat(self.socket_path)
+            if statmod.S_ISSOCK(st.st_mode) and \
+                    (st.st_dev, st.st_ino) == self.socket_identity:
+                os.unlink(self.socket_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _session_log("forward.socket_unlink_failed", logging.WARNING,
+                         self.session, exc=exc, job=self.id)
 
     def start(self):
         # Registration makes the job visible before this call. An interrupt
@@ -2771,6 +2993,7 @@ class _LocalForwardJob(_ExecJob):
                         _session_log("forward.close_failed", logging.WARNING,
                                      self.session, chan, exc, job=self.id)
         finally:
+            self._unlink_socket()
             with self.session.execs_lock:
                 self.session.execs.discard(self)
             self.closed.set()
@@ -2818,9 +3041,15 @@ class _LocalForwardJob(_ExecJob):
             transport = self.session.transport
             if self.aborted or not transport.is_active():
                 return
-            chan = transport.open_channel(
-                "direct-tcpip", self.destination, origin[:2],
-                timeout=self.session.timeout)
+            if self.remote_socket:
+                chan = _open_streamlocal_channel(
+                    transport, self.remote_socket, self.session.timeout)
+            else:
+                # AF_UNIX accept() has no IP/port origin to put in direct-tcpip.
+                source = origin[:2] if not self.socket_path else ("127.0.0.1", 0)
+                chan = transport.open_channel(
+                    "direct-tcpip", self.destination, source,
+                    timeout=self.session.timeout)
             with self.lock:
                 if self.aborted:
                     return
@@ -2851,7 +3080,7 @@ class _LocalForwardJob(_ExecJob):
                                  self.session, chan, exc, job=self.id)
 
     def _relay(self, conn, chan, transport):
-        """Bound both directions and preserve independent TCP half-closes."""
+        """Bound both directions and preserve independent stream half-closes."""
         conn.setblocking(False)
         chan.settimeout(0.0)
         to_remote = to_local = b""
@@ -2902,7 +3131,7 @@ class _LocalForwardJob(_ExecJob):
                         self.session.last = time.time()
                 except BlockingIOError:
                     pass
-            # A direct-tcpip channel has no command exit status. EOF is
+            # TCP/streamlocal channels have no command exit status. EOF is
             # separate from CLOSE, and unread buffered data must go first.
             if not remote_eof and len(to_local) < SESSION_BACKLOG:
                 if chan.recv_ready():
@@ -4330,15 +4559,22 @@ class _Session(object):
 # The status reply includes "jobs": N using the same snapshot rules, so
 # --sessions can show counts without making a second request to each daemon.
 #
-# "op": "forward" adds persistent local TCP listeners, with no descriptors:
+# "op": "forward" adds persistent local TCP/Unix listeners, with no descriptors:
 #
-#     {"op": "forward", "specs": ["[bind:]port:host:hostport", ...]}\n
+#     {"op": "forward", "specs": ["[bind:]port:host:hostport",
+#                               "[bind:]port:remote_socket",
+#                               "local_socket:host:hostport",
+#                               "local_socket:remote_socket", ...]}\n
 #     {"ok": true, "forwards": [{"id": N, "command": "bind -> target"}, ...]}\n
 #
 # The daemon validates and binds the entire batch before registration.
 # Failures roll back the batch without changing existing listeners.
 # Each listener is one "forward" job with a null channel field; it owns
-# all accepted TCP sockets and direct-tcpip channels until interrupted.
+# all accepted sockets and direct-tcpip/direct-streamlocal@openssh.com channels
+# until interrupted. Local relative socket paths are made absolute by the
+# configuring client; remote socket paths are passed literally to the target.
+# Bind never overwrites a path. Teardown unlinks only the local socket inode
+# created by that job, never the remote socket or a replaced local path.
 # The request client may exit immediately: no client socket owns the job.
 # Forward configuration and targeted cancellation work while reconnecting.
 # Listener jobs survive transport replacement; individual connections do not.
@@ -5703,6 +5939,7 @@ def _show_forwards(name, rows):
 
 
 def run_session_forward(name, specs):
+    specs = [_local_forward_spec(parse_local_forward(spec)) for spec in specs]
     reply = session_request(name, {"op": "forward", "specs": specs}, timeout=30)
     if reply.get("error"):
         sys.stderr.write(reply["error"].rstrip("\n") + "\n")
@@ -6212,15 +6449,24 @@ persistent session (keep one connection and one shell alive):
   to preserve permissions and timestamps. Transfers use a separate channel;
   relative remote paths do not follow the session shell's current directory.
 
-  Keep local TCP forwards in the session daemon:
+  Keep local TCP or Unix socket forwards in the session daemon:
   mssh --session s -L 8080:127.0.0.1:80 root@10.0.0.9
   mssh s -L 15432:db.internal:5432                # configure an existing session
   mssh s -L '[::1]:8080:[::1]:80'                 # IPv6
+  mssh s -L 8080:/run/service.sock               # TCP -> remote Unix socket
+  mssh s -L /tmp/db.sock:db.internal:5432        # local Unix socket -> TCP
+  mssh s -L /tmp/client.sock:/run/service.sock   # Unix socket -> Unix socket
+  -L accepts [bind_address:]port:host:hostport,
+             [bind_address:]port:remote_socket,
+             local_socket:host:hostport, or local_socket:remote_socket.
   Repeat -L for several; a failed bind rolls back that whole addition.
   The client exits after configuration; --jobs lists each forward and
   --interrupt --job ID closes its listener and connections. The destination
-  is reached from the target, and requires SSH direct-tcpip permission.
+  is reached from the target; SSH must permit TCP/streamlocal forwarding.
   Default bind is localhost; * or an empty bind exposes all interfaces.
+  Socket paths contain /; use ./name.sock for a relative path. Local paths
+  start at the configuring client's directory; remote paths are literal.
+  Local sockets are mode 0600, never overwrite paths and are removed on stop.
   --reconnect retains listeners, but existing connections cannot be restored.
 
   'mssh s' with nothing to run is 'ssh s' as nearly as this can be: a shell on the
@@ -6495,8 +6741,9 @@ def build_parser():
     )
     group.add_argument(
         "-L", dest="local_forwards", action="append", default=[],
-        metavar="[BIND:]PORT:HOST:HOSTPORT",
-        help="add a persistent local TCP forward to a session; repeat for "
+        metavar="SPEC",
+        help="add a persistent local TCP/Unix socket forward (SSH -L syntax) "
+             "to a session; repeat for "
              "several, default bind is localhost; --jobs lists forwards and "
              "--interrupt --job ID stops one",
     )
@@ -6683,8 +6930,9 @@ def main(argv=None):
         parser.error("--job requires --interrupt or --stop and a nonnegative job ID")
 
     try:
-        for spec in opts.local_forwards:
-            parse_local_forward(spec)
+        opts.local_forwards = [
+            _local_forward_spec(parse_local_forward(spec))
+            for spec in opts.local_forwards]
     except ValueError as exc:
         parser.error(str(exc))
 
