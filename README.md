@@ -33,6 +33,18 @@ the `cd`, and the three-hop chain that took seconds to build, are gone before
 the next call. `--session` puts the state in a local daemon instead, and each
 call becomes a short reconnect to something that is already logged in.
 
+## Contents
+
+- [Requirements](#requirements)
+- [Endpoint Format](#endpoint-format)
+- [Logging In](#logging-in)
+- [Authentication](#authentication)
+- [Copying Files](#copying-files)
+- [Persistent Sessions](#persistent-sessions)
+- [Options](#options)
+- [Exit Codes](#exit-codes)
+- [Tests](#tests)
+
 ## Requirements
 
 - Python 3.6 or newer
@@ -47,7 +59,7 @@ The shebang is `#!/usr/bin/env python3`. If the interpreter that owns your
 paramiko install is not the one `python3` resolves to, run it explicitly
 (`python3.12 mssh ...`) or edit the first line.
 
-## Endpoint format
+## Endpoint Format
 
 Every host, jump or target, is written the same way:
 
@@ -68,7 +80,7 @@ Every host, jump or target, is written the same way:
 > **Passwords on a command line are visible in `ps` and in your shell
 > history.** Prefer keys, or omit the password and let `mssh` prompt for it.
 
-## Logging in
+## Logging In
 
 ```bash
 # no jump at all: a direct login as the local user
@@ -88,7 +100,7 @@ mssh -j ops@10.0.0.1 root@10.0.0.9 -c 'uptime; df -h'
 `mssh host -c 'cat > /tmp/f' < local` works as you would expect. Add `-t` to
 force a pty for something that insists on one.
 
-### Shell initialization
+### Shell Initialization
 
 `--rcfile FILE` reads a local shell script before connecting, uploads it to
 a private mode-0600 temporary file directly under the target's `/tmp`, and
@@ -96,7 +108,6 @@ loads it in the new shell with `.` (source):
 
 ```bash
 mssh --rcfile ./init.sh -j ops@10.0.0.1 root@10.0.0.9
-mssh --session web --rcfile ./init.sh root@10.0.0.9
 ```
 
 The bundled `mssh.rc` provides a minimal default initialization script.
@@ -104,7 +115,6 @@ It is opt-in, not automatically loaded:
 
 ```bash
 mssh --rcfile ./mssh.rc root@10.0.0.9
-mssh --session web --rcfile ./mssh.rc root@10.0.0.9
 ```
 
 It exports `MSSH=1` to identify an initialized mssh shell,
@@ -129,40 +139,67 @@ the login banner and subsequent prompt are retained. The script reads
 `/dev/null`, so it must not prompt for input. A nonzero return or an
 initialization timeout (using `--timeout`) fails the new shell. Cleanup runs
 in that same shell for direct logins immediately after the script returns,
-including a nonzero return; no additional cleanup channel is opened. If the script exits or
-replaces the shell, hangs, or the connection is lost, temporary files may remain.
-Remote artifacts share the naming convention `/tmp/.mssh-<kind>-<random>`:
-`rc` for initialization files and `in` for stdin FIFOs. Names use locally
-generated 16-character suffixes using ASCII letters (both cases) and digits.
-Files and FIFOs are created exclusively with mode
-0600, so an existing path is not overwritten.
-The target needs a sh-compatible shell, `cat` and `rm`;
-SFTP is not required.
+including a nonzero return; no additional cleanup channel is opened. If the
+script exits or replaces the shell, hangs, or the connection is lost,
+temporary files may remain. Files are created exclusively with mode `0600`,
+so an existing path is not overwritten. The target needs a sh-compatible
+shell, `cat` and `rm`; SFTP is not required.
 
 On Bash, the initialization command removes only its own in-memory history
 entry before sourcing the script, without disabling subsequent user history.
 Other shells do not have this guarantee. Previously saved initialization
 entries are not removed, and remote audit or custom logging hooks are unaffected.
 
-Shell sessions start a login Bash, falling back to a login `/bin/sh`, so
-remote login profiles run before the local script. Reconnects rerun the
-original script snapshot, not a newly read local file. A session retains its
-remote rc file: fresh logins source that existing path without uploading again.
-Each reconnect uploads a new copy. `--stop` removes the session's retained
-files, including earlier copies from reconnects; other normal session shutdowns
-also attempt cleanup. Cleanup cannot be guaranteed while the target is unreachable.
-`mssh NAME --status` displays the current remote path on the `rcfile:` line,
-or `none` when no rc file is configured.
-An explicit `--rcfile` overrides the retained file for that login only and
-is deleted after source. Ordinary commands in an existing session do not
-rerun initialization. `--rcfile` cannot be combined with `-c`, `--exec`, file
-copies or session control operations.
+`--rcfile` cannot be combined with `-c`, `--exec`, file copies or session
+control operations. For retained initialization scripts and reconnect
+behavior, see [Session Initialization](#session-initialization).
 
 Use only trusted scripts compatible with the target shell. This option does
 not bypass read-only variables or remote auditing. Relative references inside
 the script resolve on the target; neighboring local files are not uploaded.
 
-## Copying files
+## Authentication
+
+Client keys authenticate you to each hop; host keys identify the servers
+you connect to. Both apply to direct connections and persistent sessions.
+
+### Key Setup
+
+Password prompts on every hop get old quickly. Install a key once:
+
+```bash
+ssh-keygen -t ed25519                              # if you have none yet
+mssh --copy-id -j ops:pw1@10.0.0.1 root:pw2@10.0.0.9
+mssh -j ops@10.0.0.1 root@10.0.0.9                 # key auth from now on
+```
+
+`--copy-id` appends the key to `~/.ssh/authorized_keys` on **every** hop, then
+exits without opening a shell. It defaults to `~/.ssh/id_ed25519.pub` or
+`id_rsa.pub`; name a file to pick another. It refuses to upload anything that
+looks like a private key.
+
+`-i KEYFILE` offers a specific key (repeatable, applied to every hop) and
+prompts once for the passphrase if it is encrypted. An OpenSSH certificate is
+used automatically when `<key>-cert.pub` sits next to the private key.
+
+Supported: **ed25519** (recommended), **ecdsa** (nistp256/384/521) and **rsa**.
+DSA is gone — paramiko 5 dropped it, as did OpenSSH 9.8.
+
+### Host Keys
+
+By default an unknown host key is added and the connection proceeds, which is
+what makes a one-off chain to a machine you have never met usable. `--strict`
+opts into real verification and rejects anything unknown; `--known-hosts FILE`
+points at a specific file.
+
+### Legacy Servers
+
+Against OpenSSH older than 7.8, RSA keys do not work: those servers accept only
+SHA-1 `ssh-rsa` signatures, which paramiko 5 no longer produces. Use an ed25519
+key (`ssh-keygen -t ed25519`). This is why ed25519 leads the default key search
+order.
+
+## Copying Files
 
 The same argument shape as `scp`: `SOURCE... DEST`, where the local side is a
 plain path and the remote side is an endpoint with `:` and a path appended:
@@ -217,7 +254,11 @@ bits matter.
 Ctrl-C during a download removes the partial file rather than leaving something
 that looks complete to whatever runs next.
 
-## Persistent sessions
+For copies through an already-open connection, see session
+[File Transfers](#file-transfers) and
+[File Synchronization with rsync](#file-synchronization-with-rsync).
+
+## Persistent Sessions
 
 A normal run connects, does one thing, and tears everything down. `--session
 NAME` leaves a small local daemon holding the chain and one long-lived remote
@@ -240,7 +281,6 @@ is also the name of the machine it reached — the whole chain, under an alias.
 mssh -j ops@10.0.0.1 -j dmz@10.1.0.4 root@192.168.1.10 --session web
 mssh web 'cd /var/log && ls'                   # = mssh --session web '...'
 mssh web --status                              # and --stop, --interrupt
-mssh web --exec -t 'vim /etc/nginx/nginx.conf'
 mssh web                                       # nothing to run: a login
 ```
 
@@ -248,12 +288,9 @@ A word that no live session answers to is read as a host, exactly as before,
 so `mssh 10.0.0.9` still logs in to `10.0.0.9` and every existing command line
 keeps working.
 
-That last line is the nearest thing to `ssh web`: it opens a shell on the
-target, on **a channel of its own** rather than in the session's shell, which
-is busy being a session — the framing around every command above is what makes
-it one. Your terminal drives that shell the way it drives an `--exec -t`
-program (forwarded as its input, raw until the shell ends, resized along with
-your window, no `--wait`), and `mssh` exits with the shell's own exit code.
+`mssh web` without a command opens a fresh login shell on a separate channel,
+not the persistent shell that receives ordinary commands. See
+[Interactive Terminals](#interactive-terminals) for terminal behavior.
 
 Separate processes, one shell: the working directory, the environment and any
 background jobs live on between calls. Output streams as it is produced, so a
@@ -264,116 +301,221 @@ Once a session is live, every positional is a command — nothing is guessed —
 a repeated start runs the endpoint as one and the shell reports it. `--status`
 says whether a session is live, and `-j` or `-c` on a live one is refused.
 
-Piping into a session works the way it does with `ssh`:
+The first call keeps your terminal until the chain is up, so a hop can ask
+for a password and `-vv` can show connection progress. Only then does the
+daemon detach. Later calls reuse that authenticated connection.
 
-```bash
-echo hello | mssh --session s cat               # prints hello
-mssh --session s 'wc -l' < access.log           # counts the local file
-tar cf - ./dir | mssh --session s 'tar xf - -C /srv'
-```
+Session topics:
 
-Managing them:
-
-```bash
-mssh --session s --status      # session/link state, activity and job counts
-mssh --session s --jobs        # commands, exec/login channels and transfers
-mssh --session s --interrupt   # Ctrl-C into the session, to unstick something
-mssh --session s --stop        # end it and close the connection
-mssh --sessions                # list every live session and its job count
-```
-
-The `JOBS` column uses the same task-selection rules as `--jobs`, including
-pending requests and persistent forwards but excluding the idle primary shell.
-It shows `?` when an older daemon does not provide a count or cannot respond.
-Liveness probes request only an acknowledgement; `--sessions` requests only
-its displayed fields and a job count. Only `--status` requests full status.
-Older daemons may still return a full reply for these lightweight requests.
-
-`--status` distinguishes idle, forwarding-only, running, pending, interrupting,
-disconnected, reconnecting, stopping and ended sessions. A pending task means
-its client stopped waiting; it remains tracked until its result is consumed
-or the primary channel is resynchronized. Connection/lifecycle states take
-precedence over surviving forward listeners. The `default:` line reports the
-primary shell or interactive request independently of exec/login channels,
-transfers and proxies.
-
-The reply includes total jobs with a type breakdown (`socks` counts `-D`
-listeners, `forward` counts `-L` and `reverse` counts `-R` listeners),
-time since last session activity,
-and the configured idle expiry. Detailed commands, channels and forwarding
-addresses are shown only by `--jobs`, not `--status`.
-An unused listener does not mean traffic is flowing.
-Status remains available during long commands and reconnect backoff, without
-waiting for the shell or starting a reconnect. Older daemons show only the
-fields they provide; missing task details are not reported as zero jobs.
+- [Command Execution](#command-execution)
+- [Independent Commands](#independent-commands)
+- [Holding a Program Instead of a Shell](#holding-a-program-instead-of-a-shell)
+- [Session Initialization](#session-initialization)
+- [Jobs and Session Control](#jobs-and-session-control)
+- [File Transfers](#file-transfers)
+- [File Synchronization with rsync](#file-synchronization-with-rsync)
+- [Port Forwarding](#port-forwarding)
+- [Surviving a Reboot](#surviving-a-reboot)
+- [Session Storage and Security](#session-storage-and-security)
+- [Daemon Diagnostics](#daemon-diagnostics)
 
 For client/server message layouts, descriptor ownership and request
 lifecycles, see [Session Client/Server Interaction](session-protocol.md).
 
-### Surviving a reboot
+### Command Execution
 
-A session is only as alive as its connection. A jump host restarting, the
-target restarting, a firewall dropping the flow — any of them ends it, and the
-next call reports it and exits 1. `--reconnect N`, on the call that *starts* a
-session, builds the whole chain again instead:
+Ordinary commands run sequentially in the persistent shell, keeping its
+working directory, variables and functions. stdout and stderr are merged
+by the shell's PTY; use the exit code to detect failure. Independent
+`--exec` commands can run concurrently and keep the streams separate.
+
+When the session is named as the first word (`mssh s ...` rather than
+`--session s`), the first non-option after the name starts the command.
+Everything from there belongs to the command, including its options:
 
 ```bash
-mssh --session s --reconnect 20 -j ops@10.0.0.1 root@10.0.0.9
+mssh s ls -l
+mssh s --wait 5 'sleep 3'
+mssh s --exec -t top -d 1
 ```
 
-Attempts are 2 s, 4 s, 8 s, 16 s and then 30 s *apart* — a gap between
-attempts, not a period. An attempt that has to time out adds its own cost on
-top (up to `-o SEC`, 20 s by default, per hop), so attempts never overlap and
-never pile up, and `--reconnect 20` spans at least the eight minutes of
-waiting plus however long twenty failures take. In a reboot that is usually
-one SYN timeout per attempt while the kernel is down and an instant
-`connection refused` once the host is up but sshd is not, so the real window
-is comfortably longer than the gaps alone — which is the right way round for
-a physical machine.
+Put mssh's own options before the command. With explicit `--session s`,
+options may also follow the command; use `--` to separate command arguments
+that could be mistaken for mssh options.
 
-They run in the background: `--status` shows the link and which attempt is
-running, and the session keeps answering while they go on. A command that
-arrives mid-attempt is told so and exits 1 rather than being held for the
-length of a reboot; a command that was *running* when the link went is told
-the same thing, since its output is lost either way.
+#### Input and Output
 
-The clock starts when the drop is noticed, which for a host that went away
-without closing its TCP connection means when a write to it finally fails —
-that is what the 30 s keepalive is for. A reset (an sshd restarting, a hop
-rebooting) is noticed at once.
+Pipes and regular files are forwarded automatically, and both input and
+output stream as they arrive:
 
-**The connection comes back; the shell does not.** A reconnect starts a *new*
-shell, in the home directory, with none of the old environment and none of the
-background jobs — so a `cd /var/log` from before the reboot is gone. That is
-why it is never silent: the first command after a reconnect is told, on stderr,
-before it runs.
-
-```
-mssh: session s reconnected to root@10.0.0.9:22 after the connection to
-root@10.0.0.9:22 dropped.  This is a new shell: the working directory, the
-environment and any background jobs of the old one are gone.
+```bash
+echo hello | mssh --session s cat
+mssh --session s 'wc -l' < access.log
+tar cf - ./dir | mssh --session s 'tar xf - -C /srv'
 ```
 
-Two things it will not do:
+A terminal is not forwarded for ordinary commands unless `--stdin` is
+specified; then programs such as `cat` read until Ctrl-D. `-n` suppresses
+stdin forwarding, useful when a local script owns stdin. `/dev/null` is
+treated as no input, so a bare `cat` ends instead of waiting indefinitely.
+Login shells and `--exec -t` use the interactive terminal rules below.
 
-- **Authenticate with a credential it does not have.** The daemon is detached
-  from your terminal, so a password you typed at the prompt cannot be typed
-  again. A key, an agent, or a password written into the endpoint
-  (`user:secret@host`) reconnects; anything else is refused.
-- **Rebuild a `-c` session.** There the state *is* the program — the gdb that
-  was attached to pid 1234 does not exist after a reboot — so a new one would
-  be a different thing wearing the same name.
+#### Waiting and Interrupting
 
-A session that cannot reconnect does not disappear quietly: it stays up,
-broken, until a command asks it for something, and that command gets the
-reason and exit 1 as the session ends. The same is true once the attempts run
-out — one more is tried when the next command arrives, since a command
-arriving is evidence that somebody expects the target to be back.
+`--wait SEC` bounds how long the client watches one command. The default is
+30 seconds, or `0` for a login and `--exec -t`; `0` means indefinitely.
+A timeout exits `124` and leaves the session usable. A primary-shell
+request stays pending until the next request or interruption resynchronizes
+the shell; an independent exec request closes its own channel on timeout.
 
-Without `--reconnect` nothing changes: a dropped connection ends the session
-immediately, as it always has.
+Ctrl-C requests interruption of the current task while keeping the session
+alive. A second Ctrl-C lets the client leave without waiting; it does not
+guarantee that the remote process keeps running. Use `--jobs` and targeted
+`--interrupt --job ID` to inspect and cancel a task from another client.
 
-### Borrowing the connection without the shell
+### Independent Commands
+
+Plenty of commands want the chain but nothing else: a `grep` over a log, a
+`systemctl status`, a `cat` of a config. `--exec` runs those on a channel of
+their own instead of in the session's shell.
+
+```bash
+mssh --session s --exec 'grep -c error /var/log/messages'
+mssh --session s --exec 'cat /etc/nginx/nginx.conf' 2>/dev/null
+mssh --session s --exec 'tar cf - /etc' > etc.tar
+```
+
+It shares the connection, not the shell: a `cd` from an earlier call does
+**not** apply, and neither do that shell's variables, functions or background
+jobs. Without a PTY:
+
+- **stdout and stderr stay apart**, since nothing merges them, so
+  `2>/dev/null` and `2>errors.log` do what they say.
+- **The bytes are untouched.** No pty means no line discipline, so no `\r`
+  before a `\n`, no 4095-byte line limit, and no control byte in the data
+  being read as a signal. Binary output survives.
+- **Nothing is framed.** The channel's own exit status ends the command, so
+  there is no marker printed into the output and no `base64`, `printf` or
+  POSIX shell needed on the target.
+- **Several run at once**, including while the session's shell is busy with
+  something else.
+
+Input forwarding, `--wait` and Ctrl-C use the command rules above. On a
+timeout, targeted interruption or client disconnect, mssh closes this
+request's channel and removes its job instead of keeping a pending request.
+Closing an SSH channel is not a guarantee that every remote process or
+descendant is killed; do not use client disconnection as process control.
+
+Use an ordinary command when it depends on earlier shell state; use
+`--exec` for isolated commands or binary streams. It also works when the
+session holds an interactive program instead of a shell.
+
+#### Interactive Terminals
+
+Some commands need a terminal. `--exec -t` requests a PTY on the command's
+own channel; a session name without a command opens a fresh login shell:
+
+```bash
+mssh --session s --exec -t 'vim /etc/hosts'
+mssh --session s --exec -t top
+mssh --session s --exec -t 'mysql -u root -p'
+mssh s
+```
+
+The login shell uses the existing connection, but does not inherit the
+persistent shell's working directory or current variables. It runs remote
+login profiles and any configured session initialization script.
+
+For an interactive login or a command with a PTY:
+
+- **Your terminal is forwarded as the program's input**, which is the one case
+  the default rule holds back — here it is exactly what the program reads.
+- **Your terminal goes raw** for as long as the command runs and is restored
+  after. The remote pty is the line discipline now; a local one still echoing
+  and editing would do all of it twice.
+- **Resizing your window resizes the remote one**, so a full-screen program
+  keeps painting the right rectangle.
+- **`--wait` defaults to 0** — indefinite. Time spent in an editor is not
+  evidence that anything is stuck.
+
+All of that needs a terminal on **both** ends. Redirect either one and the
+command runs without a pty, as it would without `-t`: there would be nothing
+to put in raw mode, no size to send, and `--exec -t top > log` would otherwise
+fill the file with escape sequences.
+
+Within a session, explicit `-t` applies to `--exec`, not ordinary commands.
+The persistent shell already runs behind a PTY; forwarded input reaches
+ordinary commands through a FIFO rather than the interactive terminal.
+
+### Holding a Program Instead of a Shell
+
+With `-c`, the session holds an interactive program, and `--prompt` gives the
+regex that marks the end of one of its replies:
+
+```bash
+mssh --session g --prompt '\(gdb\) $' -j ops@10.0.0.1 root@10.0.0.9 \
+     -c 'gdb -q -ex "set pagination off" -p 1234'
+mssh --session g 'break do_work'
+mssh --session g 'bt'
+```
+
+Verified against `gdb -q` (`'\(gdb\) $'`), `python3 -i` (`'>>> $'`) and
+`sqlite3` (`'sqlite> $'`), with nothing injected into the program. Without
+`--prompt`, `mssh` falls back to treating a pause in the output as the end
+(`--idle SEC`, default 0.4) — workable, but a guess; name the prompt if you
+can.
+
+Disable paging in the program itself, as in the gdb example, or a command
+can stall at its pager until interrupted. Ordinary requests go to the
+held program; use `--exec` for independent system commands. A `-c` session
+cannot rebuild the program's state after a connection loss.
+
+### Session Initialization
+
+Apply a local initialization script when creating a shell session:
+
+```bash
+mssh --session web --rcfile init.sh root@target
+mssh --session web --rcfile mssh.rc root@target
+```
+
+These are alternative starts, not commands to run on an existing session.
+See [Shell Initialization](#shell-initialization) for script contents,
+hidden output, history handling and the bundled `mssh.rc` markers.
+
+Shell sessions start a login Bash, falling back to a login `/bin/sh`, so
+remote login profiles run before the local script. A session retains the
+uploaded rcfile: fresh logins source that path without uploading again.
+Ordinary commands do not rerun initialization, and independent `--exec`
+commands do not inherit the persistent shell's initialization environment.
+
+An explicit `--rcfile` on a fresh login overrides the retained script for
+that login only and is removed after sourcing:
+
+```bash
+mssh web --rcfile login-init.sh
+```
+
+Each reconnect uploads the original script snapshot to a new path; changes
+to the local file after session creation are not picked up. `--stop` and
+other normal shutdowns attempt to remove retained files, including copies
+from earlier reconnects. Cleanup is not guaranteed when the target is
+unreachable. `mssh web --status` shows the current path on the `rcfile:`
+line, or `none` when no script is configured.
+
+### Jobs and Session Control
+
+```bash
+mssh web --status             # session/link state, activity and job counts
+mssh web --jobs               # individual tasks and forwarding listeners
+mssh web --interrupt          # only the primary shell/program's current task
+mssh web --interrupt --job 3  # interrupt one specific task
+mssh web --job 3 --stop       # same cancellation, keep the session alive
+mssh web --stop               # end the whole session and close its resources
+mssh --sessions              # list every live session and its job count
+```
+
+#### Job Selection
 
 `mssh NAME --jobs` lists mssh-managed tasks with their ID, type, channel,
 state, elapsed time and command or transfer paths. It includes active shell
@@ -388,15 +530,8 @@ This is a daemon snapshot, not a remote process list: background processes
 started by the shell are not tracked individually. Finished tasks disappear;
 jobs are not saved as history, and IDs restart when the daemon is recreated.
 
-```bash
-mssh web --interrupt          # only the default shell's task
-mssh web --jobs               # find the task's ID
-mssh web --interrupt --job 3  # interrupt one specific task
-mssh web --job 3 --stop       # same cancellation, keep the session alive
-```
-
 `--interrupt` without `--job` leaves independent exec/login/SFTP tasks and
-local forwards alone.
+all forwarding listeners alone.
 For a `-c` session it interrupts the current interactive request.
 With no default job, it reports that nothing is running.
 `--job ID` requires `--interrupt` or `--stop`; an unknown or completed ID
@@ -405,10 +540,132 @@ reports an error. `--stop --job ID` uses the same targeted cancellation as
 Only `--stop` without `--job` ends the entire session.
 Interrupting a default shell or interactive task keeps the primary channel
 alive; interrupting an exec/login/SFTP task closes only that task's channel.
-Client-side Ctrl-C
-on an exec/login request targets its own task, not the default shell or
-other jobs. Stopping or exiting the session closes the default channel
-and all job channels.
+Client-side Ctrl-C on an exec/login request targets its own task, not the
+default shell or other jobs. Stopping or exiting the session closes the
+default channel and all job channels.
+
+#### Status and Listings
+
+The `JOBS` column in `--sessions` uses the same selection rules as `--jobs`,
+including pending requests and persistent forwards but excluding the idle
+primary shell. It shows `?` when a count is unavailable from an older or
+unresponsive daemon.
+
+`--status` distinguishes idle, forwarding-only, running, pending,
+interrupting, disconnected, reconnecting, stopping and ended sessions.
+Connection and lifecycle states take precedence over surviving listeners.
+The `default:` line reports the primary shell or interactive request
+independently of exec/login tasks, transfers and proxies.
+
+Status includes total jobs with a type breakdown (`forward` for `-L`,
+`reverse` for `-R`, `socks` for `-D`), time since last activity and the idle
+expiry setting. Commands, channel IDs and forwarding addresses are shown
+only by `--jobs`; an unused listener does not mean traffic is flowing.
+Queries do not wait for the shell, consume pending results, refresh
+activity or start reconnect attempts. Older daemons show only the fields
+they provide; missing task details are not reported as zero jobs.
+
+For lightweight probe/list requests and full status message layouts, see
+[Session Client/Server Interaction](session-protocol.md#jobs-status-and-cancellation).
+
+### File Transfers
+
+Files can also use the existing session's connection, without rebuilding
+the jump chain or authenticating again:
+
+```bash
+mssh web --put ./app.conf /tmp/app.conf
+mssh web --get /var/log/app.log ./app.log
+mssh web -r -p --put ./release /tmp/
+mssh --session web --get /tmp/app.conf ./app.conf
+```
+
+`--put LOCAL REMOTE` and `--get REMOTE LOCAL` transfer one file or tree.
+An existing destination directory receives the source's basename. `-r`
+allows directories and `-p` preserves permissions and timestamps, following
+the normal copy rules. Progress goes to stderr when it is a terminal.
+Remote paths are SFTP paths: relative paths start at the SFTP subsystem's
+initial directory, not the persistent shell's current directory; shell
+variables and `~` are not expanded. The target must provide SFTP.
+
+Transfers use their own channel and can run alongside shell commands or
+other transfers, including in a session holding an interactive program.
+An interrupted download removes its partial local file.
+`--interrupt --job ID` or `--stop --job ID` stops the selected transfer;
+plain `--interrupt` does not stop transfers. Some Paramiko versions can
+still print a client-side background-thread traceback on Ctrl-C; this is
+separate from daemon channel cleanup. See
+[Rcfile and Teardown Safety](session-protocol.md#rcfile-and-teardown-safety)
+for implementation details.
+
+Connection failures are reported without automatically retrying transfers.
+`--timeout` bounds socket inactivity, not total transfer duration.
+
+### File Synchronization with rsync
+
+Use rsync's remote-shell mode to synchronize files through an existing
+session. mssh provides the session's SSH connection; rsync handles file
+comparison, incremental transfers, exclusions and resuming partial files.
+Both the local machine and the target must have `rsync` installed and
+available in `PATH`; SFTP is not required.
+
+```bash
+# Create the session once, then use its name as rsync's remote host.
+mssh --session web root@target
+rsync -a -e 'mssh --exec' tests web:/tmp/
+
+# Synchronize build directory contents; allow transfers longer than 30s.
+rsync -a --info=progress2 -e 'mssh --exec --wait 0' build/ web:/data/build/
+
+# Download test results through the same session.
+rsync -a -e 'mssh --exec --wait 0' web:/data/results/ results/
+
+# Preview changes and exclude intermediate object files.
+rsync -ani --exclude='*.o' -e 'mssh --exec --wait 0' build/ web:/data/build/
+
+# Retain partial files; rerun the same command after an interruption.
+rsync -a --partial-dir=.rsync-partial -e 'mssh --exec --wait 0' \
+      build/ web:/data/build/
+```
+
+`web` is the name of a live session, not a new SSH host or login.
+These examples assume `mssh` is in the local `PATH`; otherwise use its
+absolute path in `-e` and when creating the session. The default command wait
+is 30 seconds; `--wait 0` disables that limit, not rsync's own timeout handling.
+Keep `--exec` and do not add `-t` or `-n`: rsync needs an unmodified,
+bidirectional binary stream on stdin/stdout. Its remote process runs as an
+independent exec job and can be inspected with `mssh web --jobs`.
+The session shell's working directory and rcfile environment do not apply.
+
+A trailing slash on `build/` copies its contents, while `tests` copies the
+directory itself, producing `/tmp/tests`. Add rsync's `--delete` only when
+destination files absent from the source should be removed, and preview
+with `--dry-run` first. Partial files are managed by rsync, not mssh's
+`--put/--get` cleanup. A dropped SSH connection still fails the current
+transfer; after the session reconnects, rerun rsync to continue synchronizing.
+
+### Port Forwarding
+
+Forwarding is session-only. Configure listeners when creating a session or
+add them later; the daemon retains them after the configuring client exits.
+
+| Option | Listener | Destination |
+| --- | --- | --- |
+| `-L` | Local TCP or Unix socket | TCP or Unix service reached from the target |
+| `-R` | Target-side TCP or Unix socket | TCP or Unix service reached from the local daemon |
+| `-D` | Local TCP SOCKS proxy | Per-connection TCP destination reached from the target |
+
+Repeat or combine `-L/-R/-D` in one request. All new listeners must bind
+before success; failure rolls back that addition without changing existing
+jobs. An existing-session configuration takes no command, login or copy
+options. Each listener is one `forward` job; its accepted connections are
+not separate jobs. Targeted stop/interrupt closes the listener and its
+owned connections. Default `--interrupt` leaves it alone; whole-session
+stop, exit and idle expiry close all listeners.
+
+Traffic refreshes session activity, but an unused listener alone does not
+prevent idle expiry. Connections do not survive a transport replacement.
+The sections below describe endpoint-specific binding and reconnect rules.
 
 #### Local Port Forwarding
 
@@ -434,18 +691,6 @@ mssh web -L /tmp/client.sock:/run/service.sock
 mssh web --jobs
 mssh web --interrupt --job 3
 ```
-
-The configuring client exits once all requested listeners are bound.
-Each forward appears as one `forward` job showing its listening address
-and destination; accepted connections do not create additional jobs.
-Use `--interrupt --job ID` or `--stop --job ID` to close that listener and
-its active connections. `--stop` without `--job`, session exit and idle expiry
-close all forwards.
-
-Repeat `-L` to add several forwards in one request. If any listener cannot
-bind, the whole addition is rolled back; existing forwards are unchanged.
-An existing-session configuration takes no command, login or copy options.
-Forwarding requires a session, not a direct one-shot connection.
 
 By default, the daemon listens only on `localhost` (IPv4 and IPv6 when
 available). Specify `127.0.0.1` or `[::1]` to choose one family.
@@ -483,8 +728,7 @@ that connection. Diagnostic failures go to the session log under `-v`.
 With `--reconnect`, listeners and job IDs remain in the daemon. Existing
 connections are lost when their SSH transport drops; new connections use
 the rebuilt transport. Connections received while the link is down are
-closed rather than queued or replayed. Forward traffic updates session
-activity; an unused listener alone does not prevent `--session-idle` expiry.
+closed rather than queued or replayed.
 
 #### Remote Port Forwarding
 
@@ -512,14 +756,10 @@ mssh dev --stop --job 3
 # On the target, localhost:8080 now reaches the local machine's port 8000.
 ```
 
-Repeat `-R`, or combine `-L/-R/-D` in one atomic addition. The configuring
-client exits after the target acknowledges all remote binds. Existing
-forwards are unchanged on failure. Each listener is one persistent `forward`
-job (`remote LISTENER -> local DESTINATION`); accepted connections do not
-create jobs. `--status` counts these as `reverse`, without listing addresses.
-Targeted stop/interrupt cancels the listener and closes its connections.
-Default `--interrupt` does not affect forwards. Session exit and idle expiry
-stop all listeners; cancellation is sent without waiting for an SSH reply.
+The configuring client exits after the target acknowledges the remote binds.
+`--jobs` labels them `remote LISTENER -> local DESTINATION`; `--status`
+counts them as `reverse`, without listing addresses. Cancellation is sent
+without waiting for an SSH reply.
 
 The default remote bind is `localhost`. Explicit `*` or an empty address
 requests all interfaces, subject to the target's `GatewayPorts` policy:
@@ -561,8 +801,7 @@ rebuild and is reported through reconnect status and verbose diagnostics.
 Unix listeners may need the target's `StreamLocalBindUnlink yes` policy to
 rebind a retained path. Adding `-R` requires a live SSH transport; stopping an
 existing job still works while disconnected. Destination failures affect only
-that incoming connection. Traffic refreshes activity, but an unused listener
-does not prevent idle expiry. Older daemons must be stopped and recreated
+that incoming connection. Older daemons must be stopped and recreated
 before they can accept `-R`.
 
 #### Dynamic SOCKS Proxies
@@ -595,182 +834,93 @@ there is no SOCKS authentication, so anyone who can reach that listener
 can use the session's access to TCP services on the target's network.
 Keep the default loopback binding unless this exposure is intended.
 
-Repeat `-D` and combine it with `-L` or `-R` in one request. All new listeners
-are bound before success; any failure rolls back the whole addition
-without changing existing forwards. Configuring an existing session
-takes no command, login or copy options. The configuring client exits,
-while each proxy remains as one `forward` job (`bind -> SOCKS4/5`).
-`--stop --job ID` or `--interrupt --job ID` closes its listener, pending
-handshakes and active connections; default `--interrupt` leaves it alone.
-Session stop, exit and idle expiry close every proxy.
+`--jobs` labels a proxy `bind -> SOCKS4/5`. Targeted stop/interrupt closes
+pending handshakes as well as its listener and active connections.
 
 With `--reconnect`, listeners and job IDs survive transport replacement;
 connections do not. Requests made while disconnected fail rather than
 being queued. Handshakes have a total `--timeout` limit, with a minimum
-of one second, and bounded fields. Successful requests and relayed traffic
-update session activity; an unused listener alone does not prevent expiry.
+of one second, and bounded fields. Successful requests update activity.
 Older session daemons must be stopped and recreated to accept `-D`.
 
-#### File Transfers
+### Surviving a Reboot
 
-Files can also use the existing session's connection, without rebuilding
-the jump chain or authenticating again:
-
-```bash
-mssh web --put ./app.conf /tmp/app.conf
-mssh web --get /var/log/app.log ./app.log
-mssh web -r -p --put ./release /tmp/
-mssh --session web --get /tmp/app.conf ./app.conf
-```
-
-`--put LOCAL REMOTE` and `--get REMOTE LOCAL` transfer one file or tree.
-An existing destination directory receives the source's basename. `-r`
-allows directories and `-p` preserves permissions and timestamps, following
-the normal copy rules. Progress goes to stderr when it is a terminal.
-Remote paths are SFTP paths: relative paths start at the SFTP subsystem's
-initial directory, not the persistent shell's current directory; shell
-variables and `~` are not expanded. The target must provide SFTP.
-
-Transfers use their own channel and can run alongside shell commands or
-other transfers, including in a session holding an interactive program.
-An interrupted download removes its partial local file.
-`--interrupt --job ID` or `--stop --job ID` stops the selected transfer;
-plain `--interrupt`
-does not stop transfers. Session channels detach their receive
-notifications before closing, preventing late remote data from writing to
-a closed Paramiko event pipe and disconnecting the shared transport.
-Client-side prefetch cancellation hardening remains separate work; some
-Paramiko versions can still print a background-thread traceback on Ctrl-C.
-Connection failures are reported without automatically retrying transfers.
-`--timeout` bounds socket inactivity, not total transfer duration.
-
-Plenty of commands want the chain but nothing else: a `grep` over a log, a
-`systemctl status`, a `cat` of a config. `--exec` runs those on a channel of
-their own instead of in the session's shell.
+A jump host or target restarting, or a network connection dropping, can end
+the shared SSH connection. Without reconnect, the session ends when that
+loss is detected. Set `--reconnect N` when creating a shell session to
+rebuild the whole chain instead:
 
 ```bash
-mssh --session s --exec 'grep -c error /var/log/messages'
-mssh --session s --exec 'cat /etc/nginx/nginx.conf' 2>/dev/null
-mssh --session s --exec 'tar cf - /etc' > etc.tar
+mssh --session s --reconnect 20 -j ops@10.0.0.1 root@10.0.0.9
 ```
 
-It shares the connection, not the shell: a `cd` from an earlier call does
-**not** apply, and neither do that shell's variables, functions or background
-jobs. What you get instead is everything the pty was costing —
+Attempts run in the background after delays of 2, 4, 8, 16 and then at most
+30 seconds. Each connection attempt adds its own duration, bounded by
+`--timeout` per hop; attempts do not overlap. Counting begins when the
+daemon detects the loss, which can be delayed if the peer disappears
+without closing TCP.
 
-- **stdout and stderr stay apart**, since nothing merges them, so
-  `2>/dev/null` and `2>errors.log` do what they say.
-- **The bytes are untouched.** No pty means no line discipline, so no `\r`
-  before a `\n`, no 4095-byte line limit, and no control byte in the data
-  being read as a signal. Binary output survives.
-- **Nothing is framed.** The channel's own exit status ends the command, so
-  there is no marker printed into the output and no `base64`, `printf` or
-  POSIX shell needed on the target.
-- **Several run at once**, including while the session's shell is busy with
-  something else.
+`--status` shows the link and current attempt. Queries and targeted stop
+remain available, but commands arriving during reconnect exit `1` instead
+of waiting for the whole reboot. Commands that were running when the link
+failed are not replayed.
 
-`--wait`, Ctrl-C, stdin and the exit code behave as they do for a normal send;
-use `--interrupt --job ID` to interrupt an exec task from another client.
-A command that ends any way but
-normally — a `--wait` timeout, a targeted interruption, a client that walked away — is
-**killed** rather than left running, because closing its channel is what ends
-it and nothing else is waiting on that channel. A shell command in the same
-position keeps running, since the next send has to share the same pty with it.
+**The connection comes back; the old shell state does not.** A reconnect
+starts a new login shell and reruns the retained rcfile snapshot, if any.
+The old working directory, runtime environment changes and background jobs
+are not restored. Remote login profiles and the rcfile may establish their
+own environment and working directory in the new shell.
 
-`--exec` works against a `-c` session too, where it is the only way to reach a
-plain shell on the target.
+The first subsequent shell/exec command receives a notice on stderr before
+it runs:
 
-#### A terminal for the programs that need one
-
-Some commands refuse to run without one. `-t` asks for a pty on the `--exec`
-channel, and then the call is a login rather than a command:
-
-```bash
-mssh --session s --exec -t 'vim /etc/hosts'
-mssh --session s --exec -t top
-mssh --session s --exec -t 'mysql -u root -p'
+```text
+mssh: session s reconnected to root@10.0.0.9:22 after the connection to
+root@10.0.0.9:22 dropped.  This is a new shell: the working directory, the
+environment and any background jobs of the old one are gone.
 ```
 
-When the session is named as the first word (`mssh s ...` rather than
-`--session s`), the first word after it that is not an option starts the command, and
-everything from there is the command's, options included: `mssh s ls -l` runs
-`ls -l`, `mssh s --exec -t top -d 1` runs `top -d 1`. Put mssh's own options
-before the command (`mssh s --wait 5 'sleep 3'`); after it they belong to the command.
-With `--session s` the options may still follow the command, and a command that
-starts with a dash needs `--` in front of it.
+Automatic reconnect is refused in two cases:
 
-With `-t`:
+- **Authentication required an interactively typed password.** The detached
+  daemon cannot prompt again. Use a key, an agent, or an explicit endpoint
+  password that remains available, while considering command-line exposure.
+- **The session holds a `-c` program.** Restarting it would not restore the
+  debugger, interpreter or other program state that the session held.
 
-- **Your terminal is forwarded as the program's input**, which is the one case
-  the default rule holds back — here it is exactly what the program reads.
-- **Your terminal goes raw** for as long as the command runs and is restored
-  after. The remote pty is the line discipline now; a local one still echoing
-  and editing would do all of it twice.
-- **Resizing your window resizes the remote one**, so a full-screen program
-  keeps painting the right rectangle.
-- **`--wait` defaults to 0** — indefinite. Time spent in an editor is not
-  evidence that anything is stuck.
+A session that cannot reconnect does not disappear quietly: it stays up,
+broken, until a command asks it for something, and that command gets the
+reason and exit 1 as the session ends. The same is true once the attempts run
+out — one more is tried when the next command arrives, since a command
+arriving is evidence that somebody expects the target to be back.
 
-All of that needs a terminal on **both** ends. Redirect either one and the
-command runs without a pty, as it would without `-t`: there would be nothing
-to put in raw mode, no size to send, and `--exec -t top > log` would otherwise
-fill the file with escape sequences.
+Other resources have different lifetimes:
 
-`-t` applies to `--exec` only. The session's own shell already runs behind a
-pty, and a command sent to it reads a fifo rather than your terminal.
+| Resource | After reconnect |
+| --- | --- |
+| Primary shell/request | New shell; old default job is cleared |
+| Session rcfile | Original local snapshot uploaded and sourced again |
+| `-L/-D` listeners | Remain locally bound with the same job IDs |
+| `-R` listeners | Rebound on the target with the same job IDs; bind failure fails that attempt |
+| Accepted forwarding connections | Lost, not queued or replayed |
+| Exec/login commands and SFTP transfers | Not automatically restarted |
+| rsync synchronization | Rerun rsync after the session is ready |
 
-Use a normal send when the command depends on what came before it, and
-`--exec` when it does not.
+#### Keepalive and Idle Expiry
 
-### Holding a program instead of a shell
+Keepalive packets go out every 30 seconds by default (`-k SEC`, `0` to
+disable), helping maintain idle connections through NATs and firewalls.
+They do not override server-enforced disconnect policies. Session shell
+setup unsets writable `TMOUT`; read-only settings cannot be bypassed.
 
-With `-c`, the session holds an interactive program, and `--prompt` gives the
-regex that marks the end of one of its replies:
+`--session-idle SEC` ends the daemon after that much inactivity. Default
+`0` disables expiry. Commands, forwarding configuration and forwarded
+traffic refresh activity; status/jobs queries, keepalives and unused
+forwarding listeners do not.
+This is separate from `--idle`, which detects pauses in an interactive
+program's output, and `--wait`, which limits one command's waiting time.
 
-```bash
-mssh --session g --prompt '\(gdb\) $' -j ops@10.0.0.1 root@10.0.0.9 \
-     -c 'gdb -q -ex "set pagination off" -p 1234'
-mssh --session g 'break do_work'
-mssh --session g 'bt'
-```
-
-Verified against `gdb -q` (`'\(gdb\) $'`), `python3 -i` (`'>>> $'`) and
-`sqlite3` (`'sqlite> $'`), with nothing injected into the program. Without
-`--prompt`, `mssh` falls back to treating a pause in the output as the end
-(`--idle SEC`, default 0.4) — workable, but a guess; name the prompt if you
-can.
-
-### Things worth knowing
-
-- **Output is stdout and stderr merged**, in the order the program wrote them,
-  because the session runs behind a pty. The exit code, not the stream, is what
-  tells you whether a command failed. (A pty is not optional here: without one
-  the two streams arrive unordered, and Ctrl-C cannot be delivered correctly.)
-  `--exec` has no pty and keeps them apart, at the cost of the shell's state.
-- **stdin is forwarded when it is a pipe or a file**, so `echo hello | mssh
-  --session s cat` behaves as it would through `ssh`, and it streams — a filter
-  fed by a slow producer prints as it goes. The command still runs in the
-  session's own shell, so a `cd` from an earlier call still applies. A terminal
-  is *not* forwarded by default: with `--stdin` the command reads until you
-  type Ctrl-D, which is what you want for `cat` and not for a plain
-  `mssh --session s ls`.
-  `-n` never forwards, for when mssh's stdin belongs to something else, such as
-  a script being read from a pipe. `/dev/null` is never forwarded — it cannot be
-  told apart from having no input, so a bare `cat` still ends instead of wedging
-  the session.
-- **`--wait SEC`** (default 30, or 0 for a login and with `--exec -t`) bounds how long one
-  command is watched; `0` means indefinitely. A timeout exits 124 and leaves
-  the session usable — the next command stops whatever was still running.
-- **Ctrl-C interrupts the remote command**, not your local process, so the
-  session survives it. Press it twice to walk away and leave the command
-  running.
-- **A program that paginates will stall at its pager** until `--interrupt`, so
-  turn paging off in the program itself (`gdb -ex 'set pagination off'`).
-- **`--session-idle SEC`** ends a session after that much quiet, so a forgotten
-  one does not hold a root channel open forever. Default `0`: never.
-- The first call keeps your terminal until the chain is up, so a hop that needs
-  a password can still ask for one and `-vv` shows each hop. Only then
-  does it detach.
+### Session Storage and Security
 
 Sessions live in `~/.mssh/sessions`, one socket each, mode `0600` inside a
 `0700` directory that is re-checked on every use, and the daemon refuses any
@@ -778,7 +928,16 @@ peer whose uid is not yours. **Holding one of those sockets is equivalent to
 being logged in on the target**, so it is guarded like a private key rather
 than like a temp file.
 
-### Daemon diagnostics
+Remote temporary artifacts use `/tmp/.mssh-<kind>-<random>`: `rc` for
+initialization files and `in` for forwarded-stdin FIFOs. Suffixes contain
+16 ASCII letters/digits, generated locally. Files and FIFOs are created
+exclusively with mode `0600`, so an existing path is not overwritten.
+Cleanup is best-effort when a remote shell exits or its connection is lost.
+
+For descriptor ownership, cleanup races and message formats, see
+[Session Client/Server Interaction](session-protocol.md).
+
+### Daemon Diagnostics
 
 Choose the log level when creating a session:
 
@@ -809,8 +968,8 @@ for subsequent records.
 Structured daemon and Paramiko records include timestamps, severity, PID,
 thread name and session name. Request workers also carry a request ID and
 operation; channel events include channel ID, EOF/closed flags and transport
-state. Events cover startup, requests, shell/exec/SFTP I/O, channel cleanup,
-rcfile cleanup, reconnect attempts and daemon exit.
+state. Events cover startup, requests, shell/exec/SFTP I/O, forwarding,
+channel cleanup, rcfile cleanup, reconnect attempts and daemon exit.
 
 Failures preserve original exception tracebacks. Paramiko ERROR records
 capture the current exception, and link-failure events also report the
@@ -823,41 +982,13 @@ messages, filenames, remote errors and hop diagnostics can still contain
 sensitive information; treat these logs as private. Logs are not
 automatically rotated or deleted by `--stop`.
 
-## Key setup
-
-Password prompts on every hop get old quickly. Install a key once:
-
-```bash
-ssh-keygen -t ed25519                              # if you have none yet
-mssh --copy-id -j ops:pw1@10.0.0.1 root:pw2@10.0.0.9
-mssh -j ops@10.0.0.1 root@10.0.0.9                 # key auth from now on
-```
-
-`--copy-id` appends the key to `~/.ssh/authorized_keys` on **every** hop, then
-exits without opening a shell. It defaults to `~/.ssh/id_ed25519.pub` or
-`id_rsa.pub`; name a file to pick another. It refuses to upload anything that
-looks like a private key.
-
-`-i KEYFILE` offers a specific key (repeatable, applied to every hop) and
-prompts once for the passphrase if it is encrypted. An OpenSSH certificate is
-used automatically when `<key>-cert.pub` sits next to the private key.
-
-Supported: **ed25519** (recommended), **ecdsa** (nistp256/384/521) and **rsa**.
-DSA is gone — paramiko 5 dropped it, as did OpenSSH 9.8.
-
-## Host keys
-
-By default an unknown host key is added and the connection proceeds, which is
-what makes a one-off chain to a machine you have never met usable. `--strict`
-opts into real verification and rejects anything unknown; `--known-hosts FILE`
-points at a specific file.
-
 ## Options
 
 | Option | Meaning |
 | --- | --- |
 | `-j, --jump SPEC` | Add a jump host; repeat for each hop, in order |
 | `-c, --command CMD` | Run `CMD` instead of opening a shell |
+| `--rcfile FILE` | Source a local initialization script in a new remote shell |
 | `-t, --force-tty` | Allocate a pty even with `-c`; with `--session --exec`, run the command on a terminal |
 | `-n, --no-stdin` | Never forward stdin; the remote command reads `/dev/null` |
 | `-r, --recursive` | Copy directories recursively |
@@ -884,7 +1015,7 @@ Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
 
 `mssh --help` carries the same detail plus worked examples.
 
-## Exit codes
+## Exit Codes
 
 | Code | Meaning |
 | --- | --- |
@@ -896,27 +1027,12 @@ Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
 | `124` | A session command did not finish within `--wait` |
 | `130` | Interrupted (Ctrl-C) |
 
-## Idle connections
-
-A keepalive goes out every 30 s (`-k SEC`, `0` to disable), so an idle session
-survives NAT and firewall timeouts. It cannot override a server-side
-`ClientAliveInterval` or a shell `TMOUT` — those still apply, and a session
-that dies that way reports it on the next call, or rebuilds itself if it was
-started with [`--reconnect`](#surviving-a-reboot).
-
-## Legacy servers
-
-Against OpenSSH older than 7.8, RSA keys do not work: those servers accept only
-SHA-1 `ssh-rsa` signatures, which paramiko 5 no longer produces. Use an ed25519
-key (`ssh-keygen -t ed25519`). This is why ed25519 leads the default key search
-order.
-
 ## Tests
 
 ```bash
-python3 tests/test_session_unit.py     # framing, endpoints, flags     (61)
-python3 tests/test_session_daemon.py   # daemon, protocol, client      (62)
-python3 tests/test_copy_mode.py        # copy permissions vs real scp (51)
+python3 tests/test_session_unit.py     # framing, endpoints, flags
+python3 tests/test_session_daemon.py   # daemon, protocol, client
+python3 tests/test_copy_mode.py        # copy permissions vs real scp
 python3 -m unittest discover -s tests -p test_session_forward.py
 python3 -m unittest discover -s tests -p test_session_unix_forward.py
 python3 -m unittest discover -s tests -p test_session_remote_forward.py
