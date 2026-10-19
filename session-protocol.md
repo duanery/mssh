@@ -99,7 +99,7 @@ Parent CLI                         Forked child / future daemon
     |                                           | start primary PTY program
     |                                           | initialize and check shell
     |                                           | upload/source retained rcfile
-    |                                           | bind initial -L/-D listeners
+    |                                           | bind initial -L/-R/-D listeners
     |                                           | detach and redirect stdio
     |                                           | start listener workers
     |<---------- readiness JSON over pipe -------|
@@ -142,7 +142,7 @@ Command requests can receive a notice before their final reply.
 
 | Operation | Client half-closes after request? | Server response |
 | --- | --- | --- |
-| `status`, `jobs`, `stop`, `interrupt`, `forward`, `dynamic_forward` | Yes, `shutdown(SHUT_WR)` | One JSON reply, then half-close |
+| `status`, `jobs`, `stop`, `interrupt`, `forward`, `remote_forward`, `dynamic_forward` | Yes, `shutdown(SHUT_WR)` | One JSON reply, then half-close |
 | `send`, `exec` | No | Optional notice, then terminal reply |
 | `sftp` | No | Setup acknowledgement; connection remains open as a lifetime guard |
 
@@ -430,7 +430,7 @@ are not individually registered.
 | `shell`, `interactive` | Current request on the primary channel | Default job; keep primary channel |
 | `exec`, `login` | Independent command or login | Its own SSH channel |
 | `sftp`, `put`, `get` | SFTP relay | Its channel and relay endpoints |
-| `forward` | One `-L` or `-D` listener | Listener plus all owned connections |
+| `forward` | One `-L`, `-R` or `-D` listener | Listener plus all owned connections |
 
 IDs increase within a daemon lifetime and restart when the daemon is
 recreated. Completed jobs disappear; there is no job history.
@@ -449,8 +449,8 @@ It is not a substitute for authentication or a session-wide identifier.
 ```
 
 Snapshots are sorted by job ID. Job states are `running`, `pending`
-or `stopping`. `forward_type` is `local` for `-L`, `socks` for `-D`,
-and `null` otherwise; both listener types retain `kind: "forward"`.
+or `stopping`. `forward_type` is `local` for `-L`, `remote` for `-R`,
+`socks` for `-D`, and `null` otherwise; all listeners retain `kind: "forward"`.
 Listeners have a `null` channel because each accepted connection opens
 its own channel.
 
@@ -501,7 +501,8 @@ those replies for discovery and listing without an additional request.
 It derives running/pending/interrupting/forwarding state from the snapshot,
 then gives lifecycle and connection states precedence.
 The default-job state is shown independently. Type counts are sorted
-alphabetically by name; `-D` counts as `socks`, while `-L` counts as `forward`.
+alphabetically by name; `-D` counts as `socks`, `-L` as `forward`,
+and `-R` as `reverse`.
 Use `--jobs` for commands, channel IDs and forwarding addresses.
 
 These queries do not acquire the primary lock, refresh activity, consume a
@@ -569,6 +570,10 @@ every remote process has already exited or every cleanup step succeeded.
 ```
 
 ```json
+{"op": "remote_forward", "remote_specs": ["8080:127.0.0.1:8000", "/tmp/target.sock:/tmp/local.sock"], "specs": ["8081:service.internal:80"], "dynamic_specs": ["1080"]}
+```
+
+```json
 {"ok": true, "forwards": [{"id": 3, "command": "127.0.0.1:1080 -> SOCKS4/5"}]}
 ```
 
@@ -579,13 +584,31 @@ Later additions use the operations above.
 
 The daemon validates and binds all listeners in a batch before completing
 registration. Bind/start failure rolls back the additions, not existing
-forwards. Configuration success confirms local binding, not remote
-destination reachability. No descriptors are passed by the configuring CLI.
+forwards. Configuration success confirms listener binding (and the target's
+acknowledgement for `-R`), not destination reachability. No descriptors are
+passed by the configuring CLI.
 
 `-L` supports TCP/Unix listeners and TCP/Unix destinations.
 The configuring client makes relative local socket paths absolute before
 sending them. Remote paths are literal. Existing local paths are never
 overwritten; cleanup removes only the Unix socket inode created by that job.
+
+`-R` uses the same four forms but listens on the target and connects the
+destination from the daemon's machine:
+
+```text
+-R [bind_address:]port:host:hostport
+-R [bind_address:]port:local_socket
+-R remote_socket:host:hostport
+-R remote_socket:local_socket
+```
+
+The client normalizes relative
+destination socket paths, not target listener paths. `remote_specs` is
+required and nonempty; `specs` and `dynamic_specs` are optional batch members.
+Adding remote listeners requires a live transport; targeted cancellation
+remains possible during reconnect. sshd owns remote socket permissions,
+stale-path replacement and cleanup; mssh does not unlink those paths.
 
 ### Forwarded Data
 
@@ -602,6 +625,29 @@ Application --> local TCP/Unix listener owned by daemon
 TCP destinations use `direct-tcpip`; remote Unix destinations use
 `direct-streamlocal@openssh.com`. Neither application data nor channel
 contents pass through the CLI control socket.
+
+Remote TCP listeners use SSH global requests `tcpip-forward` and
+`cancel-tcpip-forward` with address and port. Unix listeners use
+`streamlocal-forward@openssh.com` and `cancel-streamlocal-forward@openssh.com`
+with a socket path. Binds request an acknowledgement; cancellation does not.
+Incoming `forwarded-tcpip` channels include listener and origin addresses;
+`forwarded-streamlocal@openssh.com` includes listener path and a reserved
+string. `_RemoteForwardManager` installs handlers on this transport alone
+and routes channels to jobs by listener endpoint. It avoids Paramiko's
+single remote-TCP callback and adds its missing incoming Unix support.
+
+Global replies have no request IDs. The manager serializes bind requests;
+a timed-out request stays pending until its reply or transport replacement.
+A late successful bind is cancelled, preventing orphaned target listeners
+and preventing its reply from completing a subsequent bind. Unrelated
+incoming channel types and unowned global replies retain Paramiko's handlers.
+mssh's other global requests (keepalives) do not request replies.
+
+Each remote incoming channel starts a local connect worker, then uses the
+same bounded, half-close-preserving relay as `-L`. The transport dispatch
+thread never performs local DNS/connect or a rekey-waiting channel close.
+Remote listener access is subject to sshd's forwarding and GatewayPorts
+policies; destination names are resolved on the daemon's machine.
 
 `-D` first parses a SOCKS4/4a/5 TCP CONNECT handshake on the accepted socket.
 SOCKS4a/5 domain names are sent to the target for resolution, supporting
@@ -626,6 +672,7 @@ and output would make command framing ambiguous.
 | `_Session.lock` | Primary command execution, pending resynchronization and replacement-shell setup |
 | `execs_lock` | Independent job registry, default-job identity and job IDs |
 | `state_lock` | Stored link/reconnect state and one-time reconnect notice |
+| `forward_lock` | Atomic forward additions and remote rebind during reconnect |
 | Forward job lock | Accepted sockets, channel publication and cancellation ownership |
 
 Job snapshots hold only the job-registry lock briefly; they do not wait
@@ -740,11 +787,18 @@ not the previous working directory, environment, processes or program
 state. The first subsequent send/exec request receives a notice before
 its command runs. Work is not automatically replayed.
 
+Remote listeners are rebound before a rebuild reports success; any failed
+bind fails that attempt and cancels the listeners newly restored in it.
+Their job IDs remain. Unix path rebinding can require sshd's
+`StreamLocalBindUnlink` policy when a previous listener path remains.
+`-L/-D` listeners stay bound on the local daemon during transport replacement.
+
 Forward listener jobs and IDs remain, but individual accepted connections
 do not survive transport replacement. New connections while disconnected
 fail rather than queue; later ones use the rebuilt transport.
 Forward configuration and targeted cancellation do not trigger link
-resolution and remain available during reconnect.
+resolution. `-L/-D` additions and targeted cancellation remain available
+during reconnect; `-R` additions need a live transport.
 
 ## Rcfile and Teardown Safety
 
@@ -789,7 +843,8 @@ show unknown counts when absent, rather than treating missing details as
 zero jobs. Missing output FDs and unsupported operations produce errors
 that may require stopping and recreating the daemon.
 
-`dynamic_forward` is intentionally a distinct op. Sending a `-D` field
+`dynamic_forward` and `remote_forward` are intentionally distinct ops.
+Sending a `-D` or `-R` field
 inside an old `forward` request could otherwise be silently ignored.
 Job-targeted stop remains compatible by using the existing `interrupt` op.
 
@@ -823,7 +878,7 @@ not remove or rotate logs.
 | Independent channels | `_Session.exec_run()`, `_pump_exec()`, `_exec_control()` |
 | SFTP adapter and relay | `open_session_sftp()`, `_SessionSFTPChannel`, `run_session_copy()` |
 | Jobs and cancellation | `_ExecJob`, `jobs_snapshot()`, `interrupt_job()`, `close_channels()` |
-| Forwarding | `_LocalForwardJob`, `_SocksRequest`, `add_forwards()` |
+| Forwarding | `_LocalForwardJob`, `_RemoteForwardJob`, `_RemoteForwardManager`, `_SocksRequest`, `add_forwards()` |
 | Reconnect and initialization | `failed()`, `resolve()`, `rebuild()`, `setup_rcfile()` |
 | Safe channel close and logging | `_close_session_channel()`, `_session_log()`, `_setup_logging()` |
 
@@ -836,7 +891,8 @@ and, for forwarding, real SSH fixtures:
 - `tests/test_session_jobs.py` and `tests/test_session_status.py`: snapshots,
   targeted cancellation, status summaries and legacy replies.
 - `tests/test_session_copy.py`: SFTP relay and copy lifecycle.
-- `tests/test_session_forward.py`, `tests/test_session_unix_forward.py` and
+- `tests/test_session_forward.py`, `tests/test_session_unix_forward.py`,
+  `tests/test_session_remote_forward.py` and
   `tests/test_session_socks.py`: listener configuration and forwarded data.
 - `tests/test_session_reconnect.py`: disconnect detection and rebuild.
 - `tests/test_session_channel_close.py` and `tests/test_session_logging.py`:

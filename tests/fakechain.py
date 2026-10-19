@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import termios
+import threading
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +48,7 @@ def link_up():
 class FakeTransport(object):
     def __init__(self, client):
         self.client = client
+        self.reverse_managers = []
 
     def open_session(self, timeout=None):
         if not link_up():
@@ -122,9 +124,10 @@ class FakeClient(object):
     def __init__(self):
         self.channels = []
         self.shut = False
+        self.transport = FakeTransport(self)
 
     def get_transport(self):
-        return FakeTransport(self)
+        return self.transport
 
     def close(self):
         """Take the chain's channels with it, as closing a transport does.
@@ -134,12 +137,100 @@ class FakeClient(object):
         attempt, still holding the fd the test is about to check.
         """
         self.shut = True
+        for manager in self.transport.reverse_managers:
+            manager.close()
         for chan in self.channels:
             try:
                 chan.close()
             except Exception:
                 pass
         del self.channels[:]
+
+
+class _FakeRemoteForwardManager(object):
+    """Fake only sshd's listener; actual remote jobs and relays run unchanged.
+
+    Protocol packets are tested against Paramiko and a real OpenSSH fixture.
+    These sockets instead let separate CLI processes test daemon ownership,
+    cancellation and rebind without needing credentials or a network host.
+    """
+
+    endpoint = staticmethod(mssh._RemoteForwardManager.endpoint)
+
+    def __init__(self, transport, timeout):
+        self.transport = transport
+        self.lock = threading.Lock()
+        self.entries = {}
+        transport.reverse_managers.append(self)
+
+    def bind(self, job):
+        if not self.transport.is_active():
+            raise OSError("fake chain: the connection is down")
+        endpoint = self.endpoint(job.settings)
+        family = socket.AF_UNIX if endpoint[0] == "unix" else socket.AF_INET
+        listener = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            if family == socket.AF_UNIX:
+                address = endpoint[1]
+            else:
+                address = ("127.0.0.1" if endpoint[1] == "localhost" else
+                           endpoint[1], endpoint[2])
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(address)
+            listener.listen(16)
+            listener.settimeout(0.1)
+            with self.lock:
+                if endpoint in self.entries:
+                    raise ValueError("remote listener is already configured")
+                self.entries[endpoint] = (job, listener)
+            worker = threading.Thread(target=self.accept, args=(job, listener))
+            worker.daemon = True
+            worker.start()
+        except BaseException:
+            with self.lock:
+                if self.entries.get(endpoint) == (job, listener):
+                    self.entries.pop(endpoint)
+            listener.close()
+            raise
+
+    def accept(self, job, listener):
+        try:
+            while self.transport.is_active():
+                try:
+                    conn, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                chan = _TCPChan(conn)
+                self.transport.client.channels.append(chan)
+                if job.accepting(self.transport):
+                    job.incoming(chan, self.transport)
+                else:
+                    chan.close()
+        except OSError:
+            pass
+        finally:
+            self.cancel(job)
+
+    def cancel(self, job):
+        with self.lock:
+            entry = self.entries.get(self.endpoint(job.settings))
+            if entry is None or entry[0] is not job:
+                return
+            self.entries.pop(self.endpoint(job.settings))
+        try:
+            entry[1].shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        entry[1].close()
+
+    def close(self):
+        with self.lock:
+            jobs = [entry[0] for entry in self.entries.values()]
+        for job in jobs:
+            self.cancel(job)
+
+
+mssh._RemoteForwardManager = _FakeRemoteForwardManager
 
 
 class _PtyChan(FakeChan):

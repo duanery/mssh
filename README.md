@@ -298,7 +298,8 @@ primary shell or interactive request independently of exec/login channels,
 transfers and proxies.
 
 The reply includes total jobs with a type breakdown (`socks` counts `-D`
-listeners, `forward` counts `-L` listeners), time since last session activity,
+listeners, `forward` counts `-L` and `reverse` counts `-R` listeners),
+time since last session activity,
 and the configured idle expiry. Detailed commands, channels and forwarding
 addresses are shown only by `--jobs`, not `--status`.
 An unused listener does not mean traffic is flowing.
@@ -376,7 +377,7 @@ immediately, as it always has.
 
 `mssh NAME --jobs` lists mssh-managed tasks with their ID, type, channel,
 state, elapsed time and command or transfer paths. It includes active shell
-or interactive requests, exec/login channels, SFTP transfers and local forwards.
+or interactive requests, exec/login channels, SFTP transfers and forwards.
 The idle persistent shell or `-c` program itself is not a job. Each request
 on its primary channel creates a default job, removed when the reply completes.
 A timed-out or detached request remains `pending` until resynchronized.
@@ -485,6 +486,85 @@ the rebuilt transport. Connections received while the link is down are
 closed rather than queued or replayed. Forward traffic updates session
 activity; an unused listener alone does not prevent `--session-idle` expiry.
 
+#### Remote Port Forwarding
+
+`-R` uses the same four endpoint forms as `-L`, but reverses their location:
+the left endpoint listens on the target, and the right endpoint is connected
+from the local session daemon.
+
+```text
+-R [bind_address:]port:host:hostport
+-R [bind_address:]port:local_socket
+-R remote_socket:host:hostport
+-R remote_socket:local_socket
+```
+
+Configure at creation or afterward, for example to let a development target
+reach your local artifact HTTP server or debugger:
+
+```bash
+mssh --session dev -R 8080:127.0.0.1:8000 -j ops@jump root@target
+mssh dev -R 8081:/tmp/local-service.sock
+mssh dev -R /tmp/target.sock:127.0.0.1:8000
+mssh dev -R /tmp/target.sock:/tmp/local-service.sock
+mssh dev --jobs
+mssh dev --stop --job 3
+# On the target, localhost:8080 now reaches the local machine's port 8000.
+```
+
+Repeat `-R`, or combine `-L/-R/-D` in one atomic addition. The configuring
+client exits after the target acknowledges all remote binds. Existing
+forwards are unchanged on failure. Each listener is one persistent `forward`
+job (`remote LISTENER -> local DESTINATION`); accepted connections do not
+create jobs. `--status` counts these as `reverse`, without listing addresses.
+Targeted stop/interrupt cancels the listener and closes its connections.
+Default `--interrupt` does not affect forwards. Session exit and idle expiry
+stop all listeners; cancellation is sent without waiting for an SSH reply.
+
+The default remote bind is `localhost`. Explicit `*` or an empty address
+requests all interfaces, subject to the target's `GatewayPorts` policy:
+sshd may restrict a wildcard to loopback or override the requested address.
+TCP listeners require `AllowTcpForwarding` to permit remote forwarding,
+and Unix listeners require `AllowStreamLocalForwarding`. Bracket IPv6
+addresses, and use TCP ports from 1 to 65535; port zero and reverse dynamic
+SOCKS forwarding are not supported.
+
+Destination host names are resolved locally, not on the target or jump host.
+Relative local destination socket paths are resolved in the configuring
+client's directory. Remote listener paths are literal, with no shell or
+`~` expansion. The same path escaping rules as `-L` apply.
+mssh never removes or overwrites a remote listener path. sshd controls
+permissions and stale-path replacement through `StreamLocalBindMask` and
+`StreamLocalBindUnlink`; cancellation may leave a socket pathname behind.
+Parent directories must already exist.
+
+If binding is denied, the error names the remote listener and suggests
+checks; SSH's failure reply does not carry a detailed reason. Check the
+listener path/port on the target, its parent directory permissions and
+the target's effective sshd forwarding policy. For example, if
+`/tmp/echo.sock` already exists on the target and `StreamLocalBindUnlink`
+is disabled, use a different remote listener path:
+
+```bash
+mssh dev -R /tmp/mssh-echo.sock:/tmp/echo.sock
+```
+
+Here `/tmp/mssh-echo.sock` is created on the target; `/tmp/echo.sock` is
+the local destination. The destination is connected only after someone
+connects to the remote listener, not during configuration. Never remove an
+existing remote socket without first checking its owner and active users.
+
+With `--reconnect`, remote listener jobs and IDs remain, but all connections
+using the old transport are lost. The daemon reissues remote binds before
+declaring the rebuilt session ready. A denied/conflicting bind fails that
+rebuild and is reported through reconnect status and verbose diagnostics.
+Unix listeners may need the target's `StreamLocalBindUnlink yes` policy to
+rebind a retained path. Adding `-R` requires a live SSH transport; stopping an
+existing job still works while disconnected. Destination failures affect only
+that incoming connection. Traffic refreshes activity, but an unused listener
+does not prevent idle expiry. Older daemons must be stopped and recreated
+before they can accept `-R`.
+
 #### Dynamic SOCKS Proxies
 
 `-D [bind_address:]port` creates a SOCKS proxy owned by the session daemon,
@@ -515,7 +595,7 @@ there is no SOCKS authentication, so anyone who can reach that listener
 can use the session's access to TCP services on the target's network.
 Keep the default loopback binding unless this exposure is intended.
 
-Repeat `-D` and combine it with `-L` in one request. All new listeners
+Repeat `-D` and combine it with `-L` or `-R` in one request. All new listeners
 are bound before success; any failure rolls back the whole addition
 without changing existing forwards. Configuring an existing session
 takes no command, login or copy options. The configuring client exits,
@@ -796,7 +876,8 @@ points at a specific file.
 | `-V, --version` | Print the version |
 
 Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
-`--interrupt`, `--job ID`, `--jobs`, `-L SPEC`, `-D [BIND:]PORT`, `--exec`,
+`--interrupt`, `--job ID`, `--jobs`, `-L SPEC`, `-R SPEC`,
+`-D [BIND:]PORT`, `--exec`,
 `--put LOCAL REMOTE`, `--get REMOTE LOCAL`,
 `--prompt REGEX`, `--stdin`, `--idle SEC`,
 `--wait SEC`, `--reconnect N`, `--session-idle SEC`.
@@ -838,6 +919,7 @@ python3 tests/test_session_daemon.py   # daemon, protocol, client      (62)
 python3 tests/test_copy_mode.py        # copy permissions vs real scp (51)
 python3 -m unittest discover -s tests -p test_session_forward.py
 python3 -m unittest discover -s tests -p test_session_unix_forward.py
+python3 -m unittest discover -s tests -p test_session_remote_forward.py
 python3 -m unittest discover -s tests -p test_session_socks.py
 ```
 
@@ -850,6 +932,8 @@ listeners and a real Paramiko client/server transport over a socketpair.
 Unix forwarding tests also use local Unix sockets. When `sshd` is available
 and the tests run as root, additional socketpair-based tests check actual
 OpenSSH streamlocal channels; otherwise only those tests are skipped.
+Remote forwarding tests cover all four TCP/Unix combinations, late bind
+replies, cancellation races, atomic rollback and reconnect restoration.
 SOCKS tests exercise fragmented requests, remote DNS, failures, cancellation,
 reconnects and binary half-closes, including a real curl client when available.
 Some of the permission tests drop to

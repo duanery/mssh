@@ -2562,7 +2562,7 @@ class _InteractiveFramer(object):
         return (130, False)
 
 
-def _close_session_channel(chan):
+def _close_session_channel(chan, transport_thread=False):
     """Close a session channel without stranding its transport on EBADF.
 
     Channel.fileno() creates an OS pipe for select() and installs its
@@ -2590,6 +2590,21 @@ def _close_session_channel(chan):
         with chan.lock:
             chan.in_buffer.set_event(threading.Event())
             chan.in_stderr_buffer.set_event(threading.Event())
+            if transport_thread:
+                # Incoming forwarded channels are dispatched in Transport.run.
+                # Its normal close sends via _send_user_message(), which can
+                # wait for rekeying driven by this same thread. Preserve the
+                # usual EOF/CLOSE and pipe teardown, but send without that wait.
+                if chan._pipe is not None:
+                    chan._pipe.close()
+                    chan._pipe = None
+                messages = chan._close_internal() \
+                    if chan.active and not chan.closed else []
+        if transport_thread:
+            for message in messages:
+                if message is not None:
+                    chan.transport._send_message(message)
+            return
         # Channel.close() acquires the non-reentrant channel lock itself.
         # Keep its normal EOF/CLOSE packets, waiter notifications and pipe
         # cleanup; only the buffers' notification destinations have changed.
@@ -2599,7 +2614,7 @@ def _close_session_channel(chan):
 
 
 class _ExecJob(object):
-    """One tracked shell command, exec/login, SFTP transfer, or local forward.
+    """One tracked shell command, exec/login, SFTP transfer, or forward.
 
     Independent exec/login/SFTP channels are closed on targeted interruption.
     Shell jobs instead flag their pump, keeping the shared shell channel alive.
@@ -2632,14 +2647,15 @@ class _ExecJob(object):
                          chan=self.chan, exc=exc)
 
 
-def parse_local_forward(spec):
-    """Parse the four SSH -L forms; slash-containing fields are socket paths."""
+def parse_local_forward(spec, remote=False):
+    """Parse -L/-R's four forms; only the client-side path is made absolute."""
+    option = "-R" if remote else "-L"
     if not isinstance(spec, str) or not spec:
-        raise ValueError("-L expects a TCP or Unix socket forwarding specification")
+        raise ValueError("%s expects a TCP or Unix socket forwarding specification" % option)
     fields, field, bracketed, escaped, closed_bracket = [], "", False, False, False
     for char in spec:
         if closed_bracket and char != ":":
-            raise ValueError("unexpected characters after bracket in -L")
+            raise ValueError("unexpected characters after bracket in %s" % option)
         if escaped:
             field += char
             escaped = False
@@ -2652,7 +2668,7 @@ def parse_local_forward(spec):
                 try:
                     ipaddress.IPv6Address(field.split("%", 1)[0])
                 except ValueError:
-                    raise ValueError("invalid IPv6 address in -L: %r" % field)
+                    raise ValueError("invalid IPv6 address in %s: %r" % (option, field))
             bracketed = False
             closed_bracket = True
         elif char == ":" and not bracketed:
@@ -2662,7 +2678,7 @@ def parse_local_forward(spec):
         else:
             field += char
     if escaped or bracketed:
-        raise ValueError("unterminated escape or bracket in -L")
+        raise ValueError("unterminated escape or bracket in %s" % option)
     fields.append(field)
 
     local_socket = remote_socket = None
@@ -2679,43 +2695,57 @@ def parse_local_forward(spec):
         bind, port, host, hostport = (
             ["localhost"] + fields if len(fields) == 3 else fields)
     else:
-        raise ValueError("-L expects [bind:]port:host:hostport, "
-                         "[bind:]port:remote_socket, local_socket:host:hostport "
-                         "or local_socket:remote_socket")
+        listener_socket, destination_socket = (
+            ("remote_socket", "local_socket") if remote else
+            ("local_socket", "remote_socket"))
+        raise ValueError("%s expects [bind_address:]port:host:hostport, "
+                         "[bind_address:]port:%s, %s:host:hostport "
+                         "or %s:%s" % (option, destination_socket,
+                                      listener_socket, listener_socket,
+                                      destination_socket))
 
     settings = {}
+    # Keep -L's established wire/settings keys shared with -R: local_socket
+    # denotes the left/listening endpoint, remote_socket the right/destination.
+    # For -R their actual machine locations are reversed.
     for key, path in (("local_socket", local_socket), ("remote_socket", remote_socket)):
         if path is not None:
             if "\x00" in path or any(ord(char) < 32 for char in path):
-                raise ValueError("invalid Unix socket path in -L")
-            settings[key] = os.path.abspath(path) if key == "local_socket" else path
+                raise ValueError("invalid Unix socket path in %s" % option)
+            client_path = key == ("remote_socket" if remote else "local_socket")
+            settings[key] = os.path.abspath(path) if client_path else path
     addresses = []
     if local_socket is None:
         addresses.append(bind)
     if remote_socket is None:
         addresses.append(host)
         if host in ("", "*"):
-            raise ValueError("-L requires a destination host")
+            raise ValueError("%s requires a destination host" % option)
     for value in addresses:
         if ":" in value:
             try:
                 ipaddress.IPv6Address(value.split("%", 1)[0])
             except ValueError:
-                raise ValueError("invalid IPv6 address in -L: %r" % value)
+                raise ValueError("invalid IPv6 address in %s: %r" % (option, value))
         if value not in ("", "*") and not valid_host(
                 value, bracketed=":" in value):
-            raise ValueError("invalid host in -L: %r" % value)
+            raise ValueError("invalid host in %s: %r" % (option, value))
     for key, value in (("port", port if local_socket is None else None),
                        ("hostport", hostport if remote_socket is None else None)):
         if value is not None:
             if not re.fullmatch("[0-9]+", value) or not 1 <= int(value) <= 65535:
-                raise ValueError("-L ports must be between 1 and 65535")
+                raise ValueError("%s ports must be between 1 and 65535" % option)
             settings[key] = int(value)
     if local_socket is None:
         settings["bind"] = bind
     if remote_socket is None:
         settings["host"] = host
     return settings
+
+
+def parse_remote_forward(spec):
+    """The left endpoint listens on the target; the right is local to this daemon."""
+    return parse_local_forward(spec, remote=True)
 
 
 def _local_forward_spec(settings):
@@ -2858,6 +2888,219 @@ def _open_streamlocal_channel(transport, path, timeout):
 
 def _forward_address(host, port):
     return "%s:%d" % ("[%s]" % host if ":" in host else host, port)
+
+
+class _RemoteForwardManager(object):
+    """Transport-local remote listeners and incoming SSH channel dispatch.
+
+    Paramiko exposes one _tcp_handler for all remote TCP listeners and clears
+    it on every cancel. It also lacks forwarded-streamlocal handling. Install
+    handlers only on this transport, routing by listener endpoint instead.
+    Global replies carry no request ID, so serialize requests and retain a
+    timed-out one until its reply arrives; a late success cancels its listener
+    rather than being mistaken for the next request's acknowledgement.
+    """
+
+    def __init__(self, transport, timeout):
+        from paramiko.common import (MSG_CHANNEL_OPEN, MSG_REQUEST_SUCCESS,
+                                     MSG_REQUEST_FAILURE)
+
+        self.transport = transport
+        self.timeout = max(timeout, 1.0)
+        self.lock = threading.Lock()
+        self.request_lock = threading.Lock()
+        self.entries = {}
+        self.pending = None
+        table = transport._handler_table
+        self.original_open = table[MSG_CHANNEL_OPEN]
+        self.original_success = table[MSG_REQUEST_SUCCESS]
+        self.original_failure = table[MSG_REQUEST_FAILURE]
+        table[MSG_CHANNEL_OPEN] = self._incoming
+        table[MSG_REQUEST_SUCCESS] = lambda msg: self._response(msg, True)
+        table[MSG_REQUEST_FAILURE] = lambda msg: self._response(msg, False)
+
+    @staticmethod
+    def endpoint(settings):
+        if "local_socket" in settings:
+            return ("unix", settings["local_socket"])
+        bind = settings["bind"]
+        return ("tcp", "" if bind == "*" else bind, settings["port"])
+
+    def _send_request(self, kind, data, reply, transport_thread=False):
+        from paramiko.common import cMSG_GLOBAL_REQUEST
+
+        msg = paramiko.Message()
+        msg.add_byte(cMSG_GLOBAL_REQUEST)
+        msg.add_string(kind)
+        msg.add_boolean(reply)
+        msg.add(*data)
+        if transport_thread:
+            # Never wait for rekeying from the thread responsible for rekeying.
+            self.transport._send_message(msg)
+        else:
+            self.transport._send_user_message(msg)
+
+    def _request(self, kind, data, late_cancel=None):
+        with self.request_lock:
+            if not self.transport.is_active():
+                raise paramiko.SSHException("SSH session not active")
+            item = {"event": threading.Event(), "success": False,
+                    "abandoned": False, "late_cancel": late_cancel}
+            with self.lock:
+                if self.pending is not None:
+                    raise paramiko.SSHException(
+                        "previous remote forwarding request is still awaiting a reply")
+                self.pending = item
+            try:
+                self._send_request(kind, data, True)
+                deadline = time.monotonic() + self.timeout
+                while not item["event"].wait(min(0.1, self.timeout)):
+                    if not self.transport.is_active() or time.monotonic() >= deadline:
+                        with self.lock:
+                            if item["event"].is_set():
+                                break
+                            item["abandoned"] = True
+                        raise paramiko.SSHException(
+                            "remote forwarding request timed out or transport closed")
+                if not item["success"]:
+                    # SSH_MSG_REQUEST_FAILURE has no reason string. Provide
+                    # the listener and likely checks, without inventing a
+                    # server errno or probing/removing remote paths.
+                    if kind == "streamlocal-forward@openssh.com":
+                        detail = (
+                            "Unix listener %r; check whether the remote path "
+                            "already exists, parent directory permissions, and "
+                            "sshd AllowStreamLocalForwarding/StreamLocalBindUnlink"
+                            % data[0])
+                    else:
+                        detail = (
+                            "TCP listener %s; check port occupancy, bind "
+                            "permissions, and sshd remote forwarding policy"
+                            % _forward_address(data[0] or "*", data[1]))
+                    raise paramiko.SSHException(
+                        "remote forwarding request denied for %s "
+                        "(SSH server did not provide a reason)" % detail)
+            except BaseException:
+                with self.lock:
+                    if self.pending is item:
+                        item["abandoned"] = True
+                raise
+
+    def _response(self, msg, success):
+        with self.lock:
+            item = self.pending
+            if item is not None:
+                item["success"] = success
+                cancel = item["late_cancel"] if item["abandoned"] and success else None
+                if cancel is None:
+                    self.pending = None
+                    item["event"].set()
+        if item is None:
+            (self.original_success if success else self.original_failure)(msg)
+        elif cancel is not None:
+            try:
+                # Keep the request pending until CANCEL is on the SSH stream.
+                # Otherwise another thread could rebind the same endpoint
+                # before this cancellation and have its new listener removed.
+                self._send_request(cancel[0], cancel[1], False, transport_thread=True)
+            except Exception as exc:
+                _session_log("reverse.late_cancel_failed", logging.WARNING, exc=exc)
+            finally:
+                with self.lock:
+                    self.pending = None
+                    item["event"].set()
+
+    def bind(self, job):
+        endpoint = self.endpoint(job.settings)
+        kind = "streamlocal-forward@openssh.com" if endpoint[0] == "unix" \
+            else "tcpip-forward"
+        cancel = "cancel-streamlocal-forward@openssh.com" if endpoint[0] == "unix" \
+            else "cancel-tcpip-forward"
+        data = endpoint[1:]
+        with self.lock:
+            if endpoint in self.entries:
+                raise ValueError("remote listener is already configured")
+            self.entries[endpoint] = job
+        try:
+            self._request(kind, data, late_cancel=(cancel, data))
+        except BaseException as exc:
+            with self.lock:
+                if self.entries.get(endpoint) is job:
+                    self.entries.pop(endpoint)
+            _session_log("reverse.bind_failed", logging.WARNING,
+                         job.session, exc=exc, job=job.id,
+                         endpoint=endpoint, request=kind)
+            raise
+        _session_log("reverse.bound", session=job.session,
+                     job=job.id, endpoint=endpoint)
+
+    def cancel(self, job):
+        endpoint = self.endpoint(job.settings)
+        with self.request_lock:
+            with self.lock:
+                if self.entries.get(endpoint) is not job:
+                    return
+                self.entries.pop(endpoint)
+            if self.transport.is_active():
+                # Removing the routing entry allows a new job to claim this
+                # endpoint. Keep request_lock until CANCEL is sent so its
+                # replacement BIND cannot overtake it and then be cancelled.
+                # No reply is needed or allowed to consume a pending bind reply.
+                kind = "cancel-streamlocal-forward@openssh.com" if endpoint[0] == "unix" \
+                    else "cancel-tcpip-forward"
+                self._send_request(kind, endpoint[1:], False)
+        _session_log("reverse.cancelled", session=job.session,
+                     job=job.id, endpoint=endpoint)
+
+    def _incoming(self, original):
+        from paramiko.common import (cMSG_CHANNEL_OPEN_FAILURE,
+                                     cMSG_CHANNEL_OPEN_SUCCESS)
+
+        msg = paramiko.Message(original.get_remainder())
+        kind = msg.get_text()
+        if kind not in ("forwarded-tcpip", "forwarded-streamlocal@openssh.com"):
+            return self.original_open(original)
+        remote_id, window, packet = msg.get_int(), msg.get_int(), msg.get_int()
+        if kind == "forwarded-tcpip":
+            endpoint = ("tcp", msg.get_text(), msg.get_int())
+            origin = (msg.get_text(), msg.get_int())
+        else:
+            # OpenSSH PROTOCOL 2.4: path followed by an unused reserved string.
+            endpoint = ("unix", msg.get_text())
+            msg.get_text()
+            origin = None
+        with self.lock:
+            job = self.entries.get(endpoint)
+        transport = self.transport
+        if job is None or not job.accepting(transport):
+            reply = paramiko.Message()
+            reply.add_byte(cMSG_CHANNEL_OPEN_FAILURE)
+            reply.add_int(remote_id)
+            reply.add_int(paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED)
+            reply.add_string("")
+            reply.add_string("en")
+            transport._send_message(reply)
+            return
+        with transport.lock:
+            chanid = transport._next_channel()
+            chan = paramiko.Channel(chanid)
+            transport._channels.put(chanid, chan)
+            transport.channels_seen[chanid] = True
+            chan._set_transport(transport)
+            chan._set_window(transport.default_window_size,
+                             transport.default_max_packet_size)
+            chan._set_remote_channel(remote_id, window, packet)
+        chan.origin_addr = origin
+        reply = paramiko.Message()
+        reply.add_byte(cMSG_CHANNEL_OPEN_SUCCESS)
+        reply.add_int(remote_id)
+        reply.add_int(chanid)
+        reply.add_int(transport.default_window_size)
+        reply.add_int(transport.default_max_packet_size)
+        transport._send_message(reply)
+        # Local DNS/connect runs in the job's worker, not this transport
+        # thread. Incoming cancellation uses a non-rekey-waiting close.
+        job.incoming(chan, transport)
 
 
 def parse_dynamic_forward(spec):
@@ -3306,6 +3549,196 @@ class _LocalForwardJob(_ExecJob):
                     remote_eof = True
 
 
+class _RemoteForwardJob(_LocalForwardJob):
+    """A target-side listener with local destinations, sharing the stream relay."""
+
+    def __init__(self, session, settings):
+        _ExecJob.__init__(self, None, "forward")
+        self.session = session
+        self.settings = settings
+        self.remote = True
+        self.dynamic = False
+        self.manager = None
+        self.enabled = False
+        self.lock = threading.Lock()
+        self.bind_lock = threading.Lock()
+        self.closed = threading.Event()
+        self.connections = {}             # incoming channel -> local socket or None
+        self.destination = settings.get("remote_socket") or (
+            settings["host"], settings["hostport"])
+        listener = settings.get("local_socket") or _forward_address(
+            settings["bind"] or "*", settings["port"])
+        self.command = "remote %s -> local %s" % (
+            listener, self.destination if isinstance(self.destination, str)
+            else _forward_address(*self.destination))
+
+    def accepting(self, transport):
+        with self.lock:
+            return not self.aborted and self.enabled and \
+                not self.session.stopping.is_set() and self.manager is not None \
+                and self.manager.transport is transport
+
+    def start(self):
+        with self.lock:
+            manager = self.manager
+        if manager is not None and manager.transport is self.session.transport:
+            with self.lock:
+                self.enabled = not self.aborted and not self.session.stopping.is_set()
+        else:
+            self.rebind(self.session.remote_forward_manager())
+
+    def rebind(self, manager, enable=True):
+        # Serialize a slow bind against cancellation. Abort marks the job
+        # first, so a bind that completes afterward is immediately cancelled.
+        with self.bind_lock:
+            with self.lock:
+                if self.aborted:
+                    return
+                old = self.manager
+                self.enabled = False
+                self.manager = manager
+            self._close_connections()
+            if old is not None and old is not manager:
+                old.cancel(self)
+            try:
+                manager.bind(self)
+                with self.lock:
+                    cancelled = self.aborted or self.session.stopping.is_set()
+                    self.enabled = enable and not cancelled
+                if cancelled:
+                    manager.cancel(self)
+            except BaseException:
+                with self.lock:
+                    self.enabled = False
+                raise
+
+    def unbind(self):
+        with self.bind_lock:
+            with self.lock:
+                self.enabled = False
+                manager = self.manager
+                self.manager = None
+            self._close_connections()
+            if manager is not None:
+                manager.cancel(self)
+
+    def _close_connections(self):
+        with self.lock:
+            connections = list(self.connections.items())
+        for chan, conn in connections:
+            if conn is not None:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                conn.close()
+            try:
+                _close_session_channel(chan)
+            except Exception as exc:
+                _session_log("reverse.close_failed", logging.WARNING,
+                             self.session, chan, exc, job=self.id)
+
+    def abort(self):
+        with self.lock:
+            closing = self.aborted
+            self.aborted = True
+            self.enabled = False
+        if closing:
+            self.closed.wait()
+            return
+        try:
+            self.unbind()
+        except Exception as exc:
+            _session_log("reverse.cancel_failed", logging.WARNING,
+                         self.session, exc=exc, job=self.id)
+        finally:
+            with self.session.execs_lock:
+                self.session.execs.discard(self)
+            self.closed.set()
+        _session_log("reverse.stopped", session=self.session, job=self.id)
+
+    def incoming(self, chan, transport):
+        try:
+            with self.lock:
+                if self.aborted or not self.enabled or chan.closed:
+                    _close_session_channel(chan, transport_thread=True)
+                    return
+                # Install notifications before publishing to abort(). The
+                # worker must not recreate them after safe channel close.
+                chan.fileno()
+                self.connections[chan] = None
+            worker = threading.Thread(target=self._connect_local, args=(chan, transport),
+                                      name="reverse-%s-connection" % self.id)
+            worker.daemon = True
+            worker.start()
+        except Exception as exc:
+            _session_log("reverse.worker_failed", logging.ERROR,
+                         self.session, chan, exc, job=self.id)
+            with self.lock:
+                self.connections.pop(chan, None)
+            _close_session_channel(chan, transport_thread=True)
+
+    def _connect_local(self, chan, transport):
+        conn = None
+        try:
+            if not self.accepting(transport):
+                return
+            addresses = [(socket.AF_UNIX, socket.SOCK_STREAM, 0, "", self.destination)] \
+                if isinstance(self.destination, str) else socket.getaddrinfo(
+                    self.destination[0], self.destination[1], 0, socket.SOCK_STREAM)
+            deadline = time.monotonic() + self.session.timeout
+            last_error = None
+            for family, socktype, protocol, _name, address in addresses:
+                conn = socket.socket(family, socktype, protocol)
+                conn.setblocking(False)
+                with self.lock:
+                    # DNS may finish after unbind/reconnect closed this
+                    # incoming channel. Never attach it to a replacement
+                    # listener or let its relay recreate a closed select pipe.
+                    if self.aborted or not self.enabled or chan.closed \
+                            or self.manager is None \
+                            or self.manager.transport is not transport \
+                            or self.session.stopping.is_set():
+                        return
+                    self.connections[chan] = conn
+                result = conn.connect_ex(address)
+                while result in (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+                    if not self.accepting(transport) or not transport.is_active():
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout("local forwarding destination timed out")
+                    _, writable, failed = select.select(
+                        [], [conn], [conn], min(remaining, SESSION_TICK))
+                    if writable or failed:
+                        result = conn.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if result == 0:
+                    break
+                last_error = OSError(result, os.strerror(result))
+                conn.close()
+                conn = None
+            if conn is None:
+                raise last_error or OSError("no usable local destination")
+            if not self.accepting(transport):
+                return
+            _session_log("reverse.connected", session=self.session, chan=chan, job=self.id)
+            self._relay(conn, chan, transport)
+        except Exception as exc:
+            _session_log("reverse.connection_failed",
+                         logging.DEBUG if self.aborted else logging.WARNING,
+                         self.session, chan, exc, job=self.id)
+        finally:
+            with self.lock:
+                self.connections.pop(chan, None)
+            if conn is not None:
+                conn.close()
+            try:
+                _close_session_channel(chan)
+            except Exception as exc:
+                _session_log("reverse.close_failed", logging.WARNING,
+                             self.session, chan, exc, job=self.id)
+
+
 _SESSION_LOG_CONTEXT = threading.local()
 _SESSION_LOG_NAME = None
 _SESSION_LOG_ENABLED = False
@@ -3431,6 +3864,10 @@ class _Session(object):
         # --interrupt --job has to be able to find them.
         self.execs = set()
         self.execs_lock = threading.Lock()
+        # Remote bind requests and reconnect restoration must not interleave.
+        # Never hold execs_lock while waiting on an SSH global-request reply.
+        self.forward_lock = threading.RLock()
+        self.remote_manager = None
         self.job_sequence = 0
         # Everything --reconnect needs, all of it inert until arm() fills it
         # in: a session that was never armed behaves exactly as it did before
@@ -3478,19 +3915,40 @@ class _Session(object):
             job.abort()
             raise _SessionDead("session is stopping")
 
-    def add_forwards(self, specs, start=True, dynamic_specs=None):
+    def remote_forward_manager(self):
+        with self.forward_lock:
+            if self.remote_manager is None or \
+                    self.remote_manager.transport is not self.transport:
+                self.remote_manager = _RemoteForwardManager(self.transport, self.timeout)
+            return self.remote_manager
+
+    def add_forwards(self, specs, start=True, dynamic_specs=None, remote_specs=None):
+        with self.forward_lock:
+            return self._add_forwards(specs, start, dynamic_specs, remote_specs)
+
+    def _add_forwards(self, specs, start, dynamic_specs, remote_specs):
         """Bind an entire request before registering any persistent jobs."""
         if dynamic_specs is None:
             dynamic_specs = []
+        if remote_specs is None:
+            remote_specs = []
         if not isinstance(specs, list) or not isinstance(dynamic_specs, list) \
-                or not (specs or dynamic_specs):
-            raise ValueError("-L/-D require a nonempty list of forwarding specifications")
+                or not isinstance(remote_specs, list) \
+                or not (specs or dynamic_specs or remote_specs):
+            raise ValueError("-L/-R/-D require a nonempty list of forwarding specifications")
         settings = [parse_local_forward(spec) for spec in specs]
         settings.extend(parse_dynamic_forward(spec) for spec in dynamic_specs)
+        reverse = [parse_remote_forward(spec) for spec in remote_specs]
         jobs = []
         try:
             for item in settings:
                 jobs.append(_LocalForwardJob(self, item))
+            for item in reverse:
+                job = _RemoteForwardJob(self, item)
+                jobs.append(job)
+                # Bind before acknowledgement, but accept only after the
+                # entire batch is registered (and startup has detached).
+                job.rebind(self.remote_forward_manager(), enable=False)
             with self.execs_lock:
                 if self.stopping.is_set():
                     raise _SessionDead("session is stopping")
@@ -3580,7 +4038,8 @@ class _Session(object):
                  "channel": getattr(job.chan, "chanid", None),
                  "started": job.started,
                  "default": job.default,
-                 "forward_type": "socks" if getattr(job, "dynamic", False) else
+                 "forward_type": "remote" if getattr(job, "remote", False) else
+                                 "socks" if getattr(job, "dynamic", False) else
                                  "local" if job.kind == "forward" else None,
                  "state": "stopping" if job.aborted else
                           "pending" if job is self.default_job and
@@ -4581,7 +5040,9 @@ class _Session(object):
 
         previous = (self.chain, self.chan, self.transport, self.mark,
                     self.rcfile_path)
-        with self.lock:
+        previous_manager = self.remote_manager
+        restored = []
+        with self.lock, self.forward_lock:
             if self.stopping.is_set():
                 close_all(clients)
                 return False
@@ -4592,6 +5053,12 @@ class _Session(object):
             try:
                 self.setup(self.setup_wait)
                 self.setup_rcfile()
+                with self.execs_lock:
+                    reverse = [job for job in self.execs
+                               if isinstance(job, _RemoteForwardJob)]
+                for job in reverse:
+                    restored.append(job)
+                    job.rebind(self.remote_forward_manager())
                 if self.stopping.is_set():
                     self.cleanup_rcfiles()
                     raise _SessionDead("session stopped during reconnect")
@@ -4601,8 +5068,15 @@ class _Session(object):
                 # The hops answered but the shell behind them did not; put
                 # back what was there and let the next attempt try again.
                 self.last_error = _one_line(exc)
+                for job in restored:
+                    try:
+                        job.unbind()
+                    except Exception as cleanup:
+                        _session_log("reverse.restore_cleanup_failed", logging.WARNING,
+                                     self, exc=cleanup, job=job.id)
                 (self.chain, self.chan,
                  self.transport, self.mark, self.rcfile_path) = previous
+                self.remote_manager = previous_manager
                 close_all(clients)
                 return False
 
@@ -4727,18 +5201,18 @@ class _Session(object):
 #     {"jobs": [{"id": N, "kind": "...", "command": "...",
 #                "channel": N or null, "started": UNIX_SECONDS,
 #                "default": true or false,
-#                "forward_type": "local" or "socks" or null,
+#                "forward_type": "local" or "remote" or "socks" or null,
 #                "state": "running" or "pending" or "stopping"}, ...]}\n
 #
 # It is answered before link resolution, like status, without taking the
 # persistent shell lock or starting a reconnect. The idle primary shell or
 # -c program is excluded; its current request is the default job, in either
-# mode. Exec/login, SFTP channels and local forwards are included. Completed jobs
+# mode. Exec/login, SFTP channels and forwards are included. Completed jobs
 # disappear; pending primary requests can outlive their client.
 # This is daemon metadata, not the remote shell's process/job table.
 # The status reply keeps "jobs": N for --sessions and older clients, and
 # adds "job_details": [...] from that same snapshot. "default" identifies the
-# primary request; "forward_type" distinguishes -L from -D while preserving
+# primary request; "forward_type" distinguishes -L/-R/-D while preserving
 # the existing "forward" job kind. Status also includes "last_activity"
 # (UNIX_SECONDS), "idle_limit" (seconds; zero disables expiry) and "stopping"
 # (boolean). These are read-only metadata: a query does not refresh activity,
@@ -4785,6 +5259,31 @@ class _Session(object):
 # CONNECT success follows SSH channel-open success, not just SOCKS parsing.
 # Handshakes have a total timeout and bounded fields; pipelined application
 # bytes remain unread until the shared relay takes over.
+#
+# "op": "remote_forward" adds -R listeners, optionally with -L/-D batches:
+#
+#     {"op": "remote_forward",
+#      "remote_specs": ["[bind_address:]port:host:hostport",
+#                       "[bind_address:]port:local_socket",
+#                       "remote_socket:host:hostport",
+#                       "remote_socket:local_socket", ...],
+#      "specs": [...], "dynamic_specs": [...]}\n
+#
+# The four forms are identical to -L, but the left endpoint listens on the
+# target and the daemon connects the right endpoint locally. Client-relative
+# destination socket paths are normalized before sending; target paths are
+# literal. Registration is atomic with optional -L/-D additions. The distinct
+# op prevents older daemons from silently ignoring remote_specs.
+# TCP listeners use tcpip-forward/cancel-tcpip-forward global requests;
+# Unix listeners use streamlocal-forward@openssh.com and its cancel extension.
+# Incoming forwarded-tcpip/forwarded-streamlocal@openssh.com channels are
+# routed by endpoint, not Paramiko's transport-wide single TCP callback.
+# SSH policy controls remote binding and Unix path cleanup; mssh never removes
+# unknown remote paths. Each listener is a persistent "forward" job with
+# forward_type "remote". Targeted interruption cancels that listener and all
+# owned connections. Reconnect reissues binds with the same job IDs; a failed
+# bind fails that rebuild. Adding -R requires a live transport, but cancellation
+# still works while disconnected. No application bytes cross the JSON socket.
 #
 #     {"op": "interrupt"}\n
 #     {"op": "interrupt", "job": N}\n
@@ -5402,22 +5901,29 @@ def _session_serve(session, srv, path, opts):
             state["stop"] = True
             _reply(conn, {"ok": True})
             return
-        if op in ("forward", "dynamic_forward"):
+        if op in ("forward", "dynamic_forward", "remote_forward"):
             try:
                 # Older daemons ignore unknown fields. Clients use a distinct
-                # op for -D so an old server cannot silently acknowledge it.
+                # ops for -D/-R so an old server cannot silently acknowledge them.
                 if op == "dynamic_forward":
                     if not req.get("dynamic_specs"):
                         raise ValueError("-D requires at least one proxy specification")
                     jobs = session.add_forwards(
                         req.get("specs", []), dynamic_specs=req.get("dynamic_specs"))
+                elif op == "remote_forward":
+                    if not req.get("remote_specs"):
+                        raise ValueError("-R requires at least one remote specification")
+                    jobs = session.add_forwards(
+                        req.get("specs", []), dynamic_specs=req.get("dynamic_specs", []),
+                        remote_specs=req.get("remote_specs"))
                 else:
                     jobs = session.add_forwards(req.get("specs"))
             except Exception as exc:
                 _session_log("forward.setup_failed", logging.WARNING,
                              session, exc=exc)
                 _reply(conn, {"error": "mssh: cannot configure %s: %s" %
-                              ("-L/-D" if op == "dynamic_forward" else "-L", exc)})
+                              ("-L/-R/-D" if op == "remote_forward" else
+                               "-L/-D" if op == "dynamic_forward" else "-L", exc)})
             else:
                 _reply(conn, {"ok": True, "forwards": [
                     {"id": job.id, "command": job.command} for job in jobs]})
@@ -5864,11 +6370,12 @@ def serve_session(name, srv, path, readyfd, jumps, target, opts):
         banner = session.setup(opts.wait)
         if session.mode == "shell":
             session.setup_rcfile()
-        if opts.local_forwards or opts.dynamic_forwards:
+        if opts.local_forwards or opts.dynamic_forwards or opts.remote_forwards:
             # Bind before reporting success, but do not accept connections
             # while daemonization still changes the process's standard FDs.
             forwards = session.add_forwards(
-                opts.local_forwards, start=False, dynamic_specs=opts.dynamic_forwards)
+                opts.local_forwards, start=False, dynamic_specs=opts.dynamic_forwards,
+                remote_specs=opts.remote_forwards)
     except SystemExit as exc:
         _session_log("daemon.start_failed", logging.ERROR, session, exc=exc)
         # A SystemExit carries its own message and nothing has printed it yet
@@ -6178,13 +6685,18 @@ def _show_forwards(name, rows):
                          (name, row["id"], row["command"]))
 
 
-def run_session_forward(name, specs, dynamic_specs=None):
+def run_session_forward(name, specs, dynamic_specs=None, remote_specs=None):
     specs = [_local_forward_spec(parse_local_forward(spec)) for spec in specs]
     payload = {"op": "forward", "specs": specs}
     if dynamic_specs:
         for spec in dynamic_specs:
             parse_dynamic_forward(spec)
         payload.update(op="dynamic_forward", dynamic_specs=dynamic_specs)
+    if remote_specs:
+        payload.update(op="remote_forward", remote_specs=[
+            _local_forward_spec(parse_remote_forward(spec)) for spec in remote_specs])
+        if dynamic_specs:
+            payload["dynamic_specs"] = dynamic_specs
     reply = session_request(name, payload, timeout=30)
     if reply.get("error"):
         sys.stderr.write(reply["error"].rstrip("\n") + "\n")
@@ -6192,7 +6704,7 @@ def run_session_forward(name, specs, dynamic_specs=None):
     if not reply.get("ok") or "forwards" not in reply:
         raise SystemExit("mssh: session daemon does not support %s; "
                          "stop and recreate the session" %
-                         ("-D" if dynamic_specs else "-L"))
+                         ("-R" if remote_specs else "-D" if dynamic_specs else "-L"))
     _show_forwards(name, reply["forwards"])
     return 0
 
@@ -6333,7 +6845,8 @@ def run_session_status(name):
                           if default else "idle"))
         counts = {}
         for row in rows:
-            kind = "socks" if row.get("forward_type") == "socks" else row["kind"]
+            kind = "reverse" if row.get("forward_type") == "remote" else \
+                "socks" if row.get("forward_type") == "socks" else row["kind"]
             counts[kind] = counts.get(kind, 0) + 1
         sys.stdout.write("jobs:     %d%s\n" %
                          (len(rows), " (%s)" % ", ".join(
@@ -6492,7 +7005,7 @@ def _session_login_wanted(opts):
         return False
     if opts.args or opts.command or opts.jump or opts.copy_id is not None \
             or opts.put is not None or opts.get is not None or opts.local_forwards \
-            or opts.dynamic_forwards:
+            or opts.dynamic_forwards or opts.remote_forwards:
         return False
     return not (opts.stop or opts.interrupt or opts.status or opts.jobs)
 
@@ -6511,7 +7024,7 @@ def run_session(parser, opts):
                 or opts.rcfile or opts.exec_channel or opts.force_tty \
                 or opts.stop or opts.interrupt or opts.status or opts.jobs \
                 or opts.reconnect or opts.local_forwards or opts.dynamic_forwards \
-                or opts.prompt is not None:
+                or opts.remote_forwards or opts.prompt is not None:
             parser.error("--put/--get only combine with file-copy options "
                          "and an existing session name")
         if not all(opts.put if opts.put is not None else opts.get):
@@ -6529,8 +7042,8 @@ def run_session(parser, opts):
         parser.error("--%s and --%s cannot be combined" % tuple(controls[:2]))
         return 2
     if controls:
-        if opts.local_forwards or opts.dynamic_forwards:
-            parser.error("-L/-D cannot be combined with --%s" % controls[0])
+        if opts.local_forwards or opts.dynamic_forwards or opts.remote_forwards:
+            parser.error("-L/-R/-D cannot be combined with --%s" % controls[0])
         if opts.jobs and (opts.command or opts.jump or opts.force_tty or
                           opts.recursive or opts.preserve or opts.reconnect or
                           opts.copy_id is not None or opts.stdin):
@@ -6603,12 +7116,12 @@ def run_session(parser, opts):
                 "it, --stop to end it" % name
             )
         try:
-            if opts.local_forwards or opts.dynamic_forwards:
+            if opts.local_forwards or opts.dynamic_forwards or opts.remote_forwards:
                 if opts.args or opts.exec_channel or opts.force_tty or opts.rcfile \
                         or opts.stdin or opts.no_stdin:
-                    parser.error("-L/-D only take an existing session name")
+                    parser.error("-L/-R/-D only take an existing session name")
                 return run_session_forward(
-                    name, opts.local_forwards, opts.dynamic_forwards)
+                    name, opts.local_forwards, opts.dynamic_forwards, opts.remote_forwards)
             if opts.rcfile and not login:
                 parser.error("--rcfile initializes a new shell, not a command "
                              "in an existing session")
@@ -6768,6 +7281,21 @@ persistent session (keep one connection and one shell alive):
   Local sockets are mode 0600, never overwrite paths and are removed on stop.
   --reconnect retains listeners, but existing connections cannot be restored.
 
+  Keep target-side TCP or Unix listeners forwarding to local services (-R):
+  mssh --session dev -R 8080:127.0.0.1:8000 root@target
+  mssh dev -R 8081:/tmp/local-service.sock
+  mssh dev -R /tmp/target.sock:127.0.0.1:8000
+  mssh dev -R /tmp/target.sock:/tmp/local-service.sock
+  -R accepts [bind_address:]port:host:hostport,
+             [bind_address:]port:local_socket,
+             remote_socket:host:hostport, or remote_socket:local_socket.
+  -R uses the same four forms as -L, in the opposite direction. The left
+  endpoint listens on the target; the right is reached from the local daemon.
+  Repeat or combine -L/-R/-D. --jobs lists them; --stop --job ID stops one.
+  SSH policy controls remote binding (GatewayPorts/AllowTcpForwarding and
+  AllowStreamLocalForwarding). Reconnect rebinds -R with the same job IDs.
+  Remote Unix listener paths are owned by sshd and not removed by mssh.
+
   Keep a dynamic SOCKS proxy in the session daemon:
   mssh --session s -D 1080 root@10.0.0.9
   mssh s -D 127.0.0.1:1081                      # add after session startup
@@ -6777,7 +7305,7 @@ persistent session (keep one connection and one shell alive):
   with names resolved on the target. Authentication, BIND and UDP are
   not supported. Default bind is localhost; exposing an unauthenticated
   proxy with * or an empty bind lets other machines use your SSH access.
-  Repeat -D or combine with -L; all new listeners bind or all roll back.
+  Repeat -D or combine with -L/-R; all new listeners bind or all roll back.
   Each proxy is a forward job in --jobs; --stop --job ID removes it.
 
   'mssh s' with nothing to run is 'ssh s' as nearly as this can be: a shell on the
@@ -6807,7 +7335,7 @@ persistent session (keep one connection and one shell alive):
 
   mssh --session s --status    # target, uptime, commands served, link
   --status also shows task counts, default job state and recent activity.
-  Use --jobs for commands, channels and -L/-D listener details.
+  Use --jobs for commands, channels and -L/-R/-D listener details.
   mssh --session s --interrupt # Ctrl-C, to unstick a hung command
   mssh s --jobs               # list active tasks and their IDs
   mssh s --interrupt --job 3  # interrupt only this task
@@ -7044,7 +7572,7 @@ def build_parser():
     group.add_argument(
         "--jobs", action="store_true",
         help="list active session commands, exec/login channels, transfers "
-             "and local forwards; "
+             "and forwards; "
              "exclude the default persistent shell",
     )
     group.add_argument(
@@ -7059,6 +7587,13 @@ def build_parser():
              "to a session; repeat for "
              "several, default bind is localhost; --jobs lists forwards and "
              "--interrupt --job ID stops one",
+    )
+    group.add_argument(
+        "-R", dest="remote_forwards", action="append", default=[],
+        metavar="SPEC",
+        help="add a persistent target-side TCP/Unix socket listener forwarding "
+             "to a local TCP/Unix service (SSH -R syntax); repeat for several; "
+             "--jobs lists forwards and --stop --job ID stops one",
     )
     group.add_argument(
         "-D", dest="dynamic_forwards", action="append", default=[],
@@ -7253,6 +7788,9 @@ def main(argv=None):
         opts.local_forwards = [
             _local_forward_spec(parse_local_forward(spec))
             for spec in opts.local_forwards]
+        opts.remote_forwards = [
+            _local_forward_spec(parse_remote_forward(spec))
+            for spec in opts.remote_forwards]
         for spec in opts.dynamic_forwards:
             parse_dynamic_forward(spec)
     except ValueError as exc:
@@ -7294,8 +7832,8 @@ def main(argv=None):
             else DEFAULT_SESSION_WAIT
 
     if opts.sessions:
-        if opts.local_forwards or opts.dynamic_forwards:
-            parser.error("-L/-D cannot be combined with --sessions")
+        if opts.local_forwards or opts.dynamic_forwards or opts.remote_forwards:
+            parser.error("-L/-R/-D cannot be combined with --sessions")
         if opts.job is not None:
             parser.error("--job cannot be combined with --sessions")
         if opts.jobs:
@@ -7317,6 +7855,9 @@ def main(argv=None):
     if opts.dynamic_forwards:
         parser.error("-D requires a session: "
                      "mssh --session NAME -D [BIND:]PORT TARGET")
+    if opts.remote_forwards:
+        parser.error("-R requires a session: "
+                     "mssh --session NAME -R PORT:HOST:HOSTPORT TARGET")
     if opts.put is not None or opts.get is not None:
         parser.error("--put/--get require an existing session: "
                      "mssh NAME --put LOCAL REMOTE")
