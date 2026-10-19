@@ -136,9 +136,11 @@ class TestSocksChannelOwnership(unittest.TestCase):
         self.addCleanup(client.close)
         self.addCleanup(accepted.close)
         client.settimeout(3)
-        job.connections[accepted] = None
+        connection = mssh._ForwardConnection(job, accepted, ("127.0.0.1", 1234))
+        with job.lock:
+            job._register_connection(connection)
         worker = threading.Thread(target=job._connect,
-                                  args=(accepted, ("127.0.0.1", 1234)))
+                                  args=(connection,))
         worker.start()
         try:
             with mock.patch.object(mssh.socket, "getaddrinfo",
@@ -174,11 +176,13 @@ class TestSocksChannelOwnership(unittest.TestCase):
                 "127.0.0.1:%d" % free_port()])[0]
             client, accepted = socket.socketpair()
             client.settimeout(3)
-            job.connections[accepted] = None
+            connection = mssh._ForwardConnection(job, accepted, ("127.0.0.1", 1234))
+            with job.lock:
+                job._register_connection(connection)
             try:
                 client.sendall((b"\x05\x01\x00" if version == 5 else b"") +
                                request_packet("127.0.0.1", 8080, version))
-                job._connect(accepted, ("127.0.0.1", 1234))
+                job._connect(connection)
                 if version == 5:
                     self.assertEqual(read_exact(client, 2), b"\x05\x00")
                     self.assertEqual(read_exact(client, 10),

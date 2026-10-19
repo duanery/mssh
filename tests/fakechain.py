@@ -49,13 +49,21 @@ class FakeTransport(object):
     def __init__(self, client):
         self.client = client
         self.reverse_managers = []
+        self.channel_sequence = 0
+        self.channel_lock = threading.Lock()
+
+    def assign_channel(self, chan):
+        with self.channel_lock:
+            chan.chanid = self.channel_sequence
+            self.channel_sequence += 1
+            self.client.channels.append(chan)
+        return chan
 
     def open_session(self, timeout=None):
         if not link_up():
             raise OSError("fake chain: the connection is down")
         chan = _PtyChan()
-        self.client.channels.append(chan)
-        return chan
+        return self.assign_channel(chan)
 
     def is_active(self):
         return link_up() and not self.client.shut
@@ -79,8 +87,7 @@ class FakeTransport(object):
                 sock.close()
                 raise
         chan = _TCPChan(sock)
-        self.client.channels.append(chan)
-        return chan
+        return self.assign_channel(chan)
 
 
 class _TCPChan(object):
@@ -197,11 +204,12 @@ class _FakeRemoteForwardManager(object):
         try:
             while self.transport.is_active():
                 try:
-                    conn, _ = listener.accept()
+                    conn, origin = listener.accept()
                 except socket.timeout:
                     continue
                 chan = _TCPChan(conn)
-                self.transport.client.channels.append(chan)
+                chan.origin_addr = origin
+                self.transport.assign_channel(chan)
                 if job.accepting(self.transport):
                     job.incoming(chan, self.transport)
                 else:

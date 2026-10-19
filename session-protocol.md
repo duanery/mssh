@@ -142,7 +142,7 @@ Command requests can receive a notice before their final reply.
 
 | Operation | Client half-closes after request? | Server response |
 | --- | --- | --- |
-| `status`, `jobs`, `stop`, `interrupt`, `forward`, `remote_forward`, `dynamic_forward` | Yes, `shutdown(SHUT_WR)` | One JSON reply, then half-close |
+| `status`, `jobs`, `connections`, `stop`, `interrupt`, `interrupt_connection`, `forward`, `remote_forward`, `dynamic_forward` | Yes, `shutdown(SHUT_WR)` | One JSON reply, then half-close |
 | `send`, `exec` | No | Optional notice, then terminal reply |
 | `sftp` | No | Setup acknowledgement; connection remains open as a lifetime guard |
 
@@ -171,8 +171,8 @@ A reconnect notice has the form:
 ```
 
 The command client writes notices to local stderr and continues waiting.
-`status`, `jobs`, `stop`, `interrupt` and forwarding configuration do not
-receive notices. The current SFTP setup reader also expects its setup
+Queries, cancellation and forwarding configuration do not receive notices.
+The current SFTP setup reader also expects its setup
 acknowledgement directly.
 
 ### File Descriptor Passing
@@ -453,6 +453,10 @@ or `stopping`. `forward_type` is `local` for `-L`, `remote` for `-R`,
 `socks` for `-D`, and `null` otherwise; all listeners retain `kind: "forward"`.
 Listeners have a `null` channel because each accepted connection opens
 its own channel.
+Only forward rows include `connections`, the current accepted connection
+count (including handshakes and pending opens/connects). Non-forward rows
+omit that field. Lightweight `probe` and `list` status replies do not collect
+connection metadata or counts.
 
 ```json
 {"op": "status"}
@@ -543,6 +547,52 @@ accepted connections. Targeted cancellation works while reconnecting.
 
 `--stop --job ID` uses the targeted `interrupt` operation above.
 There is no separate per-job `stop` op.
+
+### Forward Connections
+
+The descriptor-free connection query selects one forwarding job:
+
+```json
+{"op": "connections", "job": 3}
+```
+
+```json
+{"job": 3, "connections": [{"id": 1, "channel": 7, "started": 1792324800.0, "state": "active", "origin": "127.0.0.1:45678", "listener": "127.0.0.1:8080", "destination": "localhost:80"}]}
+```
+
+Rows are sorted by connection ID. IDs increase within each job without reuse,
+including reconnect, and closed connections disappear. States are `handshake`
+for pending SOCKS negotiation, `connecting` for destination/channel setup,
+and `active` for a relay. Channel IDs are local to the daemon's SSH transport;
+`channel` is `null` before a local/SOCKS channel opens. Unnamed Unix peers use
+`origin: "-"`; pending SOCKS requests have `destination: "-"`. For `-R`, the
+origin/listener are on the target and the destination is on the daemon host.
+
+To close only one stream:
+
+```json
+{"op": "interrupt_connection", "job": 3, "connection": 1}
+```
+
+```json
+{"interrupted": true}
+```
+
+Both IDs must be positive integers (booleans are rejected). Unknown/finished
+connections and non-forward jobs return an error. The daemon closes the
+selected socket and channel, leaving its listener and siblings intact.
+Cancellation covers pending handshakes/channel opens/local connects too:
+workers cannot publish a socket/channel after the record is cancelled,
+and late channel-open success closes that unowned channel.
+
+`--job ID --connection ID --stop` and `--interrupt` use the distinct
+`interrupt_connection` op, never `interrupt` or `stop`. An old daemon must
+reject an unknown op rather than ignore a new selector and stop the whole
+job/session. Both operations are answered before SSH link resolution, work
+while reconnecting, and do not refresh activity or resynchronize default jobs.
+
+### Whole-Session Stop
+
 Session-wide stop is:
 
 ```json
@@ -673,11 +723,13 @@ and output would make command framing ambiguous.
 | `execs_lock` | Independent job registry, default-job identity and job IDs |
 | `state_lock` | Stored link/reconnect state and one-time reconnect notice |
 | `forward_lock` | Atomic forward additions and remote rebind during reconnect |
-| Forward job lock | Accepted sockets, channel publication and cancellation ownership |
+| Forward job lock | Connection registry, monotonic connection IDs and listener lifetime |
+| Forward connection lock | Socket/channel publication, metadata and cancellation ownership |
 
-Job snapshots hold only the job-registry lock briefly; they do not wait
-for a command to release the primary lock. Shutdown marks the session
-stopping before taking the job snapshot, preventing late registration
+Job snapshots copy the registry/metadata briefly, then count forwarding
+connections outside `execs_lock` to avoid lock inversion with teardown.
+They do not wait for a command to release the primary lock. Shutdown marks
+the session stopping before taking the job snapshot, preventing late registration
 from leaving an unclosed job. Independent jobs and forwarding resources
 are closed outside the registry lock so cleanup workers can remove them.
 
@@ -878,6 +930,7 @@ not remove or rotate logs.
 | Independent channels | `_Session.exec_run()`, `_pump_exec()`, `_exec_control()` |
 | SFTP adapter and relay | `open_session_sftp()`, `_SessionSFTPChannel`, `run_session_copy()` |
 | Jobs and cancellation | `_ExecJob`, `jobs_snapshot()`, `interrupt_job()`, `close_channels()` |
+| Forward connections | `_ForwardConnection`, `connections_snapshot()`, `interrupt_connection()` |
 | Forwarding | `_LocalForwardJob`, `_RemoteForwardJob`, `_RemoteForwardManager`, `_SocksRequest`, `add_forwards()` |
 | Reconnect and initialization | `failed()`, `resolve()`, `rebuild()`, `setup_rcfile()` |
 | Safe channel close and logging | `_close_session_channel()`, `_session_log()`, `_setup_logging()` |

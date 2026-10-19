@@ -109,10 +109,12 @@ class TestForwardParsing(unittest.TestCase):
         try:
             job = session.add_forwards(
                 ["127.0.0.1:%d:service.internal:80" % free_port()], start=False)[0]
+            connection = mssh._ForwardConnection(
+                job, accepted, ("127.0.0.1", 1234))
             with job.lock:
-                job.connections[accepted] = None
+                job._register_connection(connection)
             worker = threading.Thread(
-                target=job._connect, args=(accepted, ("127.0.0.1", 1234)))
+                target=job._connect, args=(connection,))
             worker.start()
             self.assertTrue(entered.wait(3))
             job.abort()
@@ -150,7 +152,7 @@ class TestForwardParsing(unittest.TestCase):
         entered, release, finished = (threading.Event() for _ in range(3))
         workers = []
 
-        def close(_channel):
+        def close(_channel, **kwargs):
             entered.set()
             release.wait(5)
 
@@ -159,8 +161,10 @@ class TestForwardParsing(unittest.TestCase):
             finished.set()
 
         try:
+            connection = mssh._ForwardConnection(job, accepted)
+            connection.chan = channel
             with job.lock:
-                job.connections[accepted] = channel
+                job._register_connection(connection)
             with mock.patch.object(mssh, "_close_session_channel", side_effect=close):
                 workers.append(threading.Thread(target=job.abort))
                 workers[0].start()
@@ -188,22 +192,25 @@ class TestForwardParsing(unittest.TestCase):
         job = session.add_forwards(
             ["127.0.0.1:%d:service.internal:80" % free_port()], start=False)[0]
         client, accepted = socket.socketpair()
-        channel = mock.Mock()
+        channel = mock.Mock(closed=False)
         session.transport.open_channel.return_value = channel
+        connection = mssh._ForwardConnection(job, accepted, ("127.0.0.1", 1234))
 
         def fileno():
-            self.assertIsNone(job.connections[accepted])
+            self.assertIsNone(connection.chan)
             return 10
 
-        def relay(conn, chan, transport):
+        def relay(record, transport):
             channel.fileno.assert_called_once_with()
-            self.assertIs(job.connections[conn], channel)
+            self.assertIs(job.connections[record.id].chan, channel)
+            self.assertEqual(record.channel_fd, 10)
 
         channel.fileno.side_effect = fileno
         try:
-            job.connections[accepted] = None
+            with job.lock:
+                job._register_connection(connection)
             with mock.patch.object(job, "_relay", side_effect=relay):
-                job._connect(accepted, ("127.0.0.1", 1234))
+                job._connect(connection)
             self.assertEqual(job.connections, {})
             channel.close.assert_called_once_with()
         finally:

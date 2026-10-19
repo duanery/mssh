@@ -132,7 +132,10 @@ class TestStatusViews(unittest.TestCase):
                            ("get", mock.Mock(closed=False)),
                            ("forward", None),
                            ("exec", mock.Mock(closed=True))):
-            session._register_job(session._new_job(chan, kind, "description"))
+            job = session._new_job(chan, kind, "description")
+            if kind == "forward":
+                job.connections_count = mock.Mock(return_value=0)
+            session._register_job(job)
         # Stopping jobs stay visible until their channel closes; a retained
         # default job also counts while pending, without holding the shell lock.
         default.aborted = True

@@ -3237,6 +3237,111 @@ class _SocksRequest(object):
         return host, port
 
 
+def _connection_address(address):
+    if isinstance(address, (tuple, list)) and len(address) >= 2:
+        return _forward_address(address[0], address[1])
+    return address or "-"
+
+
+class _ForwardConnection(object):
+    """One accepted stream, including handshake/connect before channel publication.
+
+    IDs belong to the listener job and never repeat, including across reconnect.
+    This lock serializes socket/channel publication with cancellation, so a slow
+    open cannot attach a channel after its connection has been stopped.
+    """
+
+    def __init__(self, job, conn=None, origin=None, listener=None):
+        self.job = job
+        self.id = None
+        self.conn = conn
+        self.chan = None
+        self.channel_fd = None
+        self.started = time.time()
+        self.origin_address = origin
+        self.origin = _connection_address(origin)
+        self.listener = _connection_address(listener)
+        self.destination = _connection_address(job.destination)
+        self.state = "handshake" if job.dynamic else "connecting"
+        self.lock = threading.Lock()
+        self.aborted = False
+        self.closed = threading.Event()
+
+    def set_channel(self, chan):
+        with self.lock:
+            if self.aborted or chan.closed:
+                return False
+            # Capture fileno once before cancellation can close its event pipe.
+            # Relays select this integer, never recreating a closed channel pipe.
+            self.channel_fd = chan.fileno()
+            self.chan = chan
+            return True
+
+    def set_socket(self, conn):
+        with self.lock:
+            if self.aborted:
+                return False
+            self.conn = conn
+            return True
+
+    def set_destination(self, destination):
+        with self.lock:
+            if self.aborted:
+                return
+            self.destination = _connection_address(destination)
+            self.state = "connecting"
+
+    def activate(self):
+        with self.lock:
+            if self.aborted:
+                return False
+            self.state = "active"
+            return True
+
+    def snapshot(self):
+        with self.lock:
+            if self.aborted:
+                return None
+            return {"id": self.id, "channel": getattr(self.chan, "chanid", None),
+                    "started": self.started, "state": self.state,
+                    "origin": self.origin, "listener": self.listener,
+                    "destination": self.destination}
+
+    def abort(self, transport_thread=False):
+        with self.lock:
+            closing = self.aborted
+            self.aborted = True
+            conn, chan = self.conn, self.chan
+        if closing:
+            # A transport-thread caller must not wait for another closer that
+            # might itself be waiting for this transport to finish rekeying.
+            if not transport_thread:
+                self.closed.wait()
+            return
+        try:
+            if conn is not None:
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    conn.close()
+                except OSError as exc:
+                    _session_log("forward.socket_close_failed", logging.WARNING,
+                                 self.job.session, exc=exc,
+                                 job=self.job.id, connection=self.id)
+        finally:
+            try:
+                if chan is not None:
+                    _close_session_channel(chan, transport_thread=transport_thread)
+            except Exception as exc:
+                _session_log("forward.connection_close_failed", logging.WARNING,
+                             self.job.session, chan, exc,
+                             job=self.job.id, connection=self.id)
+            finally:
+                self.closed.set()
+
+
 class _LocalForwardJob(_ExecJob):
     """One persistent listener job, owning every accepted socket and channel."""
 
@@ -3251,6 +3356,7 @@ class _LocalForwardJob(_ExecJob):
         self.socket_identity = None
         self.listeners = []
         self.connections = {}
+        self.connection_sequence = 0
         self.lock = threading.Lock()
         self.closed = threading.Event()
         self.worker = None
@@ -3307,6 +3413,40 @@ class _LocalForwardJob(_ExecJob):
             "SOCKS4/5" if self.dynamic else
             self.remote_socket or _forward_address(*self.destination))
 
+    def _register_connection(self, connection):
+        # Caller holds job.lock, also used to disable accepting during teardown.
+        self.connection_sequence += 1
+        connection.id = self.connection_sequence
+        self.connections[connection.id] = connection
+
+    def _remove_connection(self, connection):
+        with self.lock:
+            self.connections.pop(connection.id, None)
+
+    def connections_snapshot(self):
+        with self.lock:
+            records = list(self.connections.values())
+        rows = [connection.snapshot() for connection in records]
+        return sorted((row for row in rows if row is not None),
+                      key=lambda row: row["id"])
+
+    def connections_count(self):
+        with self.lock:
+            return sum(not connection.aborted for connection in self.connections.values())
+
+    def interrupt_connection(self, connection_id):
+        with self.lock:
+            connection = self.connections.get(connection_id)
+        if connection is None or connection.aborted:
+            raise ValueError("connection %s in job %s is not running" %
+                             (connection_id, self.id))
+        # Stop only this stream. Do not touch the listener, job registry or
+        # session activity. A pending open will close its late channel itself.
+        connection.abort()
+        self._remove_connection(connection)
+        _session_log("forward.connection_stopped", session=self.session,
+                     job=self.id, connection=connection_id)
+
     def _unlink_socket(self):
         if self.socket_identity is None:
             return
@@ -3340,7 +3480,7 @@ class _LocalForwardJob(_ExecJob):
             if not closing:
                 self.aborted = True
                 listeners = list(self.listeners)
-                connections = list(self.connections.items())
+                connections = list(self.connections.values())
         if closing:
             # Concurrent interrupts acknowledge only after resources close.
             # The acceptor's finally must not wait: the closing thread may
@@ -3360,18 +3500,9 @@ class _LocalForwardJob(_ExecJob):
                 except OSError:
                     pass
                 listener.close()
-            for conn, chan in connections:
-                try:
-                    conn.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                conn.close()
-                if chan is not None:
-                    try:
-                        _close_session_channel(chan)
-                    except Exception as exc:
-                        _session_log("forward.close_failed", logging.WARNING,
-                                     self.session, chan, exc, job=self.id)
+            for connection in connections:
+                connection.abort()
+                self._remove_connection(connection)
         finally:
             self._unlink_socket()
             with self.session.execs_lock:
@@ -3396,17 +3527,18 @@ class _LocalForwardJob(_ExecJob):
                             return
                         # Register before starting the worker so --interrupt
                         # also owns connections waiting for SSH channel open.
-                        self.connections[conn] = None
+                        connection = _ForwardConnection(
+                            self, conn, origin, conn.getsockname())
+                        self._register_connection(connection)
                     worker = threading.Thread(
-                        target=self._connect, args=(conn, origin),
+                        target=self._connect, args=(connection,),
                         name="forward-%s-connection" % self.id)
                     worker.daemon = True
                     try:
                         worker.start()
                     except BaseException:
-                        with self.lock:
-                            self.connections.pop(conn, None)
-                        conn.close()
+                        self._remove_connection(connection)
+                        connection.abort()
                         raise
         except Exception as exc:
             _session_log("forward.accept_failed",
@@ -3415,20 +3547,22 @@ class _LocalForwardJob(_ExecJob):
         finally:
             self.abort()
 
-    def _connect(self, conn, origin):
+    def _connect(self, connection):
+        conn = connection.conn
         chan = None
         request = None
         try:
             transport = self.session.transport
-            if self.aborted:
+            if self.aborted or connection.aborted:
                 return
             destination = self.destination
             if self.dynamic:
                 request = _SocksRequest(conn, self.session.timeout)
                 destination = request.destination()
+                connection.set_destination(destination)
                 # Handshake reads exactly its fields: bytes pipelined after
                 # CONNECT remain in the socket for the shared stream relay.
-            if self.aborted:
+            if self.aborted or connection.aborted:
                 return
             if not transport.is_active():
                 raise paramiko.SSHException("SSH session not active")
@@ -3437,28 +3571,24 @@ class _LocalForwardJob(_ExecJob):
                     transport, self.remote_socket, self.session.timeout)
             else:
                 # AF_UNIX accept() has no IP/port origin to put in direct-tcpip.
-                source = origin[:2] if not self.socket_path else ("127.0.0.1", 0)
+                source = connection.origin_address[:2] if not self.socket_path \
+                    else ("127.0.0.1", 0)
                 chan = transport.open_channel(
                     "direct-tcpip", destination, source,
                     timeout=self.session.timeout)
-            with self.lock:
-                if self.aborted:
-                    return
-                # fileno() installs Paramiko's receive notifications once.
-                # Create them before publishing the channel to abort(), so
-                # the relay cannot reinstall pipe notifications after
-                # _close_session_channel() has detached them for safe close.
-                chan.fileno()
-                self.connections[conn] = chan
+            if self.aborted or not connection.set_channel(chan):
+                return
             if request is not None:
                 conn.settimeout(max(self.session.timeout, 1.0))
                 request.reply()
                 self.session.last = time.time()
+            if not connection.activate():
+                return
             _session_log("forward.connected", session=self.session,
-                         chan=chan, job=self.id)
-            self._relay(conn, chan, transport)
+                         chan=chan, job=self.id, connection=connection.id)
+            self._relay(connection, transport)
         except Exception as exc:
-            if request is not None and not self.aborted:
+            if request is not None and not self.aborted and not connection.aborted:
                 # SSH exposes only a coarse channel-open error, not the
                 # target's errno. Preserve administrative denial distinctly;
                 # do not claim DNS/refusal details we cannot reliably know.
@@ -3471,27 +3601,29 @@ class _LocalForwardJob(_ExecJob):
             # Refused destinations are per-connection failures, not reasons
             # to terminate or reconnect the session's shared SSH transport.
             _session_log("forward.connection_failed",
-                         logging.DEBUG if self.aborted else logging.WARNING,
-                         self.session, chan, exc, job=self.id)
+                         logging.DEBUG if self.aborted or connection.aborted
+                         else logging.WARNING,
+                         self.session, chan, exc, job=self.id, connection=connection.id)
         finally:
-            with self.lock:
-                self.connections.pop(conn, None)
-            conn.close()
-            if chan is not None:
+            connection.abort()
+            self._remove_connection(connection)
+            if chan is not None and chan is not connection.chan:
                 try:
                     _close_session_channel(chan)
                 except Exception as exc:
                     _session_log("forward.close_failed", logging.WARNING,
                                  self.session, chan, exc, job=self.id)
 
-    def _relay(self, conn, chan, transport):
+    def _relay(self, connection, transport):
         """Bound both directions and preserve independent stream half-closes."""
+        conn, chan = connection.conn, connection.chan
         conn.setblocking(False)
         chan.settimeout(0.0)
         to_remote = to_local = b""
         local_eof = remote_eof = False
         remote_shutdown = local_shutdown = False
-        while not self.aborted and not self.session.stopping.is_set():
+        while not self.aborted and not connection.aborted \
+                and not self.session.stopping.is_set():
             if not transport.is_active():
                 return
             if to_remote:
@@ -3522,10 +3654,10 @@ class _LocalForwardJob(_ExecJob):
             if not local_eof and len(to_remote) < SESSION_BACKLOG:
                 readers.append(conn)
             if not remote_eof and len(to_local) < SESSION_BACKLOG:
-                readers.append(chan)
+                readers.append(connection.channel_fd)
             ready, _, _ = select.select(
                 readers, [conn] if to_local else [], [], SESSION_TICK)
-            if self.aborted:
+            if self.aborted or connection.aborted:
                 return
             if conn in ready:
                 try:
@@ -3563,7 +3695,8 @@ class _RemoteForwardJob(_LocalForwardJob):
         self.lock = threading.Lock()
         self.bind_lock = threading.Lock()
         self.closed = threading.Event()
-        self.connections = {}             # incoming channel -> local socket or None
+        self.connections = {}
+        self.connection_sequence = 0
         self.destination = settings.get("remote_socket") or (
             settings["host"], settings["hostport"])
         listener = settings.get("local_socket") or _forward_address(
@@ -3624,19 +3757,10 @@ class _RemoteForwardJob(_LocalForwardJob):
 
     def _close_connections(self):
         with self.lock:
-            connections = list(self.connections.items())
-        for chan, conn in connections:
-            if conn is not None:
-                try:
-                    conn.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                conn.close()
-            try:
-                _close_session_channel(chan)
-            except Exception as exc:
-                _session_log("reverse.close_failed", logging.WARNING,
-                             self.session, chan, exc, job=self.id)
+            connections = list(self.connections.values())
+        for connection in connections:
+            connection.abort()
+            self._remove_connection(connection)
 
     def abort(self):
         with self.lock:
@@ -3658,6 +3782,7 @@ class _RemoteForwardJob(_LocalForwardJob):
         _session_log("reverse.stopped", session=self.session, job=self.id)
 
     def incoming(self, chan, transport):
+        connection = None
         try:
             with self.lock:
                 if self.aborted or not self.enabled or chan.closed:
@@ -3665,23 +3790,33 @@ class _RemoteForwardJob(_LocalForwardJob):
                     return
                 # Install notifications before publishing to abort(). The
                 # worker must not recreate them after safe channel close.
-                chan.fileno()
-                self.connections[chan] = None
-            worker = threading.Thread(target=self._connect_local, args=(chan, transport),
+                listener = self.settings.get("local_socket") or (
+                    self.settings["bind"] or "*", self.settings["port"])
+                connection = _ForwardConnection(
+                    self, origin=getattr(chan, "origin_addr", None), listener=listener)
+                if not connection.set_channel(chan):
+                    _close_session_channel(chan, transport_thread=True)
+                    return
+                self._register_connection(connection)
+            worker = threading.Thread(target=self._connect_local,
+                                      args=(connection, transport),
                                       name="reverse-%s-connection" % self.id)
             worker.daemon = True
             worker.start()
         except Exception as exc:
             _session_log("reverse.worker_failed", logging.ERROR,
                          self.session, chan, exc, job=self.id)
-            with self.lock:
-                self.connections.pop(chan, None)
-            _close_session_channel(chan, transport_thread=True)
+            if connection is not None:
+                self._remove_connection(connection)
+                connection.abort(transport_thread=True)
+            if connection is None or connection.chan is not chan:
+                _close_session_channel(chan, transport_thread=True)
 
-    def _connect_local(self, chan, transport):
+    def _connect_local(self, connection, transport):
+        chan = connection.chan
         conn = None
         try:
-            if not self.accepting(transport):
+            if connection.aborted or not self.accepting(transport):
                 return
             addresses = [(socket.AF_UNIX, socket.SOCK_STREAM, 0, "", self.destination)] \
                 if isinstance(self.destination, str) else socket.getaddrinfo(
@@ -3695,15 +3830,17 @@ class _RemoteForwardJob(_LocalForwardJob):
                     # DNS may finish after unbind/reconnect closed this
                     # incoming channel. Never attach it to a replacement
                     # listener or let its relay recreate a closed select pipe.
-                    if self.aborted or not self.enabled or chan.closed \
+                    if self.aborted or connection.aborted or not self.enabled or chan.closed \
                             or self.manager is None \
                             or self.manager.transport is not transport \
                             or self.session.stopping.is_set():
                         return
-                    self.connections[chan] = conn
+                    if not connection.set_socket(conn):
+                        return
                 result = conn.connect_ex(address)
                 while result in (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
-                    if not self.accepting(transport) or not transport.is_active():
+                    if connection.aborted or not self.accepting(transport) \
+                            or not transport.is_active():
                         return
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -3719,24 +3856,21 @@ class _RemoteForwardJob(_LocalForwardJob):
                 conn = None
             if conn is None:
                 raise last_error or OSError("no usable local destination")
-            if not self.accepting(transport):
+            if not self.accepting(transport) or not connection.activate():
                 return
-            _session_log("reverse.connected", session=self.session, chan=chan, job=self.id)
-            self._relay(conn, chan, transport)
+            _session_log("reverse.connected", session=self.session, chan=chan,
+                         job=self.id, connection=connection.id)
+            self._relay(connection, transport)
         except Exception as exc:
             _session_log("reverse.connection_failed",
-                         logging.DEBUG if self.aborted else logging.WARNING,
-                         self.session, chan, exc, job=self.id)
+                         logging.DEBUG if self.aborted or connection.aborted
+                         else logging.WARNING,
+                         self.session, chan, exc, job=self.id, connection=connection.id)
         finally:
-            with self.lock:
-                self.connections.pop(chan, None)
-            if conn is not None:
+            connection.abort()
+            self._remove_connection(connection)
+            if conn is not None and conn is not connection.conn:
                 conn.close()
-            try:
-                _close_session_channel(chan)
-            except Exception as exc:
-                _session_log("reverse.close_failed", logging.WARNING,
-                             self.session, chan, exc, job=self.id)
 
 
 _SESSION_LOG_CONTEXT = threading.local()
@@ -4030,9 +4164,30 @@ class _Session(object):
         with self.execs_lock:
             return len(self._jobs_locked())
 
+    def _forward_job(self, job_id):
+        if isinstance(job_id, bool) or not isinstance(job_id, int) or job_id < 1:
+            raise ValueError("a positive forwarding job ID is required")
+        with self.execs_lock:
+            job = next((job for job in self._jobs_locked() if job.id == job_id), None)
+        if job is None or job.aborted:
+            raise ValueError("job %s is not running" % job_id)
+        if job.kind != "forward":
+            raise ValueError("job %s is not a forwarding job" % job_id)
+        return job
+
+    def connections_snapshot(self, job_id):
+        return self._forward_job(job_id).connections_snapshot()
+
+    def interrupt_connection(self, job_id, connection_id):
+        if isinstance(connection_id, bool) or not isinstance(connection_id, int) \
+                or connection_id < 1:
+            raise ValueError("a positive connection ID is required")
+        self._forward_job(job_id).interrupt_connection(connection_id)
+
     def jobs_snapshot(self):
         """Copy job metadata without waiting for the persistent shell lock."""
         with self.execs_lock:
+            jobs = self._jobs_locked()
             rows = [
                 {"id": job.id, "kind": job.kind, "command": job.command,
                  "channel": getattr(job.chan, "chanid", None),
@@ -4044,7 +4199,14 @@ class _Session(object):
                  "state": "stopping" if job.aborted else
                           "pending" if job is self.default_job and
                           not self.lock.locked() else "running"}
-                for job in self._jobs_locked()]
+                for job in jobs]
+        # Forward teardown removes jobs from execs after closing connections.
+        # Release the registry lock before taking any listener/connection lock
+        # so snapshots cannot deadlock with that teardown. Non-forward jobs
+        # deliberately have no connection-count field.
+        for job, row in zip(jobs, rows):
+            if job.kind == "forward":
+                row["connections"] = job.connections_count()
         return sorted(rows, key=lambda row: row["id"])
 
     # -- channel i/o ------------------------------------------------------
@@ -5204,6 +5366,33 @@ class _Session(object):
 #                "forward_type": "local" or "remote" or "socks" or null,
 #                "state": "running" or "pending" or "stopping"}, ...]}\n
 #
+# Forward rows also include "connections": N, counting currently accepted
+# streams (including pending SOCKS handshakes/channel opens/local connects).
+# Non-forward rows omit this field. A forward's own channel is always null;
+# use the following descriptor-free request for its individual streams:
+#
+#     {"op": "connections", "job": N}\n
+#     {"job": N, "connections": [
+#         {"id": N, "channel": N or null, "started": UNIX_SECONDS,
+#          "state": "handshake" or "connecting" or "active",
+#          "origin": "...", "listener": "...", "destination": "..."}, ...]}\n
+#
+# Connection IDs increase within each listener job, never repeat (even on
+# reconnect), and disappear on close. Before SSH open completes channel is
+# null; Unix sockets without a named peer have origin "-". SOCKS destinations
+# become known after CONNECT parsing. Endpoints follow stream direction:
+# local -> target for -L/-D, target -> local for -R.
+#
+#     {"op": "interrupt_connection", "job": N, "connection": N}\n
+#     {"interrupted": true}\n
+#
+# --job N --connection N --stop/--interrupt uses this distinct op, never stop
+# or interrupt: old daemons must reject rather than ignore a selector and
+# cancel the entire listener. Both IDs must be positive integers. Unknown,
+# completed or non-forward jobs/connections fail. Only the selected socket
+# and channel close; its listener, sibling streams and session stay alive.
+# Inspection/cancellation work before link resolution, even on reconnect.
+#
 # It is answered before link resolution, like status, without taking the
 # persistent shell lock or starting a reconnect. The idle primary shell or
 # -c program is excluded; its current request is the default job, in either
@@ -5342,15 +5531,15 @@ class _Session(object):
 # this command -- today, that the chain was rebuilt under it by --reconnect and
 # the shell is therefore a new one.  It goes in front of the command instead of
 # after it because it changes how the output should be read.  A client reads
-# lines until one is not a notice; that line is the reply.  status, jobs, stop and
-# interrupt never carry one: they are a single line each way, and a client that
-# reads exactly one line is right about them.
+# lines until one is not a notice; that line is the reply. Status, job/connection
+# controls and forwarding configuration never carry notices: they are a single
+# line each way, and a client that reads exactly one line is right about them.
 #
 # On a send the client does not half-close its end of the socket, and the
 # daemon does not read from it: the socket going readable can then only mean
 # the client has gone, which is how a command notices that nobody is listening
-# any more.  status, jobs, stop and interrupt are a plain request, half-close, one
-# reply.
+# any more. Read-only queries, cancellation and forwarding configuration use a
+# plain request, half-close, one reply.
 
 
 def _reply(conn, payload):
@@ -5367,8 +5556,8 @@ def _notify(conn, payload):
 
     Send/exec clients read notices until their final status arrives. SFTP
     uses this helper for its initial {"ok": true} while keeping the control
-    connection open. Status, jobs, stop and interrupt are one line each in
-    both directions and are left exactly as they were.
+    connection open. Queries, cancellation and forwarding configuration
+    are one line each in both directions.
     """
     try:
         conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
@@ -5447,7 +5636,7 @@ def _session_notice(text):
 def session_request(name, payload, timeout=None):
     """Send one request, half-close, and return the daemon's single reply.
 
-    What --status, --stop, --interrupt, --jobs, -L and the liveness probe use:
+    Used by status/job/connection controls, -L/-R/-D and the liveness probe:
     one line of JSON each way, nothing streamed. A command's output does not
     come back this way -- see session_send.
     """
@@ -5854,6 +6043,20 @@ def _session_serve(session, srv, path, opts):
             drop()
         if op == "jobs":
             _reply(conn, {"jobs": session.jobs_snapshot()})
+            return
+        if op in ("connections", "interrupt_connection"):
+            # Inspect/cancel local connection ownership without resolving the
+            # SSH link. A distinct cancellation op makes old daemons reject it
+            # instead of ignoring a selector and interrupting the whole job.
+            try:
+                if op == "connections":
+                    rows = session.connections_snapshot(req.get("job"))
+                    _reply(conn, {"job": req["job"], "connections": rows})
+                else:
+                    session.interrupt_connection(req.get("job"), req.get("connection"))
+                    _reply(conn, {"interrupted": True})
+            except ValueError as exc:
+                _reply(conn, {"error": "mssh: %s" % exc})
             return
         if op == "status":
             # Answered whatever state the link is in: a session whose target
@@ -6900,16 +7103,67 @@ def run_session_jobs(name):
     if not rows:
         sys.stdout.write("No running jobs.\n")
         return 0
-    sys.stdout.write("ID    TYPE     CHANNEL  STATE     ELAPSED    COMMAND\n")
+    show_connections = any(row["kind"] == "forward" for row in rows)
+    sys.stdout.write("ID    TYPE     CHANNEL  STATE     ELAPSED    " +
+                     ("CONNS  " if show_connections else "") + "COMMAND\n")
     for row in rows:
         # Keep terminal controls and embedded newlines out of the table.
         command = "".join(char if char.isprintable() else " "
                           for char in row.get("command", ""))
-        sys.stdout.write("%-5s %-8s %-8s %-9s %-10s %s\n" %
+        count = ""
+        if show_connections:
+            count = "%-6s " % row.get("connections", "?") \
+                if row["kind"] == "forward" else "       "
+        sys.stdout.write("%-5s %-8s %-8s %-9s %-10s %s%s\n" %
                          (row["id"], row["kind"],
                           row["channel"] if row["channel"] is not None else "-",
                           row["state"],
-                          _uptime(max(0, time.time() - row["started"])), command))
+                          _uptime(max(0, time.time() - row["started"])), count, command))
+    return 0
+
+
+def run_session_connections(name, job_id):
+    info = session_request(name, {"op": "connections", "job": job_id}, timeout=15.0)
+    if info.get("error"):
+        sys.stderr.write(info["error"].rstrip("\n") + "\n")
+        return 1
+    if "connections" not in info:
+        raise SystemExit("mssh: session daemon does not support --connections; "
+                         "stop and recreate the session")
+    rows = info["connections"]
+    if not rows:
+        sys.stdout.write("No running connections for job %s.\n" % job_id)
+        return 0
+    # Socket paths may contain spaces/control characters. Sanitize before
+    # measuring column widths, preserving one output line per connection.
+    endpoints = [
+        ["".join(char if char.isprintable() else " " for char in row[key])
+         for key in ("origin", "listener", "destination")]
+        for row in rows]
+    source_width = max(len("SOURCE"), max(len(item[0]) for item in endpoints))
+    listener_width = max(len("LISTENER"), max(len(item[1]) for item in endpoints))
+    sys.stdout.write("ID    CHANNEL  STATE       ELAPSED    %-*s  %-*s  DESTINATION\n" %
+                     (source_width, "SOURCE", listener_width, "LISTENER"))
+    for row, addresses in zip(rows, endpoints):
+        sys.stdout.write("%-5s %-8s %-11s %-10s %-*s  %-*s  %s\n" %
+                         (row["id"], row["channel"] if row["channel"] is not None else "-",
+                          row["state"], _uptime(max(0, time.time() - row["started"])),
+                          source_width, addresses[0], listener_width, addresses[1],
+                          addresses[2]))
+    return 0
+
+
+def run_session_interrupt_connection(name, job_id, connection_id):
+    reply = session_request(name, {"op": "interrupt_connection", "job": job_id,
+                                  "connection": connection_id}, timeout=30.0)
+    if reply.get("error"):
+        sys.stderr.write(reply["error"].rstrip("\n") + "\n")
+        return 1
+    if not reply.get("interrupted"):
+        raise SystemExit("mssh: session daemon does not support --connection; "
+                         "stop and recreate the session")
+    sys.stderr.write("mssh: session %s: interrupted connection %s in job %s\n" %
+                     (name, connection_id, job_id))
     return 0
 
 
@@ -6998,8 +7252,8 @@ def _session_login_wanted(opts):
     only thing left to mean is the thing ssh means by the same words: a shell
     on the target, with your terminal at it.  Anything that says what to do --
     a command, a positional, a chain to build, a key to install -- is that
-    instead, and so are --status/--stop/--interrupt/--jobs, which act on the session
-    rather than on the machine behind it.
+    instead, and so are the status/job/connection controls, which act on the
+    session rather than on the machine behind it.
     """
     if not opts.session:
         return False
@@ -7007,7 +7261,7 @@ def _session_login_wanted(opts):
             or opts.put is not None or opts.get is not None or opts.local_forwards \
             or opts.dynamic_forwards or opts.remote_forwards:
         return False
-    return not (opts.stop or opts.interrupt or opts.status or opts.jobs)
+    return not (opts.stop or opts.interrupt or opts.status or opts.jobs or opts.connections)
 
 
 def run_session(parser, opts):
@@ -7023,6 +7277,7 @@ def run_session(parser, opts):
         if opts.args or opts.command or opts.jump or opts.copy_id is not None \
                 or opts.rcfile or opts.exec_channel or opts.force_tty \
                 or opts.stop or opts.interrupt or opts.status or opts.jobs \
+                or opts.connections \
                 or opts.reconnect or opts.local_forwards or opts.dynamic_forwards \
                 or opts.remote_forwards or opts.prompt is not None:
             parser.error("--put/--get only combine with file-copy options "
@@ -7036,7 +7291,7 @@ def run_session(parser, opts):
         except SessionGone:
             _no_session(name)
 
-    controls = [flag for flag in ("stop", "interrupt", "status", "jobs")
+    controls = [flag for flag in ("stop", "interrupt", "status", "jobs", "connections")
                 if getattr(opts, flag)]
     if len(controls) > 1:
         parser.error("--%s and --%s cannot be combined" % tuple(controls[:2]))
@@ -7044,10 +7299,13 @@ def run_session(parser, opts):
     if controls:
         if opts.local_forwards or opts.dynamic_forwards or opts.remote_forwards:
             parser.error("-L/-R/-D cannot be combined with --%s" % controls[0])
-        if opts.jobs and (opts.command or opts.jump or opts.force_tty or
-                          opts.recursive or opts.preserve or opts.reconnect or
-                          opts.copy_id is not None or opts.stdin):
-            parser.error("--jobs only takes an existing session name")
+        if (opts.jobs or opts.connections or opts.connection is not None) and (
+                opts.command or opts.jump or opts.force_tty or opts.recursive or
+                opts.preserve or opts.reconnect or opts.copy_id is not None or opts.stdin
+                or opts.prompt is not None):
+            parser.error("--%s only takes an existing session name%s" %
+                         ("connection" if opts.connection is not None else controls[0],
+                          " and job ID" if opts.connection is not None else ""))
         if opts.args:
             parser.error("--%s takes no other arguments" % controls[0])
             return 2
@@ -7060,6 +7318,10 @@ def run_session(parser, opts):
                 return run_session_status(name)
             if controls[0] == "jobs":
                 return run_session_jobs(name)
+            if controls[0] == "connections":
+                return run_session_connections(name, opts.job)
+            if opts.connection is not None:
+                return run_session_interrupt_connection(name, opts.job, opts.connection)
             if controls[0] == "stop":
                 return run_session_stop(name, opts.job)
             return run_session_interrupt(name, opts.job)
@@ -7340,11 +7602,15 @@ persistent session (keep one connection and one shell alive):
   mssh s --jobs               # list active tasks and their IDs
   mssh s --interrupt --job 3  # interrupt only this task
   mssh s --job 3 --stop       # same targeted cancellation, keep session alive
+  mssh s --job 3 --connections # list this forward's connections and channels
+  mssh s --job 3 --connection 2 --stop # close only this connection
   mssh --session s --stop      # end it; --sessions lists live ones
 
   --interrupt alone only reaches the current default shell/interactive
   request, not independent exec/login/SFTP jobs or forwards. Idle is a no-op.
-  --job ID selects one task from --jobs with --interrupt or --stop.
+  --jobs also shows current connection counts for -L/-R/-D listeners.
+  --job ID selects a task with --interrupt/--stop or inspects a forward with
+  --connections. --connection ID limits --interrupt/--stop to one stream.
   --stop without --job closes the default channel and every job channel.
 
   A session dies with its connection: a jump host or the target rebooting
@@ -7567,13 +7833,21 @@ def build_parser():
     )
     group.add_argument(
         "--job", type=int, metavar="ID",
-        help="with --interrupt or --stop, target a job ID from --jobs",
+        help="with --interrupt, --stop or --connections, target a job ID from --jobs",
     )
     group.add_argument(
         "--jobs", action="store_true",
         help="list active session commands, exec/login channels, transfers "
-             "and forwards; "
+             "and forwards with current connection counts; "
              "exclude the default persistent shell",
+    )
+    group.add_argument(
+        "--connections", action="store_true",
+        help="with --job ID, list a forward's current connections and their channels",
+    )
+    group.add_argument(
+        "--connection", type=int, metavar="ID",
+        help="with --job ID and --stop or --interrupt, close only one connection",
     )
     group.add_argument(
         "--status", action="store_true",
@@ -7781,8 +8055,16 @@ def main(argv=None):
     opts.args = list(opts.args) + command
 
     if opts.job is not None and (
-            not (opts.interrupt or opts.stop) or opts.job < 0):
-        parser.error("--job requires --interrupt or --stop and a nonnegative job ID")
+            not (opts.interrupt or opts.stop or opts.connections) or opts.job < 0):
+        parser.error("--job requires --interrupt, --stop or --connections "
+                     "and a nonnegative job ID")
+    if opts.connections and (opts.job is None or opts.job < 1):
+        parser.error("--connections requires --job with a positive job ID")
+    if opts.connection is not None and (
+            opts.job is None or opts.job < 1 or opts.connection < 1
+            or not (opts.interrupt or opts.stop)):
+        parser.error("--connection requires a positive connection ID, "
+                     "--job ID and --stop or --interrupt")
 
     try:
         opts.local_forwards = [
@@ -7800,6 +8082,7 @@ def main(argv=None):
     if opts.rcfile:
         if opts.command or opts.copy_id is not None or opts.sessions \
                 or opts.stop or opts.interrupt or opts.status or opts.jobs \
+                or opts.connections \
                 or opts.exec_channel:
             parser.error("--rcfile only applies to logins and shell session creation")
         try:
@@ -7836,8 +8119,9 @@ def main(argv=None):
             parser.error("-L/-R/-D cannot be combined with --sessions")
         if opts.job is not None:
             parser.error("--job cannot be combined with --sessions")
-        if opts.jobs:
-            parser.error("--jobs cannot be combined with --sessions")
+        if opts.jobs or opts.connections:
+            parser.error("--%s cannot be combined with --sessions" %
+                         ("jobs" if opts.jobs else "connections"))
         if opts.put is not None or opts.get is not None:
             parser.error("--put/--get require an existing session")
         if opts.session or opts.args:
@@ -7862,7 +8146,7 @@ def main(argv=None):
         parser.error("--put/--get require an existing session: "
                      "mssh NAME --put LOCAL REMOTE")
 
-    for flag in ("stop", "interrupt", "status", "jobs"):
+    for flag in ("stop", "interrupt", "status", "jobs", "connections"):
         if getattr(opts, flag):
             # Either no name was given or the one given is not live; both end
             # here, so the message names the live ones rather than guessing

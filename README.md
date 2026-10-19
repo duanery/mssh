@@ -511,6 +511,8 @@ mssh web --jobs               # individual tasks and forwarding listeners
 mssh web --interrupt          # only the primary shell/program's current task
 mssh web --interrupt --job 3  # interrupt one specific task
 mssh web --job 3 --stop       # same cancellation, keep the session alive
+mssh web --job 3 --connections # connections and channels for one forward
+mssh web --job 3 --connection 2 --stop # close only this connection
 mssh web --stop               # end the whole session and close its resources
 mssh --sessions              # list every live session and its job count
 ```
@@ -520,6 +522,10 @@ mssh --sessions              # list every live session and its job count
 `mssh NAME --jobs` lists mssh-managed tasks with their ID, type, channel,
 state, elapsed time and command or transfer paths. It includes active shell
 or interactive requests, exec/login channels, SFTP transfers and forwards.
+When forwards are present, `CONNS` shows each listener's current accepted
+connection count; non-forward rows leave that column blank. Pending SOCKS
+handshakes, SSH channel opens and local destination connects are included.
+It is not a cumulative count or a count of remote service connections.
 The idle persistent shell or `-c` program itself is not a job. Each request
 on its primary channel creates a default job, removed when the reply completes.
 A timed-out or detached request remains `pending` until resynchronized.
@@ -534,15 +540,37 @@ jobs are not saved as history, and IDs restart when the daemon is recreated.
 all forwarding listeners alone.
 For a `-c` session it interrupts the current interactive request.
 With no default job, it reports that nothing is running.
-`--job ID` requires `--interrupt` or `--stop`; an unknown or completed ID
-reports an error. `--stop --job ID` uses the same targeted cancellation as
-`--interrupt --job ID`, leaving the session and other jobs alive.
+`--job ID` requires `--interrupt`, `--stop` or `--connections`; an unknown
+or completed ID reports an error. `--stop --job ID` uses the same targeted
+cancellation as `--interrupt --job ID`, leaving the session and other jobs alive.
 Only `--stop` without `--job` ends the entire session.
 Interrupting a default shell or interactive task keeps the primary channel
 alive; interrupting an exec/login/SFTP task closes only that task's channel.
 Client-side Ctrl-C on an exec/login request targets its own task, not the
 default shell or other jobs. Stopping or exiting the session closes the
 default channel and all job channels.
+
+#### Forward Connections
+
+`mssh NAME --job ID --connections` lists that forward's accepted connections
+with their connection ID, SSH channel ID, state, elapsed time, source,
+listener and destination. It works for `-L`, `-R` and `-D`, with TCP or Unix
+endpoints. States are `handshake`, `connecting` and `active`. A pending
+channel open shows `-` for its channel; unnamed Unix peers show `-` for their
+source. SOCKS destinations are shown after the CONNECT request is parsed.
+For `-R`, the source/listener are on the target and the destination is local.
+
+`mssh NAME --job ID --connection ID --stop` closes only that connection's
+socket and channel, including one still negotiating or connecting.
+`--interrupt` can replace `--stop` here. The listener, other connections
+and the session remain usable. Unknown or finished connection IDs and
+non-forward jobs report an error without stopping anything else.
+
+Connection IDs are scoped to each job, increase without reuse through
+reconnect, and disappear when closed. Inspection and targeted cancellation
+also work while the session is reconnecting, without triggering reconnect
+or refreshing its activity timer. Older daemons need to be stopped and
+recreated before these options are available.
 
 #### Status and Listings
 
@@ -1007,7 +1035,8 @@ automatically rotated or deleted by `--stop`.
 | `-V, --version` | Print the version |
 
 Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
-`--interrupt`, `--job ID`, `--jobs`, `-L SPEC`, `-R SPEC`,
+`--interrupt`, `--job ID`, `--jobs`, `--connections`, `--connection ID`,
+`-L SPEC`, `-R SPEC`,
 `-D [BIND:]PORT`, `--exec`,
 `--put LOCAL REMOTE`, `--get REMOTE LOCAL`,
 `--prompt REGEX`, `--stdin`, `--idle SEC`,
@@ -1037,6 +1066,7 @@ python3 -m unittest discover -s tests -p test_session_forward.py
 python3 -m unittest discover -s tests -p test_session_unix_forward.py
 python3 -m unittest discover -s tests -p test_session_remote_forward.py
 python3 -m unittest discover -s tests -p test_session_socks.py
+python3 -m unittest discover -s tests -p test_session_connections.py
 ```
 
 No external network: the framing layer is driven against local `bash`,

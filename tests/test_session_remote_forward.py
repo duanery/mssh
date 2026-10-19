@@ -1,5 +1,6 @@
 """Remote TCP/Unix listeners, SSH request lifecycle and session-owned jobs."""
 
+import errno
 import os
 import socket
 import tempfile
@@ -345,7 +346,10 @@ class TestRemoteForwardProtocol(unittest.TestCase):
         chan = paramiko.Channel(1)
         chan._set_transport(self.transport)
         chan._set_remote_channel(42, 2097152, 32768)
-        job.connections[chan] = None
+        connection = mssh._ForwardConnection(job)
+        self.assertTrue(connection.set_channel(chan))
+        with job.lock:
+            job._register_connection(connection)
 
         def resolve(*args):
             job.unbind()
@@ -356,12 +360,72 @@ class TestRemoteForwardProtocol(unittest.TestCase):
         with mock.patch.object(socket, "getaddrinfo", side_effect=resolve), \
                 mock.patch.object(socket, "socket") as create_socket, \
                 mock.patch.object(job, "_relay") as relay:
-            job._connect_local(chan, self.transport)
+            job._connect_local(connection, self.transport)
         create_socket.return_value.connect_ex.assert_not_called()
         create_socket.return_value.close.assert_called_once()
         relay.assert_not_called()
         self.assertTrue(chan.closed)
         self.assertEqual(job.connections, {})
+
+    def test_single_connection_cancel_during_dns_keeps_listener(self):
+        job = self.job()
+        chan = paramiko.Channel(1)
+        chan._set_transport(self.transport)
+        chan._set_remote_channel(42, 2097152, 32768)
+        connection = mssh._ForwardConnection(job)
+        self.assertTrue(connection.set_channel(chan))
+        with job.lock:
+            job._register_connection(connection)
+
+        def resolve(*args):
+            self.assertEqual(job.connections_snapshot()[0]["channel"], 1)
+            job.interrupt_connection(connection.id)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 80))]
+
+        with mock.patch.object(socket, "getaddrinfo", side_effect=resolve), \
+                mock.patch.object(socket, "socket") as create_socket, \
+                mock.patch.object(job, "_relay") as relay:
+            job._connect_local(connection, self.transport)
+        create_socket.return_value.connect_ex.assert_not_called()
+        create_socket.return_value.close.assert_called_once()
+        relay.assert_not_called()
+        self.assertTrue(chan.closed)
+        self.assertFalse(job.aborted)
+        self.assertTrue(job.enabled)
+        self.assertIs(job.manager, self.manager)
+        self.assertEqual(job.connections, {})
+        self.assertTrue(self.transport.is_active())
+
+    def test_single_connection_cancel_during_local_connect_keeps_listener(self):
+        job = self.job()
+        chan = paramiko.Channel(1)
+        chan._set_transport(self.transport)
+        chan._set_remote_channel(42, 2097152, 32768)
+        connection = mssh._ForwardConnection(job)
+        self.assertTrue(connection.set_channel(chan))
+        with job.lock:
+            job._register_connection(connection)
+        conn = mock.Mock()
+        conn.connect_ex.return_value = errno.EINPROGRESS
+
+        def wait(*args):
+            self.assertEqual(job.connections_count(), 1)
+            job.interrupt_connection(connection.id)
+            return [], [], []
+
+        with mock.patch.object(socket, "getaddrinfo", return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 80))]), \
+                mock.patch.object(socket, "socket", return_value=conn), \
+                mock.patch.object(mssh.select, "select", side_effect=wait), \
+                mock.patch.object(job, "_relay") as relay:
+            job._connect_local(connection, self.transport)
+        conn.close.assert_called_once_with()
+        relay.assert_not_called()
+        self.assertTrue(chan.closed)
+        self.assertFalse(job.aborted)
+        self.assertTrue(job.enabled)
+        self.assertEqual(job.connections_count(), 0)
+        self.assertTrue(self.transport.is_active())
 
     def test_failed_rebuild_cancels_all_attempted_remote_binds_and_can_retry(self):
         session = self.session
