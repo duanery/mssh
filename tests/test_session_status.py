@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -18,6 +19,132 @@ def job(job_id, kind="exec", state="running", default=False, command="sleep 20",
     return {"id": job_id, "kind": kind, "state": state, "default": default,
             "command": command, "channel": None if kind == "forward" else job_id,
             "started": 940.0, "forward_type": forward_type}
+
+
+class TestStatusViews(unittest.TestCase):
+    def dispatch(self, session, request):
+        finished = threading.Event()
+        conn, srv = mock.Mock(), mock.Mock()
+        conn.recvmsg.return_value = (
+            mssh.json.dumps(request).encode("utf-8") + b"\n", [], 0, None)
+        conn.close.side_effect = finished.set
+        accepted = []
+
+        def accept():
+            if not accepted:
+                accepted.append(conn)
+                return conn, None
+            if not finished.wait(3):
+                raise RuntimeError("status worker did not finish")
+            raise OSError("test listener closed")
+
+        srv.accept.side_effect = accept
+        opts = mock.Mock(session_idle=300)
+        with mock.patch.object(mssh, "_peer_uid", return_value=os.getuid()), \
+                mock.patch.object(mssh, "_reply") as reply, \
+                mock.patch.object(mssh.os, "unlink"):
+            mssh._session_serve(session, srv, "/unused/session.sock", opts)
+        reply.assert_called_once()
+        return reply.call_args[0][1]
+
+    def session(self):
+        session = mock.Mock()
+        session.chain = []
+        session.target = "root@host:22"
+        session.mode = "shell"
+        session.started = 400.0
+        session.served = 4
+        session.jobs_count.return_value = 2
+        session.jobs_snapshot.return_value = [job(1), job(2)]
+        session.link_state.return_value = ("up", None, 0)
+        return session
+
+    def test_probe_does_not_inspect_link_or_jobs(self):
+        session = self.session()
+        reply = self.dispatch(session, {"op": "status", "view": "probe"})
+        self.assertEqual(reply, {"ok": True})
+        session.jobs_count.assert_not_called()
+        session.jobs_snapshot.assert_not_called()
+        session.link_state.assert_not_called()
+        session.refusal.assert_not_called()
+        session.resolve.assert_not_called()
+
+    def test_list_only_counts_jobs_and_returns_required_columns(self):
+        session = self.session()
+        reply = self.dispatch(session, {"op": "status", "view": "list"})
+        self.assertEqual(reply, {"target": "root@host:22", "mode": "shell",
+                                 "started": 400.0, "served": 4, "jobs": 2})
+        session.jobs_count.assert_called_once_with()
+        session.jobs_snapshot.assert_not_called()
+        session.link_state.assert_not_called()
+        session.refusal.assert_not_called()
+        session.resolve.assert_not_called()
+
+    def test_default_and_explicit_full_view_keep_complete_reply(self):
+        for fields in ({}, {"view": "full"}):
+            with self.subTest(fields=fields):
+                session = self.session()
+                request = dict(fields, op="status")
+                reply = self.dispatch(session, request)
+                self.assertEqual(reply["job_details"], [job(1), job(2)])
+                self.assertEqual(reply["jobs"], 2)
+                self.assertEqual(reply["link"], "up")
+                self.assertEqual(reply["idle_limit"], 300)
+                self.assertIn("rcfile", reply)
+                session.jobs_snapshot.assert_called_once_with()
+                session.jobs_count.assert_not_called()
+                session.resolve.assert_not_called()
+
+    def test_invalid_view_is_rejected_without_inspection(self):
+        for view in ("unknown", None, False, [], {}):
+            with self.subTest(view=view):
+                session = self.session()
+                reply = self.dispatch(session, {"op": "status", "view": view})
+                self.assertIn("unknown status view", reply["error"])
+                session.jobs_snapshot.assert_not_called()
+                session.jobs_count.assert_not_called()
+                session.link_state.assert_not_called()
+
+    def test_alive_uses_probe_and_accepts_legacy_reply(self):
+        for reply in ({"ok": True}, {"target": "root@host:22", "jobs": 2}):
+            with self.subTest(reply=reply):
+                with mock.patch.object(mssh, "session_request",
+                                       return_value=reply) as request:
+                    self.assertTrue(mssh.session_alive("hop"))
+                request.assert_called_once_with(
+                    "hop", {"op": "status", "view": "probe"}, timeout=10.0)
+
+    def test_alive_handles_missing_or_unresponsive_daemon(self):
+        with mock.patch.object(mssh, "session_request",
+                               side_effect=mssh.SessionGone()):
+            self.assertFalse(mssh.session_alive("hop"))
+        with mock.patch.object(mssh, "session_request",
+                               side_effect=SystemExit("not responding")):
+            with self.assertRaisesRegex(SystemExit, "not responding"):
+                mssh.session_alive("hop")
+
+    def test_count_matches_snapshot_without_building_metadata(self):
+        session = mssh._Session(mock.Mock(closed=False), "marker", "shell",
+                                None, 0.1, "target", None)
+        default = session._new_job(session.chan, "shell", "sleep 20", default=True)
+        session.default_job = default
+        for kind, chan in (("exec", mock.Mock(closed=False)),
+                           ("get", mock.Mock(closed=False)),
+                           ("forward", None),
+                           ("exec", mock.Mock(closed=True))):
+            session._register_job(session._new_job(chan, kind, "description"))
+        # Stopping jobs stay visible until their channel closes; a retained
+        # default job also counts while pending, without holding the shell lock.
+        default.aborted = True
+        self.assertEqual(session.jobs_count(), 4)
+        self.assertEqual(session.jobs_count(), len(session.jobs_snapshot()))
+        with mock.patch.object(session, "jobs_snapshot",
+                               side_effect=AssertionError("metadata requested")):
+            self.assertEqual(session.jobs_count(), 4)
+            session.chan.closed = True
+            self.assertEqual(session.jobs_count(), 3)
+            session.execs.clear()
+            self.assertEqual(session.jobs_count(), 0)
 
 
 class TestStatusOutput(unittest.TestCase):
@@ -184,9 +311,19 @@ class TestStatusOutput(unittest.TestCase):
 
 
 class TestStatusDaemon(SessionTest):
-    def status(self):
+    def status(self, view=None):
+        payload = {"op": "status"}
+        if view is not None:
+            payload["view"] = view
         with mock.patch.dict(os.environ, HOME=ENV["HOME"]):
-            return mssh.session_request(self.name, {"op": "status"}, timeout=3)
+            return mssh.session_request(self.name, payload, timeout=3)
+
+    def assert_lightweight_status(self, full):
+        self.assertEqual(self.status("probe"), {"ok": True})
+        listing = self.status("list")
+        self.assertEqual(listing, {key: full[key] for key in
+                                  ("target", "mode", "started", "served", "jobs")})
+        self.assertEqual(self.status()["last_activity"], full["last_activity"])
 
     def wait_jobs(self, count):
         deadline = time.monotonic() + 5
@@ -209,6 +346,7 @@ class TestStatusDaemon(SessionTest):
         self.assertEqual(first["jobs"], 0)
         self.assertEqual(first["idle_limit"], 300)
         self.assertFalse(first["stopping"])
+        self.assert_lightweight_status(first)
         self.assertIn("state:    idle\n", self.output())
         self.assertIn("link:     up\n", self.output())
         self.assertEqual(self.status()["last_activity"], first["last_activity"])
@@ -225,6 +363,7 @@ class TestStatusDaemon(SessionTest):
             info = self.wait_jobs(1)
             self.assertFalse(info["running"])
             self.assertFalse(info["job_details"][0]["default"])
+            self.assert_lightweight_status(info)
             out = self.output()
             self.assertIn("state:    running\n", out)
             self.assertIn("default:  idle\n", out)
@@ -249,6 +388,7 @@ class TestStatusDaemon(SessionTest):
         row = info["job_details"][0]
         self.assertTrue(row["default"])
         self.assertEqual(row["state"], "pending")
+        self.assert_lightweight_status(info)
         out = self.output()
         self.assertIn("state:    pending\n", out)
         self.assertIn("default:  job %s (pending)\n" % row["id"], out)
@@ -264,9 +404,11 @@ class TestStatusDaemon(SessionTest):
                 self.name, 3, {"kind": "get", "source": "/remote/file",
                                "destination": "./local"})
         try:
-            row = self.wait_jobs(1)["job_details"][0]
+            info = self.wait_jobs(1)
+            row = info["job_details"][0]
             self.assertFalse(row["default"])
             self.assertEqual(row["kind"], "get")
+            self.assert_lightweight_status(info)
             out = self.output()
             self.assertIn("state:    running\n", out)
             self.assertIn("jobs:     1 (get=1)\n", out)
@@ -289,6 +431,7 @@ class TestStatusDaemon(SessionTest):
         self.assertEqual(sorted(row["forward_type"] for row in rows),
                          ["local", "socks"])
         self.assertTrue(all(not row["default"] for row in rows))
+        self.assert_lightweight_status(info)
         out = self.output()
         self.assertIn("state:    forwarding\n", out)
         self.assertIn("jobs:     2 (forward=1, socks=1)\n", out)
@@ -319,6 +462,7 @@ class TestStatusDaemon(SessionTest):
                         time.sleep(1.1)
                     self.assertEqual(info["link"], "reconnecting")
                     self.assertEqual(info["job_details"], before["job_details"])
+                    self.assert_lightweight_status(info)
                     self.assertIn("state:    reconnecting\n", self.output())
                     self.assertIn("default:  idle\n", self.output())
                     self.assertIn("jobs:     1 (socks=1)\n", self.output())

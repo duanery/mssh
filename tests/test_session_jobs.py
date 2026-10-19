@@ -325,7 +325,7 @@ class TestSessionListCounts(unittest.TestCase):
         }
 
         def request(name, payload, timeout):
-            self.assertEqual(payload, {"op": "status"})
+            self.assertEqual(payload, {"op": "status", "view": "list"})
             value = responses[name]
             if isinstance(value, BaseException):
                 raise value

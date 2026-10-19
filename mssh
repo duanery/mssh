@@ -3560,12 +3560,21 @@ class _Session(object):
         job.abort()
         return True
 
+    def _jobs_locked(self):
+        """Live jobs shared by counts and snapshots; caller holds execs_lock."""
+        jobs = list(self.execs)
+        if self.default_job is not None:
+            jobs.append(self.default_job)
+        return [job for job in jobs if not getattr(job.chan, "closed", False)]
+
+    def jobs_count(self):
+        """Count live jobs without building or sorting their display metadata."""
+        with self.execs_lock:
+            return len(self._jobs_locked())
+
     def jobs_snapshot(self):
         """Copy job metadata without waiting for the persistent shell lock."""
         with self.execs_lock:
-            jobs = list(self.execs)
-            if self.default_job is not None:
-                jobs.append(self.default_job)
             rows = [
                 {"id": job.id, "kind": job.kind, "command": job.command,
                  "channel": getattr(job.chan, "chanid", None),
@@ -3576,7 +3585,7 @@ class _Session(object):
                  "state": "stopping" if job.aborted else
                           "pending" if job is self.default_job and
                           not self.lock.locked() else "running"}
-                for job in jobs if not getattr(job.chan, "closed", False)]
+                for job in self._jobs_locked()]
         return sorted(rows, key=lambda row: row["id"])
 
     # -- channel i/o ------------------------------------------------------
@@ -4736,6 +4745,13 @@ class _Session(object):
 # acquire the primary lock, resynchronize a pending task or trigger reconnect.
 # Clients must distinguish absent details from an empty list on old daemons.
 #
+# Status has optional "view": "probe", "list" or "full" (default).
+# Probe replies {"ok": true} without inspecting link or jobs. List returns
+# only target, mode, started, served and numeric jobs, counting live jobs
+# without building their metadata. Full retains all status fields above.
+# Unknown views fail. Older daemons ignore view and return full status;
+# new clients accept that reply for probes and session listings too.
+#
 # "op": "forward" adds persistent local TCP/Unix listeners, with no descriptors:
 #
 #     {"op": "forward", "specs": ["[bind:]port:host:hostport",
@@ -5103,7 +5119,7 @@ def session_exec(name, payload, send_stdin=False, watcher=None):
 
 def session_alive(name):
     try:
-        session_request(name, {"op": "status"}, timeout=10.0)
+        session_request(name, {"op": "status", "view": "probe"}, timeout=10.0)
         return True
     except SessionGone:
         return False
@@ -5343,6 +5359,22 @@ def _session_serve(session, srv, path, opts):
         if op == "status":
             # Answered whatever state the link is in: a session whose target
             # is rebooting is exactly when somebody wants to look at it.
+            view = req.get("view", "full")
+            if view not in ("probe", "list", "full"):
+                _reply(conn, {"error": "mssh: unknown status view %r" % (view,)})
+                return
+            if view == "probe":
+                _reply(conn, {"ok": True})
+                return
+            if view == "list":
+                # --sessions consumes only these columns. Avoid constructing
+                # command descriptions or sorting the full task snapshot.
+                _reply(conn, {
+                    "target": str(session.target), "mode": session.mode,
+                    "started": session.started, "served": session.served,
+                    "jobs": session.jobs_count(),
+                })
+                return
             link, broken, attempt = session.link_state()
             jobs = session.jobs_snapshot()
             _reply(conn, {
@@ -6396,7 +6428,7 @@ def run_session_list():
             continue
         name = entry[:-len(".sock")]
         try:
-            info = session_request(name, {"op": "status"}, timeout=5.0)
+            info = session_request(name, {"op": "status", "view": "list"}, timeout=5.0)
         except SessionGone:
             continue                      # stale socket, a killed daemon
         except SystemExit:

@@ -282,9 +282,12 @@ mssh --session s --stop        # end it and close the connection
 mssh --sessions                # list every live session and its job count
 ```
 
-The `JOBS` column uses the same task snapshot as `--jobs`, including pending
-requests and persistent forwards but excluding the idle primary shell.
+The `JOBS` column uses the same task-selection rules as `--jobs`, including
+pending requests and persistent forwards but excluding the idle primary shell.
 It shows `?` when an older daemon does not provide a count or cannot respond.
+Liveness probes request only an acknowledgement; `--sessions` requests only
+its displayed fields and a job count. Only `--status` requests full status.
+Older daemons may still return a full reply for these lightweight requests.
 
 `--status` distinguishes idle, forwarding-only, running, pending, interrupting,
 disconnected, reconnecting, stopping and ended sessions. A pending task means

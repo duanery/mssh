@@ -73,10 +73,12 @@ Session names contain up to 64 characters from `A-Z`, `a-z`, `0-9`,
 The session directory is owner-only (`0700`); sockets and logs are `0600`.
 The daemon also checks the peer UID when `SO_PEERCRED` is available.
 
-`session_alive()` probes with `{"op": "status"}`. A response means the local
-daemon exists, not necessarily that its target connection is healthy.
-`--sessions` scans socket names and sends a status request to each daemon;
-there is no separate session registry server.
+`session_alive()` probes with `{"op": "status", "view": "probe"}` and gets
+`{"ok": true}` without inspecting link state or jobs. A response means the
+local daemon exists, not necessarily that its target connection is healthy.
+`--sessions` scans socket names and requests `view: "list"` from each daemon;
+there is no separate session registry server. These lightweight requests
+avoid sending full status or job metadata.
 
 The shorthand `mssh NAME ...` first checks whether `NAME` names a live
 session. Otherwise it remains a target-host argument. Additional liveness
@@ -456,7 +458,8 @@ its own channel.
 {"op": "status"}
 ```
 
-Status returns the following groups in one reply:
+Without a `view` field, status returns the following groups in one reply
+(`view: "full"` explicitly requests the same reply):
 
 | Fields | Meaning |
 | --- | --- |
@@ -468,6 +471,31 @@ Status returns the following groups in one reply:
 | `dead`, `stopping` | Lifecycle flags/reason |
 | `link`, `broken`, `attempt`, `retries`, `reconnects` | Stored connection and reconnect state |
 | `refusal`, `last_error` | Why reconnect is unavailable or why the last attempt failed |
+
+For discovery and listing, use lightweight views of the same operation:
+
+```json
+{"op": "status", "view": "probe"}
+```
+
+```json
+{"ok": true}
+```
+
+```json
+{"op": "status", "view": "list"}
+```
+
+```json
+{"target": "root@host:22", "mode": "shell", "started": 1792324800.0, "served": 4, "jobs": 2}
+```
+
+Probe does not inspect jobs or connection state. List counts jobs using
+the same live-job selection as `--jobs`, but does not build/sort job
+metadata or inspect link/reconnect state. It returns only the five fields
+shown above. Unknown views receive an error reply.
+Older daemons ignore `view` and return their full status; clients accept
+those replies for discovery and listing without an additional request.
 
 `run_session_status()` renders a summary, not the detailed job table.
 It derives running/pending/interrupting/forwarding state from the snapshot,
