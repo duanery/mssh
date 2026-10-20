@@ -303,7 +303,8 @@ says whether a session is live, and `-j` or `-c` on a live one is refused.
 
 The first call keeps your terminal until the chain is up, so a hop can ask
 for a password and `-vv` can show connection progress. Only then does the
-daemon detach. Later calls reuse that authenticated connection.
+daemon detach. Successful creation prints `mssh: session NAME started` on
+stderr, even without `-v`. Later calls reuse that authenticated connection.
 
 Session topics:
 

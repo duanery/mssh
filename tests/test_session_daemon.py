@@ -8,8 +8,10 @@ that the socket is as private as it claims to be.
 """
 
 import importlib.util
+import base64
 import getpass
 import glob
+import io
 import json
 import os
 import pty
@@ -23,6 +25,7 @@ import tempfile
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAKE = os.path.join(HERE, "fakechain.py")
@@ -72,6 +75,61 @@ class SessionTest(unittest.TestCase):
 
     def send(self, line, *extra, **kw):
         return run("--session", self.name, line, *extra, **kw)
+
+
+class TestStartupConfirmation(SessionTest):
+    def test_quiet_start_confirms_once_without_creating_a_log(self):
+        proc = self.start()
+        expected = ("mssh: session %s started\n" % self.name).encode()
+        self.assertEqual(proc.stderr, expected)
+        self.assertEqual(proc.stdout, b"")
+        self.assertFalse(os.path.exists(os.path.join(SOCKDIR, self.name + ".log")))
+        following = self.send("echo hello")
+        self.assertEqual(following.returncode, 0, following.stderr)
+        self.assertEqual(following.stdout, b"hello\n")
+        self.assertEqual(following.stderr, b"")
+
+    def test_verbose_start_confirms_once_at_every_level(self):
+        expected = ("mssh: session %s started\n" % self.name).encode()
+        for flag in ("-v", "-vv", "-vvv"):
+            with self.subTest(flag=flag):
+                proc = self.start(flag)
+                self.assertEqual(proc.stderr.count(expected), 1, proc.stderr)
+                self.assertEqual(run(self.name, "--stop").returncode, 0)
+
+    def test_interactive_start_confirms_success(self):
+        proc = self.start("-c", "cat")
+        self.assertEqual(proc.stderr,
+                         ("mssh: session %s started\n" % self.name).encode())
+
+    def test_failed_start_does_not_confirm_success(self):
+        with tempfile.TemporaryDirectory(prefix="mssh-start-failed-") as directory:
+            down = os.path.join(directory, "down")
+            with open(down, "w"):
+                pass
+            with mock.patch.dict(ENV, MSSH_FAKE_DOWN=down):
+                proc = run("--session", self.name, "root@10.0.0.1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(b"cannot reach", proc.stderr)
+        self.assertNotIn(("session %s started" % self.name).encode(), proc.stderr)
+
+
+class TestStartupBanner(unittest.TestCase):
+    def test_confirmation_does_not_mix_with_banner(self):
+        payload = json.dumps({
+            "ok": True, "banner": base64.b64encode(b"banner\n").decode("ascii")
+        }).encode() + b"\n"
+        stdout = mock.Mock(buffer=io.BytesIO())
+        stderr = io.StringIO()
+        opts = mssh.build_parser().parse_args([])
+        with mock.patch.object(mssh.os, "read", side_effect=[payload, b""]), \
+                mock.patch.object(mssh.os, "close"), \
+                mock.patch.object(mssh.os, "waitpid"), \
+                mock.patch.object(mssh.sys, "stdout", stdout), \
+                mock.patch.object(mssh.sys, "stderr", stderr):
+            self.assertEqual(mssh._await_session("test", 123, 456, opts), 0)
+        self.assertEqual(stdout.buffer.getvalue(), b"banner\n")
+        self.assertEqual(stderr.getvalue(), "mssh: session test started\n")
 
 
 class TestLifecycle(SessionTest):

@@ -6903,6 +6903,7 @@ def _await_session(name, readfd, pid, opts):
                                 else banner + b"\n")
         sys.stdout.buffer.flush()
     verbose(opts, "session %s listening on %s" % (name, session_path(name)))
+    sys.stderr.write("mssh: session %s started\n" % name)
     _show_forwards(name, info.get("forwards", []))
     return 0
 
