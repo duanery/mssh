@@ -367,6 +367,10 @@ Login shells and `--exec -t` use the interactive terminal rules below.
 A timeout exits `124` and leaves the session usable. A primary-shell
 request stays pending until the next request or interruption resynchronizes
 the shell; an independent exec request closes its own channel on timeout.
+If the primary program ignores Ctrl-C and recovery cannot reach the shell,
+the request returns an error and keeps the original job pending instead of
+ending the session or sending new work into that program. Independent
+`--exec` commands, jobs/status queries and forwards remain available.
 
 Ctrl-C requests interruption of the current task while keeping the session
 alive. A second Ctrl-C lets the client leave without waiting; it does not
@@ -419,6 +423,7 @@ own channel; a session name without a command opens a fresh login shell:
 mssh --session s --exec -t 'vim /etc/hosts'
 mssh --session s --exec -t top
 mssh --session s --exec -t 'mysql -u root -p'
+mssh --session s --exec -t 'man ssh'
 mssh s
 ```
 
@@ -446,6 +451,14 @@ fill the file with escape sequences.
 Within a session, explicit `-t` applies to `--exec`, not ordinary commands.
 The persistent shell already runs behind a PTY; forwarded input reaches
 ordinary commands through a FIFO rather than the interactive terminal.
+Its `TERM` is `dumb`, and initialization sets `PAGER`, `MANPAGER`, `GIT_PAGER`
+and `SYSTEMD_PAGER` to `cat`, after login profiles. Ordinary `man`, Git and
+systemd commands therefore stream output instead of waiting in a pager.
+An explicit `--rcfile` or later shell command can override these defaults;
+read-only variables are left unchanged without failing initialization.
+Explicitly running `less` or enabling a pager still requires an interactive
+login or `--exec -t`; changing `TERM` alone does not forward pager keystrokes.
+The defaults do not affect independent exec channels or fresh login shells.
 
 ### Holding a Program Instead of a Shell
 
@@ -540,6 +553,12 @@ jobs are not saved as history, and IDs restart when the daemon is recreated.
 all forwarding listeners alone.
 For a `-c` session it interrupts the current interactive request.
 With no default job, it reports that nothing is running.
+Pending-shell recovery makes two bounded attempts (about 10 seconds total).
+If no synchronization marker arrives, `--interrupt` reports an error rather
+than success and retains the pending job. Use `--exec` for independent work
+or stop and recreate the session when the foreground program cannot be
+recovered. A genuine channel/transport failure still follows normal
+session termination or reconnect rules.
 `--job ID` requires `--interrupt`, `--stop` or `--connections`; an unknown
 or completed ID reports an error. `--stop --job ID` uses the same targeted
 cancellation as `--interrupt --job ID`, leaving the session and other jobs alive.
@@ -1067,6 +1086,7 @@ python3 -m unittest discover -s tests -p test_session_unix_forward.py
 python3 -m unittest discover -s tests -p test_session_remote_forward.py
 python3 -m unittest discover -s tests -p test_session_socks.py
 python3 -m unittest discover -s tests -p test_session_connections.py
+python3 -m unittest discover -s tests -p test_session_pager.py
 ```
 
 No external network: the framing layer is driven against local `bash`,

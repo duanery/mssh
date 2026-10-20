@@ -541,6 +541,11 @@ A successful reply is:
 For a default job, cancellation sets its abort flag; the owning pump sends
 Ctrl-C and resynchronizes the primary channel. A pending job can be
 resynchronized by the interrupt worker when the primary lock is free.
+When recovery times out on a live channel, the worker returns an error rather
+than an interruption-completed reply. The job remains pending and its abort
+flag is reset; independent channels and listeners are not closed. A running
+job's interrupt reply acknowledges the cancellation request; any subsequent
+recovery failure is returned to the client streaming that job.
 For exec/login/SFTP jobs, cancellation closes that job's channel.
 For forwards it closes the listener, pending opens/handshakes and all
 accepted connections. Targeted cancellation works while reconnecting.
@@ -796,7 +801,20 @@ work and drains output to a one-shot token marker. That token distinguishes
 the synchronization point from late completion markers.
 Interactive mode instead sends Ctrl-C and drains until output is quiet.
 If shell resynchronization cannot complete, new work is not framed onto
-the unresolved request.
+the unresolved request. Shell recovery makes two attempts with a five-second
+token wait each, below the Ctrl-C client's 15-second control-request timeout.
+`_SessionBusy` distinguishes this live-but-unresponsive shell from
+`_SessionDead`: return an error and retain the old default job, without
+ending the daemon or starting reconnect. Actual read/EOF/channel failures
+still propagate as `_SessionDead`, and shutdown interrupts token waits.
+
+The default shell uses `TERM=dumb` and sets `PAGER`, `MANPAGER`, `GIT_PAGER`
+and `SYSTEMD_PAGER` to `cat` during setup, after profiles and before rcfile
+initialization. Some pagers reopen `/dev/tty` despite `/dev/null` stdin;
+waiting for terminal input can swallow recovery commands as keystrokes.
+Plain-text defaults prevent that for cooperating tools. Explicit pagers,
+rcfile overrides or read-only settings may still require `--exec -t` or a
+fresh login; independent channels do not inherit these shell defaults.
 
 Independent channels are closed on timeout/disconnect. Closing a channel
 is not proof that every remote descendant has terminated, so applications
@@ -941,6 +959,8 @@ and, for forwarding, real SSH fixtures:
 
 - `tests/test_session_daemon.py`: lifecycle, commands, streams and stdin.
 - `tests/test_session_unit.py`: framing and resynchronization.
+- `tests/test_session_pager.py`: pager defaults, busy recovery and live
+  session preservation when a pager ignores Ctrl-C.
 - `tests/test_session_jobs.py` and `tests/test_session_status.py`: snapshots,
   targeted cancellation, status summaries and legacy replies.
 - `tests/test_session_copy.py`: SFTP relay and copy lifecycle.

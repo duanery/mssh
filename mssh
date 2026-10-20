@@ -2136,6 +2136,14 @@ SESSION_WRITER_READY = b"R"
 SESSION_SETUP = (
     "unset PS1 PS2 PROMPT_COMMAND; "
     "unset TMOUT 2>/dev/null || :; "
+    # Ordinary requests are framed streams, not interactive terminals. Some
+    # pagers reopen /dev/tty even with stdin redirected from /dev/null, then
+    # wait for keys and swallow subsequent synchronization commands. Set
+    # defaults after login profiles; an explicit rcfile can override them.
+    # "command" also prevents Bash treating a read-only assignment as a
+    # fatal assignment error before the || fallback can run.
+    "command export PAGER=cat MANPAGER=cat GIT_PAGER=cat SYSTEMD_PAGER=cat "
+    "2>/dev/null || :; "
     "\n"
 )
 
@@ -2147,6 +2155,10 @@ SESSION_TAIL = 4096
 # bounds how soon --idle, --wait and an interrupt from another thread are
 # noticed; data wakes the select immediately.
 SESSION_TICK = 0.05
+
+# Two recovery attempts must finish before the Ctrl-C client's 15s control
+# timeout. A live program ignoring SIGINT is busy, not a dead SSH session.
+SESSION_RESYNC_WAIT = 5.0
 
 # How much output may be held for a client that is not reading, and how much
 # of its stdin may be held for a remote window that is full, before the
@@ -2180,6 +2192,10 @@ class SessionGone(Exception):
 
 class _SessionDead(Exception):
     """The remote program behind the session has exited."""
+
+
+class _SessionBusy(Exception):
+    """The primary shell is alive but its pending request cannot be recovered."""
 
 
 def stdin_kind(fd=None):
@@ -4455,25 +4471,34 @@ class _Session(object):
                 # 'rintf ...', its first byte eaten.  Let the interrupt land.
                 time.sleep(0.3)
             self._write(self._marker_command(token.decode("ascii")))
-            if self._await_token(token, 20 if attempt == 0 else 10):
+            if self._await_token(token, SESSION_RESYNC_WAIT):
                 with self.execs_lock:
                     self.default_job = None
                 return
-        # The shell never answered. Leave the default job so the next command
-        # tries to resynchronise again rather than framing on a stale marker.
+        # No marker is not proof of channel/transport failure: less, for
+        # example, handles SIGINT without exiting. Preserve the pending job
+        # and never frame new work on that unresolved stream or report success.
+        with self.execs_lock:
+            if self.default_job is not None:
+                self.default_job.aborted = False
+        raise _SessionBusy(
+            "default shell did not respond after Ctrl-C; its job remains pending; "
+            "use --exec for independent commands, or --stop and recreate the session")
 
     def _await_token(self, token, limit):
         """Read until a marker line carries this token.  True if it came."""
         tail = b""
-        deadline = time.time() + limit
+        deadline = time.monotonic() + limit
         self.chan.settimeout(0.05)
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
+            if self.stopping.is_set():
+                raise _SessionDead("session is stopping")
             try:
                 data = self._recv()
             except _SessionDead as exc:
                 _session_log("shell.resync_failed", logging.WARNING,
                              self, self.chan, exc)
-                return False
+                raise
             if not data:
                 continue
             tail += data
@@ -4897,8 +4922,6 @@ class _Session(object):
                 # has to be stopped before this one starts, or its output would
                 # be mixed into ours and its marker would frame us early.
                 self._resync()
-                if self.pending:
-                    raise _SessionDead("the default job could not be resynchronized")
             job = self._new_job(self.chan, self.mode, line, default=True)
             with self.execs_lock:
                 self.default_job = job
@@ -6232,6 +6255,11 @@ def _session_serve(session, srv, path, opts):
             except ValueError as exc:
                 _reply(conn, {"error": "mssh: %s" % exc})
                 return
+            except _SessionBusy as exc:
+                _session_log("session.interrupt_busy", logging.WARNING,
+                             session, session.chan, exc)
+                _reply(conn, {"error": "mssh: %s" % exc})
+                return
             except _SessionDead as exc:
                 _session_log("session.interrupt_failed", logging.ERROR,
                              session, session.chan, exc)
@@ -6326,6 +6354,12 @@ def _session_serve(session, srv, path, opts):
                 status, timed_out = session.run(
                     req.get("line", ""), wait, sink, in_path=in_path,
                     in_fd=in_fd, in_chan=in_chan, conn=conn)
+            except _SessionBusy as exc:
+                _session_log("shell.resync_busy", logging.WARNING,
+                             session, session.chan, exc)
+                sink.drain()
+                _reply(conn, {"error": "mssh: %s" % exc})
+                return
             except _SessionDead as exc:
                 _session_log("shell.request_failed", logging.ERROR,
                              session, session.chan, exc)
