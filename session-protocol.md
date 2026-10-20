@@ -142,7 +142,7 @@ Command requests can receive a notice before their final reply.
 
 | Operation | Client half-closes after request? | Server response |
 | --- | --- | --- |
-| `status`, `jobs`, `connections`, `stop`, `interrupt`, `interrupt_connection`, `forward`, `remote_forward`, `dynamic_forward` | Yes, `shutdown(SHUT_WR)` | One JSON reply, then half-close |
+| `status`, `jobs`, `connections`, `stop`, `interrupt`, `interrupt_connection`, `reset_shell`, `forward`, `remote_forward`, `dynamic_forward` | Yes, `shutdown(SHUT_WR)` | One JSON reply, then half-close |
 | `send`, `exec` | No | Optional notice, then terminal reply |
 | `sftp` | No | Setup acknowledgement; connection remains open as a lifetime guard |
 
@@ -553,6 +553,39 @@ accepted connections. Targeted cancellation works while reconnecting.
 `--stop --job ID` uses the targeted `interrupt` operation above.
 There is no separate per-job `stop` op.
 
+### Default Shell Reset: `reset_shell`
+
+```json
+{"op": "reset_shell"}
+```
+
+```json
+{"ok": true, "reset": true}
+```
+
+This descriptor-free operation replaces the primary shell on the existing
+transport. It is explicit recovery for programs that disable terminal signals
+or ignore SIGINT, not a stronger interpretation of `interrupt`.
+It rejects `-c` sessions. A distinct operation makes old daemons reject it
+instead of acknowledging an unknown selector.
+
+`reset_lock` excludes simultaneous resets. A candidate PTY/login shell is
+opened and initialized before the existing reader is disturbed; retained
+rcfile paths are sourced without another upload. Initialization errors close
+only the candidate and return an error. Then `resetting` asks `_write()`,
+`_pump()` and `_await_token()` to raise `_SessionReset`, releasing primary
+ownership without waiting for remote signals or synchronization markers.
+The reset acquires the primary lock with a five-second deadline and checks
+that shutdown/reconnect has not replaced the transport.
+
+With that lock held it swaps the channel/marker, clears the default job and
+safely closes the old channel. A reset is not `_SessionDead`, so an active
+send/interrupt returns an error without ending the daemon or reconnecting.
+The next primary send receives a notice about lost shell state before its
+output. Exec/login/SFTP channels, forwards and existing forwarded connections
+are not changed. Job numbering is not reset. Closing the old PTY cannot
+guarantee termination of every remote descendant.
+
 ### Forward Connections
 
 The descriptor-free connection query selects one forwarding job:
@@ -725,6 +758,7 @@ and output would make command framing ambiguous.
 | Lock/state | Protects |
 | --- | --- |
 | `_Session.lock` | Primary command execution, pending resynchronization and replacement-shell setup |
+| `_Session.reset_lock` | Explicit shell reset and idle channel polling; acquired without waiting by poll/other resets |
 | `execs_lock` | Independent job registry, default-job identity and job IDs |
 | `state_lock` | Stored link/reconnect state and one-time reconnect notice |
 | `forward_lock` | Atomic forward additions and remote rebind during reconnect |
@@ -807,6 +841,9 @@ token wait each, below the Ctrl-C client's 15-second control-request timeout.
 `_SessionDead`: return an error and retain the old default job, without
 ending the daemon or starting reconnect. Actual read/EOF/channel failures
 still propagate as `_SessionDead`, and shutdown interrupts token waits.
+Ctrl-C alone cannot guarantee recovery: programs may disable `ISIG` or handle
+SIGINT without exiting. `reset_shell` bypasses that dependency by replacing
+only the shell channel, explicitly discarding its state.
 
 The default shell uses `TERM=dumb` and sets `PAGER`, `MANPAGER`, `GIT_PAGER`
 and `SYSTEMD_PAGER` to `cat` during setup, after profiles and before rcfile
@@ -961,6 +998,8 @@ and, for forwarding, real SSH fixtures:
 - `tests/test_session_unit.py`: framing and resynchronization.
 - `tests/test_session_pager.py`: pager defaults, busy recovery and live
   session preservation when a pager ignores Ctrl-C.
+- `tests/test_session_reset.py`: shell reset during execution/recovery, real
+  Vim, rcfile reuse, state-loss notices and surviving independent jobs/forwards.
 - `tests/test_session_jobs.py` and `tests/test_session_status.py`: snapshots,
   targeted cancellation, status summaries and legacy replies.
 - `tests/test_session_copy.py`: SFTP relay and copy lifecycle.

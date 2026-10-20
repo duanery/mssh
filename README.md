@@ -371,6 +371,11 @@ If the primary program ignores Ctrl-C and recovery cannot reach the shell,
 the request returns an error and keeps the original job pending instead of
 ending the session or sending new work into that program. Independent
 `--exec` commands, jobs/status queries and forwards remain available.
+Ctrl-C is best-effort: full-screen programs can disable terminal signals,
+and other commands may handle or ignore SIGINT. Use `--exec -t` for editors
+and other interactive programs. If one occupies the primary shell,
+`mssh s --reset-shell` replaces that shell without reconnecting; its state
+is discarded rather than silently preserved.
 
 Ctrl-C requests interruption of the current task while keeping the session
 alive. A second Ctrl-C lets the client leave without waiting; it does not
@@ -526,6 +531,7 @@ mssh web --interrupt --job 3  # interrupt one specific task
 mssh web --job 3 --stop       # same cancellation, keep the session alive
 mssh web --job 3 --connections # connections and channels for one forward
 mssh web --job 3 --connection 2 --stop # close only this connection
+mssh web --reset-shell        # replace the default shell; discard its state
 mssh web --stop               # end the whole session and close its resources
 mssh --sessions              # list every live session and its job count
 ```
@@ -556,8 +562,8 @@ With no default job, it reports that nothing is running.
 Pending-shell recovery makes two bounded attempts (about 10 seconds total).
 If no synchronization marker arrives, `--interrupt` reports an error rather
 than success and retains the pending job. Use `--exec` for independent work
-or stop and recreate the session when the foreground program cannot be
-recovered. A genuine channel/transport failure still follows normal
+or `--reset-shell` when the foreground program cannot be recovered.
+A genuine channel/transport failure still follows normal
 session termination or reconnect rules.
 `--job ID` requires `--interrupt`, `--stop` or `--connections`; an unknown
 or completed ID reports an error. `--stop --job ID` uses the same targeted
@@ -568,6 +574,27 @@ alive; interrupting an exec/login/SFTP task closes only that task's channel.
 Client-side Ctrl-C on an exec/login request targets its own task, not the
 default shell or other jobs. Stopping or exiting the session closes the
 default channel and all job channels.
+
+#### Resetting a Stuck Shell
+
+`mssh NAME --reset-shell` replaces only the default shell using the existing
+SSH connection. It does not wait for the foreground program to obey Ctrl-C,
+and can release a running, timed-out or abandoned request. A still-connected
+request receives an error instead of a fabricated successful exit status.
+
+The replacement starts as a login shell and applies normal initialization,
+including the retained rcfile without uploading it again. It is checked
+before the old shell is replaced; initialization failure keeps the old shell.
+The old working directory, variables, functions and background jobs are
+**not preserved**. The next ordinary command also receives a state-loss notice
+on stderr. Independent exec/login/SFTP jobs, forwarding listeners and their
+existing connections are left alone. Job IDs continue increasing.
+
+Reset is explicit, not an automatic consequence of a timeout or Ctrl-C:
+discarding a shell could lose unsaved editor contents or application state.
+Closing the old channel does not guarantee that every remote descendant is
+killed. Use an independent command for any required remote process cleanup.
+`--reset-shell` requires a live shell session and rejects `-c` sessions.
 
 #### Forward Connections
 
@@ -1055,6 +1082,7 @@ automatically rotated or deleted by `--stop`.
 
 Session-only options: `--session NAME`, `--sessions`, `--status`, `--stop`,
 `--interrupt`, `--job ID`, `--jobs`, `--connections`, `--connection ID`,
+`--reset-shell`,
 `-L SPEC`, `-R SPEC`,
 `-D [BIND:]PORT`, `--exec`,
 `--put LOCAL REMOTE`, `--get REMOTE LOCAL`,
@@ -1087,6 +1115,7 @@ python3 -m unittest discover -s tests -p test_session_remote_forward.py
 python3 -m unittest discover -s tests -p test_session_socks.py
 python3 -m unittest discover -s tests -p test_session_connections.py
 python3 -m unittest discover -s tests -p test_session_pager.py
+python3 -m unittest discover -s tests -p test_session_reset.py
 ```
 
 No external network: the framing layer is driven against local `bash`,

@@ -2198,6 +2198,10 @@ class _SessionBusy(Exception):
     """The primary shell is alive but its pending request cannot be recovered."""
 
 
+class _SessionReset(Exception):
+    """A shell reset asked the current reader to release the primary channel."""
+
+
 def stdin_kind(fd=None):
     """What the client's stdin is: 'pipe', 'file', 'tty', 'null' or 'none'.
 
@@ -4001,6 +4005,9 @@ class _Session(object):
         self.transport = transport
         self.timeout = timeout
         self.lock = threading.Lock()
+        self.reset_lock = threading.Lock()
+        self.resetting = threading.Event()
+        self.shell_notice = None
         self.started = time.time()
         self.last = self.started
         self.served = 0
@@ -4168,6 +4175,74 @@ class _Session(object):
         job.abort()
         return True
 
+    def reset_shell(self):
+        """Replace only the primary shell, without relying on remote signals.
+
+        Closing a PTY cannot promise that every remote descendant exits. The
+        guarantee here is local ownership: no reader or writer uses the old
+        channel after replacement, and independent jobs keep their transport.
+        Prepare and initialize the replacement first, so a refused channel or
+        bad rcfile does not destroy the existing shell.
+        """
+        if self.mode != "shell":
+            raise ValueError("--reset-shell is not supported for -c sessions")
+        if not self.reset_lock.acquire(False):
+            raise ValueError("a default shell reset is already in progress")
+        candidate = None
+        try:
+            if self.stopping.is_set() or self.link_down():
+                raise _SessionDead("session is stopping or disconnected")
+            transport = self.transport
+            candidate, mark = _open_session_channel(
+                transport, None, min(self.timeout, 10.0))
+            replacement = _Session(candidate, mark, "shell", None, self.idle,
+                                   self.target, None, transport, self.timeout)
+            replacement.setup(min(self.setup_wait, 10.0))
+            if self.rcfile_path is not None:
+                _source_rcfile(transport, candidate, None,
+                               min(self.timeout, 10.0),
+                               remote_path=self.rcfile_path)
+
+            # Ask the pump/token wait to release its reader ownership before
+            # closing. Do not abort the job: that would send Ctrl-C and wait
+            # for the very program this operation exists to bypass.
+            self.resetting.set()
+            if not self.lock.acquire(timeout=5.0):
+                raise ValueError("default shell is still releasing its channel; "
+                                 "try --reset-shell again")
+            try:
+                if self.stopping.is_set() or transport is not self.transport \
+                        or self.link_down():
+                    raise _SessionDead("session changed during shell reset")
+                previous = self.chan
+                with self.execs_lock:
+                    self.chan, self.mark = candidate, replacement.mark
+                    self.default_job = None
+                candidate = None
+                self.shell_notice = (
+                    "mssh: session %s: default shell was reset; its previous "
+                    "working directory, variables, functions and background "
+                    "jobs are not preserved" % self.name)
+                # Detach Paramiko pipe notifications before closing: otherwise
+                # a transport feed racing PosixPipe.close() can end every job
+                # on this shared SSH connection with EBADF.
+                try:
+                    _close_session_channel(previous)
+                except Exception as exc:
+                    _session_log("shell.reset_close_failed", logging.WARNING,
+                                 self, previous, exc)
+                self.last = time.time()
+                _session_log("shell.reset", logging.WARNING, self, self.chan)
+            finally:
+                self.lock.release()
+        finally:
+            self.resetting.clear()
+            try:
+                if candidate is not None:
+                    _close_session_channel(candidate)
+            finally:
+                self.reset_lock.release()
+
     def _jobs_locked(self):
         """Live jobs shared by counts and snapshots; caller holds execs_lock."""
         jobs = list(self.execs)
@@ -4242,6 +4317,9 @@ class _Session(object):
         data = text.encode("utf-8")
         deadline = time.time() + max(self.timeout, 1.0)
         while data:
+            if self.resetting.is_set():
+                raise _SessionReset("default shell reset requested; "
+                                    "the command was abandoned")
             try:
                 sent = self.chan.send(data)
             except socket.timeout:
@@ -4265,10 +4343,19 @@ class _Session(object):
         except socket.timeout:
             return None
         except Exception as exc:
+            if self.resetting.is_set() and not self.link_down():
+                raise _SessionReset("default shell reset requested; "
+                                    "the command was abandoned")
             _session_log("shell.read_failed", logging.ERROR, self,
                          self.chan, exc)
             raise _SessionDead("read failed: %s" % exc)
         if data == b"":
+            # The old program can exit while a reset asks its reader to
+            # release. Report that handoff, not a fatal failure subsequently
+            # applied by the request worker to the replacement shell.
+            if self.resetting.is_set() and not self.link_down():
+                raise _SessionReset("default shell reset requested; "
+                                    "the command was abandoned")
             raise _SessionDead("the remote program exited")
         return data
 
@@ -4344,6 +4431,9 @@ class _Session(object):
         in_done = in_fd is None           # no more stdin will come
 
         while True:
+            if self.resetting.is_set():
+                raise _SessionReset("default shell reset requested; "
+                                    "the command was abandoned")
             if not sink.flush():
                 raise _ClientGone("the client stopped reading")
 
@@ -4483,7 +4573,8 @@ class _Session(object):
                 self.default_job.aborted = False
         raise _SessionBusy(
             "default shell did not respond after Ctrl-C; its job remains pending; "
-            "use --exec for independent commands, or --stop and recreate the session")
+            "use --exec for independent commands, or --reset-shell "
+            "(discards shell state)")
 
     def _await_token(self, token, limit):
         """Read until a marker line carries this token.  True if it came."""
@@ -4491,6 +4582,9 @@ class _Session(object):
         deadline = time.monotonic() + limit
         self.chan.settimeout(0.05)
         while time.monotonic() < deadline:
+            if self.resetting.is_set():
+                raise _SessionReset("default shell reset requested; "
+                                    "the command was abandoned")
             if self.stopping.is_set():
                 raise _SessionDead("session is stopping")
             try:
@@ -4911,12 +5005,18 @@ class _Session(object):
         interleaved on one pty would each read the other's output.
         """
         with self.lock:
+            if self.resetting.is_set():
+                raise _SessionReset("default shell reset is in progress; try again")
             if self.stopping.is_set():
                 raise _SessionDead("session is stopping")
             # The request may have passed resolve() before waiting for this
             # lock. Do not recreate a job on the old shell while reconnecting.
             if self.transport is not None and self.link_down():
                 raise _SessionDead("the connection to %s dropped" % self.target)
+            if self.shell_notice is not None:
+                if conn is not None:
+                    _notify(conn, {"notice": self.shell_notice})
+                self.shell_notice = None
             if self.pending:
                 # A previous command timed out and may still be running.  It
                 # has to be stopped before this one starts, or its output would
@@ -5144,13 +5244,24 @@ class _Session(object):
         with self.state_lock:
             if self.broken is not None:
                 return False              # known, and already being dealt with
+        # Reset initializes a candidate without the primary lock. Serialize
+        # this idle poll with that entire operation: a result for the old
+        # channel must not be applied to the replacement after the swap.
+        if not self.reset_lock.acquire(False):
+            return False
         try:
-            if not self.chan.exit_status_ready():
+            chan = self.chan
+            try:
+                if not chan.exit_status_ready():
+                    return False
+            except Exception as exc:
+                _session_log("shell.poll_failed", logging.ERROR, self,
+                             chan, exc)
+            if chan is not self.chan:
                 return False
-        except Exception as exc:
-            _session_log("shell.poll_failed", logging.ERROR, self,
-                         self.chan, exc)
-        return self.failed("the connection to %s dropped" % self.target)
+            return self.failed("the connection to %s dropped" % self.target)
+        finally:
+            self.reset_lock.release()
 
     def take_notice(self):
         with self.state_lock:
@@ -5512,6 +5623,15 @@ class _Session(object):
 # Exec/login/SFTP requests may include a random "job_token", also sent with their
 # client's interrupt request, to target Ctrl-C before the client knows the ID.
 # On daemon exit all job channels, listeners and the primary channel close.
+#
+#     {"op": "reset_shell"}\n
+#     {"ok": true, "reset": true}\n
+#
+# --reset-shell replaces only the default shell on the same transport. The
+# replacement is initialized before abandoning the old reader; retained rc
+# files are sourced without another upload. Running sends get an error, not a
+# fabricated exit status. Shell state is lost; exec/SFTP/forwards are untouched.
+# No descriptors are accepted, and -c sessions reject this operation.
 #
 # An exec may carry a "pty": {"term": ..., "cols": N, "rows": N} for a command
 # that will not run without a terminal.  The size is the client's window and
@@ -6154,7 +6274,7 @@ def _session_serve(session, srv, path, opts):
                 _reply(conn, {"ok": True, "forwards": [
                     {"id": job.id, "command": job.command} for job in jobs]})
             return
-        if op not in ("send", "exec", "interrupt", "sftp"):
+        if op not in ("send", "exec", "interrupt", "sftp", "reset_shell"):
             _reply(conn, {"error": "mssh: unknown request %r" % (op,)})
             return
         if session.dead:
@@ -6177,6 +6297,19 @@ def _session_serve(session, srv, path, opts):
             if fatal:
                 die(message)
             _reply(conn, {"error": message})
+            return
+
+        if op == "reset_shell":
+            try:
+                session.reset_shell()
+            except (Exception, SystemExit) as exc:
+                _session_log("shell.reset_failed", logging.WARNING,
+                             session, exc=exc)
+                if session.link_down():
+                    session.failed(str(exc))
+                _reply(conn, {"error": "mssh: cannot reset default shell: %s" % exc})
+            else:
+                _reply(conn, {"ok": True, "reset": True})
             return
 
         if op == "sftp":
@@ -6255,7 +6388,7 @@ def _session_serve(session, srv, path, opts):
             except ValueError as exc:
                 _reply(conn, {"error": "mssh: %s" % exc})
                 return
-            except _SessionBusy as exc:
+            except (_SessionBusy, _SessionReset) as exc:
                 _session_log("session.interrupt_busy", logging.WARNING,
                              session, session.chan, exc)
                 _reply(conn, {"error": "mssh: %s" % exc})
@@ -6354,7 +6487,7 @@ def _session_serve(session, srv, path, opts):
                 status, timed_out = session.run(
                     req.get("line", ""), wait, sink, in_path=in_path,
                     in_fd=in_fd, in_chan=in_chan, conn=conn)
-            except _SessionBusy as exc:
+            except (_SessionBusy, _SessionReset) as exc:
                 _session_log("shell.resync_busy", logging.WARNING,
                              session, session.chan, exc)
                 sink.drain()
@@ -6557,6 +6690,22 @@ def _one_line(exc):
     return text or type(exc).__name__
 
 
+def _open_session_channel(transport, command, timeout):
+    """The primary PTY and program, shared by startup, reconnect and reset."""
+    chan = transport.open_session(timeout=timeout)
+    try:
+        _request_pty(chan, {"term": SESSION_TERM, "cols": SESSION_COLS,
+                           "rows": SESSION_ROWS})
+        # Keep signals enabled without echo, canonical buffering or CRLF
+        # expansion. Ctrl-C targets the terminal's foreground process group.
+        chan.exec_command(SESSION_STTY + " 2>/dev/null; exec "
+                          + (command or SESSION_SHELL))
+    except BaseException:
+        _close_session_channel(chan)
+        raise
+    return chan, "__MSSH_%s__" % os.urandom(8).hex()
+
+
 def _open_shell(jumps, target, opts):
     """Build the chain and start the framed program on it.
 
@@ -6568,17 +6717,11 @@ def _open_shell(jumps, target, opts):
     clients, tgt = build_chain(jumps, target, opts)
     try:
         transport = tgt.get_transport()
-        chan = transport.open_session(timeout=opts.timeout)
-        _request_pty(chan, {"term": SESSION_TERM, "cols": SESSION_COLS,
-                           "rows": SESSION_ROWS})
-        # Keep signals enabled without echo, canonical buffering or CRLF
-        # expansion.  Ctrl-C targets the terminal's foreground process group.
-        chan.exec_command(SESSION_STTY + " 2>/dev/null; exec "
-                          + (opts.command or SESSION_SHELL))
+        chan, mark = _open_session_channel(transport, opts.command, opts.timeout)
     except BaseException:
         close_all(clients)
         raise
-    return clients, transport, chan, "__MSSH_%s__" % os.urandom(8).hex()
+    return clients, transport, chan, mark
 
 
 def serve_session(name, srv, path, readyfd, jumps, target, opts):
@@ -6913,6 +7056,21 @@ def run_session_interrupt(name, job_id=None):
                           "the running command"))
     else:
         sys.stderr.write("mssh: session %s: nothing was running\n" % name)
+    return 0
+
+
+def run_session_reset_shell(name):
+    reply = session_request(name, {"op": "reset_shell"}, timeout=60.0)
+    if reply.get("error"):
+        sys.stderr.write(reply["error"].rstrip("\n") + "\n")
+        return 1
+    if not reply.get("ok") or not reply.get("reset"):
+        raise SystemExit("mssh: session daemon does not support --reset-shell; "
+                         "stop and recreate the session")
+    sys.stderr.write(
+        "mssh: session %s: default shell reset; its working directory, "
+        "variables, functions and background jobs are not preserved; "
+        "independent jobs and forwards remain active\n" % name)
     return 0
 
 
@@ -7295,7 +7453,8 @@ def _session_login_wanted(opts):
             or opts.put is not None or opts.get is not None or opts.local_forwards \
             or opts.dynamic_forwards or opts.remote_forwards:
         return False
-    return not (opts.stop or opts.interrupt or opts.status or opts.jobs or opts.connections)
+    return not (opts.stop or opts.interrupt or opts.status or opts.jobs or opts.connections
+                or opts.reset_shell)
 
 
 def run_session(parser, opts):
@@ -7311,7 +7470,7 @@ def run_session(parser, opts):
         if opts.args or opts.command or opts.jump or opts.copy_id is not None \
                 or opts.rcfile or opts.exec_channel or opts.force_tty \
                 or opts.stop or opts.interrupt or opts.status or opts.jobs \
-                or opts.connections \
+                or opts.connections or opts.reset_shell \
                 or opts.reconnect or opts.local_forwards or opts.dynamic_forwards \
                 or opts.remote_forwards or opts.prompt is not None:
             parser.error("--put/--get only combine with file-copy options "
@@ -7325,14 +7484,23 @@ def run_session(parser, opts):
         except SessionGone:
             _no_session(name)
 
-    controls = [flag for flag in ("stop", "interrupt", "status", "jobs", "connections")
+    controls = [flag for flag in ("stop", "interrupt", "status", "jobs", "connections",
+                                 "reset_shell")
                 if getattr(opts, flag)]
     if len(controls) > 1:
-        parser.error("--%s and --%s cannot be combined" % tuple(controls[:2]))
+        parser.error("--%s and --%s cannot be combined" %
+                     tuple(flag.replace("_", "-") for flag in controls[:2]))
         return 2
     if controls:
+        control = controls[0].replace("_", "-")
+        if opts.reset_shell and (
+                opts.command or opts.jump or opts.force_tty or opts.recursive
+                or opts.preserve or opts.reconnect or opts.copy_id is not None
+                or opts.stdin or opts.no_stdin or opts.prompt is not None
+                or opts.job is not None or opts.connection is not None):
+            parser.error("--reset-shell only takes an existing session name")
         if opts.local_forwards or opts.dynamic_forwards or opts.remote_forwards:
-            parser.error("-L/-R/-D cannot be combined with --%s" % controls[0])
+            parser.error("-L/-R/-D cannot be combined with --%s" % control)
         if (opts.jobs or opts.connections or opts.connection is not None) and (
                 opts.command or opts.jump or opts.force_tty or opts.recursive or
                 opts.preserve or opts.reconnect or opts.copy_id is not None or opts.stdin
@@ -7341,11 +7509,11 @@ def run_session(parser, opts):
                          ("connection" if opts.connection is not None else controls[0],
                           " and job ID" if opts.connection is not None else ""))
         if opts.args:
-            parser.error("--%s takes no other arguments" % controls[0])
+            parser.error("--%s takes no other arguments" % control)
             return 2
         if opts.exec_channel:
             parser.error("--exec runs a command; it cannot be combined with "
-                         "--%s" % controls[0])
+                         "--%s" % control)
             return 2
         try:
             if controls[0] == "status":
@@ -7354,6 +7522,8 @@ def run_session(parser, opts):
                 return run_session_jobs(name)
             if controls[0] == "connections":
                 return run_session_connections(name, opts.job)
+            if controls[0] == "reset_shell":
+                return run_session_reset_shell(name)
             if opts.connection is not None:
                 return run_session_interrupt_connection(name, opts.job, opts.connection)
             if controls[0] == "stop":
@@ -7638,6 +7808,7 @@ persistent session (keep one connection and one shell alive):
   mssh s --job 3 --stop       # same targeted cancellation, keep session alive
   mssh s --job 3 --connections # list this forward's connections and channels
   mssh s --job 3 --connection 2 --stop # close only this connection
+  mssh s --reset-shell        # replace a stuck shell; discard its state
   mssh --session s --stop      # end it; --sessions lists live ones
 
   --interrupt alone only reaches the current default shell/interactive
@@ -7646,6 +7817,11 @@ persistent session (keep one connection and one shell alive):
   --job ID selects a task with --interrupt/--stop or inspects a forward with
   --connections. --connection ID limits --interrupt/--stop to one stream.
   --stop without --job closes the default channel and every job channel.
+  --reset-shell replaces only the default shell, reusing the connection and
+  rcfile. Working directory, variables, functions and background jobs are
+  not preserved. Independent exec/login/SFTP jobs and forwards stay active.
+  Use --exec -t for vim and other interactive programs; Ctrl-C is not a
+  guarantee that a program exits. Reset does not support -c sessions.
 
   A session dies with its connection: a jump host or the target rebooting
   ends it, and the next call says so.  --reconnect N, on the call that
@@ -7864,6 +8040,11 @@ def build_parser():
     group.add_argument(
         "--interrupt", action="store_true",
         help="interrupt the default shell's task; use --job ID for a specific task",
+    )
+    group.add_argument(
+        "--reset-shell", action="store_true",
+        help="replace a stuck default shell using the existing connection; "
+             "discard shell state but keep independent jobs and forwards",
     )
     group.add_argument(
         "--job", type=int, metavar="ID",
@@ -8116,7 +8297,7 @@ def main(argv=None):
     if opts.rcfile:
         if opts.command or opts.copy_id is not None or opts.sessions \
                 or opts.stop or opts.interrupt or opts.status or opts.jobs \
-                or opts.connections \
+                or opts.connections or opts.reset_shell \
                 or opts.exec_channel:
             parser.error("--rcfile only applies to logins and shell session creation")
         try:
@@ -8149,6 +8330,8 @@ def main(argv=None):
             else DEFAULT_SESSION_WAIT
 
     if opts.sessions:
+        if opts.reset_shell:
+            parser.error("--reset-shell cannot be combined with --sessions")
         if opts.local_forwards or opts.dynamic_forwards or opts.remote_forwards:
             parser.error("-L/-R/-D cannot be combined with --sessions")
         if opts.job is not None:
@@ -8180,8 +8363,9 @@ def main(argv=None):
         parser.error("--put/--get require an existing session: "
                      "mssh NAME --put LOCAL REMOTE")
 
-    for flag in ("stop", "interrupt", "status", "jobs", "connections"):
+    for flag in ("stop", "interrupt", "status", "jobs", "connections", "reset_shell"):
         if getattr(opts, flag):
+            flag = flag.replace("_", "-")
             # Either no name was given or the one given is not live; both end
             # here, so the message names the live ones rather than guessing
             # which of the two happened.

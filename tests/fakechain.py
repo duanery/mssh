@@ -318,6 +318,11 @@ class _PtyChan(FakeChan):
         if self.want_pty:
             self.pid, self.fd = os.forkpty()
             if self.pid == 0:
+                # A real SSH server cannot inherit daemon-side client pipes or
+                # sockets. Match Popen(close_fds=True) for concurrent PTY jobs;
+                # otherwise a replacement shell keeps another client's output
+                # pipe open after that request has already completed.
+                os.closerange(3, os.sysconf("SC_OPEN_MAX"))
                 os.environ["TERM"] = self.term
                 os.execvp("/bin/sh", ["/bin/sh", "-c", command])
             self._set_size()
